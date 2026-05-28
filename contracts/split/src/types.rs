@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Symbol, Vec};
 
 /// Status of an invoice lifecycle.
 #[contracttype]
@@ -22,6 +22,8 @@ pub struct Payment {
     pub payer: Address,
     /// Amount paid in stroops (7 decimal places).
     pub amount: i128,
+    /// Optional tip in stroops (0 = no tip).
+    pub tip: i128,
 }
 
 /// An audit log entry recording a state change.
@@ -72,6 +74,8 @@ pub struct CompletionProof {
 pub struct Invoice {
     /// Address that created the invoice.
     pub creator: Address,
+    /// Optional co-creators who share creator-gated permissions.
+    pub co_creators: Vec<Address>,
     /// Ordered list of recipient addresses.
     pub recipients: Vec<Address>,
     /// Amounts owed to each recipient (parallel to `recipients`).
@@ -86,6 +90,10 @@ pub struct Invoice {
     pub status: InvoiceStatus,
     /// All payments made toward this invoice.
     pub payments: Vec<Payment>,
-    /// Whether the invoice is frozen by admin.
-    pub frozen: bool,
+    /// Optional vesting duration in seconds. When set, recipients claim gradually.
+    pub drip_duration: Option<u64>,
+    /// Timestamp when the invoice was released (set by `_release` when drip is active).
+    pub release_timestamp: Option<u64>,
+    /// Amount already claimed by each recipient (parallel to `recipients`).
+    pub claimed: Vec<i128>,
 }
