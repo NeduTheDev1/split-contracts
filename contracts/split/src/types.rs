@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Symbol, Vec};
 
 /// Status of an invoice lifecycle.
 #[contracttype]
@@ -86,4 +86,10 @@ pub struct Invoice {
     pub status: InvoiceStatus,
     /// All payments made toward this invoice.
     pub payments: Vec<Payment>,
+    /// Optional bonus pool deposited by creator, distributed to first `bonus_max_payers` unique payers.
+    pub bonus_pool: i128,
+    /// Number of early payers eligible for the bonus split.
+    pub bonus_max_payers: u32,
+    /// Optional IPFS CID or arbitrary metadata bytes.
+    pub metadata: Option<Bytes>,
 }
