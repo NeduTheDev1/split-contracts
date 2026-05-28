@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Symbol, Vec};
 
 /// Status of an invoice lifecycle.
 #[contracttype]
@@ -22,6 +22,8 @@ pub struct Payment {
     pub payer: Address,
     /// Amount paid in stroops (7 decimal places).
     pub amount: i128,
+    /// Optional tip in stroops (0 = no tip).
+    pub tip: i128,
 }
 
 /// An audit log entry recording a state change.
@@ -46,8 +48,8 @@ pub struct SubscriptionParams {
     pub recipients: Vec<Address>,
     /// Amounts owed to each recipient (parallel to `recipients`).
     pub amounts: Vec<i128>,
-    /// USDC token contract address.
-    pub token: Address,
+    /// Token contract addresses per recipient (parallel to `recipients`).
+    pub tokens: Vec<Address>,
 }
 
 /// A completion proof for a finalized invoice.
@@ -66,18 +68,16 @@ pub struct CompletionProof {
     pub hash: BytesN<32>,
 }
 
-/// Parameters for a single invoice in a batch creation call (#44).
+/// A reusable invoice template storing recipients, amounts, and token.
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct CreateInvoiceParams {
+pub struct InvoiceTemplate {
     /// Ordered list of recipient addresses.
     pub recipients: Vec<Address>,
     /// Amounts owed to each recipient (parallel to `recipients`).
     pub amounts: Vec<i128>,
     /// USDC token contract address.
     pub token: Address,
-    /// Unix timestamp after which unfunded invoices can be refunded.
-    pub deadline: u64,
 }
 
 /// An on-chain invoice splitting payment among multiple recipients.
@@ -86,12 +86,14 @@ pub struct CreateInvoiceParams {
 pub struct Invoice {
     /// Address that created the invoice.
     pub creator: Address,
+    /// Optional co-creators who share creator-gated permissions.
+    pub co_creators: Vec<Address>,
     /// Ordered list of recipient addresses.
     pub recipients: Vec<Address>,
     /// Amounts owed to each recipient (parallel to `recipients`).
     pub amounts: Vec<i128>,
-    /// USDC token contract address.
-    pub token: Address,
+    /// Token contract addresses per recipient (parallel to `recipients`).
+    pub tokens: Vec<Address>,
     /// Unix timestamp after which unfunded invoices can be refunded.
     pub deadline: u64,
     /// Total amount collected so far.
@@ -100,14 +102,10 @@ pub struct Invoice {
     pub status: InvoiceStatus,
     /// All payments made toward this invoice.
     pub payments: Vec<Payment>,
-    /// Optional deadline by which recipients must claim their share (#45).
-    /// If None, funds are pushed immediately on release (existing behaviour).
-    pub claim_deadline: Option<u64>,
-    /// Tracks which recipient indices have already claimed (#45).
-    pub claimed: Vec<bool>,
-    /// Ledger timestamp when the invoice was completed (Released/Refunded) (#46).
-    pub completion_time: Option<u64>,
-    /// SAC token addresses minted per recipient at creation (#47).
-    /// proceeds_tokens[i] is the token representing recipient[i]'s share.
-    pub proceeds_tokens: Vec<Address>,
+    /// Optional vesting duration in seconds. When set, recipients claim gradually.
+    pub drip_duration: Option<u64>,
+    /// Timestamp when the invoice was released (set by `_release` when drip is active).
+    pub release_timestamp: Option<u64>,
+    /// Amount already claimed by each recipient (parallel to `recipients`).
+    pub claimed: Vec<i128>,
 }
