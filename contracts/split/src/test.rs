@@ -44,6 +44,7 @@ fn default_options(env: &Env) -> InvoiceOptions {
         bonus_max_payers: 0,
         prerequisite_id: None,
         tranches: Vec::new(env),
+        approver: None,
     }
 }
 
@@ -601,6 +602,7 @@ fn test_bonus_pool_distributed_to_first_payer() {
             bonus_max_payers: 1,
             prerequisite_id: None,
             tranches: Vec::new(&env),
+            approver: None,
         },
     );
 
@@ -837,6 +839,7 @@ fn test_release_blocked_by_prerequisite() {
             bonus_max_payers: 0,
             prerequisite_id: Some(id_a),
             tranches: Vec::new(&env),
+            approver: None,
         },
     );
 
@@ -880,6 +883,7 @@ fn test_release_succeeds_after_prerequisite_released() {
             bonus_max_payers: 0,
             prerequisite_id: Some(id_a),
             tranches: Vec::new(&env),
+            approver: None,
         },
     );
 
@@ -956,6 +960,7 @@ fn test_tranches_partial_then_full_release() {
             bonus_max_payers: 0,
             prerequisite_id: None,
             tranches: tranches.clone(),
+            approver: None,
         },
     );
 
@@ -1014,6 +1019,7 @@ fn test_release_before_any_tranche_unlocked_panics() {
             bonus_max_payers: 0,
             prerequisite_id: None,
             tranches: tranches.clone(),
+            approver: None,
         },
     );
 
@@ -1092,4 +1098,134 @@ fn test_reputation_is_per_address() {
     // Unrelated address has zero reputation.
     let other = Address::generate(&env);
     assert_eq!(c.get_reputation(&other), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #25: Approver tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "awaiting approval")]
+fn test_release_with_unapproved_approver_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let approver = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Create an invoice with an approver set and a tranche to prevent auto-release
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100);
+    let mut tranches = Vec::new(&env);
+    tranches.push_back(Tranche { timestamp: 2_000, basis_points: 10_000 });
+    let mut options = default_options(&env);
+    options.approver = Some(approver.clone());
+    options.tranches = tranches;
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000, &options);
+
+    // Fund the invoice
+    tk.transfer(&payer, &contract_id, &100);
+    c.pay(&payer, &id, &100_i128, &0_u64);
+
+    // Attempt release without approval should panic
+    c.release(&id);
+}
+
+#[test]
+fn test_approve_invoice_then_release() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let approver = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Create an invoice with an approver set and a tranche to prevent auto-release
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100);
+    let mut tranches = Vec::new(&env);
+    tranches.push_back(Tranche { timestamp: 1_000, basis_points: 10_000 });
+    let mut options = default_options(&env);
+    options.approver = Some(approver.clone());
+    options.tranches = tranches;
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000, &options);
+
+    // Fund the invoice
+    tk.transfer(&payer, &contract_id, &100);
+    c.pay(&payer, &id, &100_i128, &0_u64);
+
+    // Verify invoice has approver set and is not approved
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.approver, Some(approver.clone()));
+    assert!(!invoice.approved);
+
+    // Approve the invoice
+    c.approve_invoice(&id);
+
+    // Verify invoice is now approved
+    let invoice = c.get_invoice(&id);
+    assert!(invoice.approved);
+
+    // Release should now succeed
+    c.release(&id);
+
+    // Verify invoice is released
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_invoice_without_approver_releases_normally() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Create an invoice without approver and with a tranche to test manual release
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100);
+    let mut tranches = Vec::new(&env);
+    tranches.push_back(Tranche { timestamp: 1_000, basis_points: 10_000 });
+    let mut options = default_options(&env);
+    options.tranches = tranches;
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000, &options);
+
+    // Fund the invoice
+    tk.transfer(&payer, &contract_id, &100);
+    c.pay(&payer, &id, &100_i128, &0_u64);
+
+    // Verify invoice has no approver
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.approver, None);
+    assert!(!invoice.approved);
+
+    // Release should succeed without needing approval
+    c.release(&id);
+
+    // Verify invoice is released
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
 }

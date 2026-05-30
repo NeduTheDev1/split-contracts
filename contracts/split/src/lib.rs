@@ -220,9 +220,11 @@ impl SplitContract {
             options.bonus_max_payers,
             options.prerequisite_id,
             options.tranches,
+            options.approver,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn _create_invoice_inner(
         env: &Env,
         creator: Address,
@@ -236,6 +238,7 @@ impl SplitContract {
         bonus_max_payers: u32,
         prerequisite_id: Option<u64>,
         tranches: Vec<Tranche>,
+        approver: Option<Address>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -306,6 +309,8 @@ impl SplitContract {
             prerequisite_id,
             tranches,
             released_bps: 0,
+            approver,
+            approved: false,
         };
 
         save_invoice(env, id, &invoice);
@@ -338,6 +343,7 @@ impl SplitContract {
                 0,
                 None,
                 Vec::new(&env),
+                None,
             );
             ids.push_back(id);
         }
@@ -379,6 +385,7 @@ impl SplitContract {
             0,
             None,
             Vec::new(&env),
+            None,
         );
 
         if months > 1 {
@@ -490,6 +497,7 @@ impl SplitContract {
     ///
     /// For tranche invoices, only distributes tranches whose timestamp ≤ now.
     /// Blocks with "prerequisite not released" until the prerequisite invoice is Released.
+    /// If an approver is set, requires the invoice to be approved first (issue #25).
     pub fn release(env: Env, invoice_id: u64) {
         require_not_paused(&env);
         let caller = env.current_contract_address();
@@ -503,6 +511,11 @@ impl SplitContract {
 
         let total: i128 = invoice.amounts.iter().sum();
         assert!(invoice.funded >= total, "invoice not fully funded");
+
+        // Approval check (issue #25).
+        if invoice.approver.is_some() && !invoice.approved {
+            panic!("awaiting approval");
+        }
 
         // Prerequisite check (issue #22).
         if let Some(prereq_id) = invoice.prerequisite_id {
@@ -531,6 +544,21 @@ impl SplitContract {
         } else {
             Self::_release_tranches(env, invoice_id, invoice, actor);
         }
+    }
+
+    /// Approve an invoice if it has an approver set (issue #25).
+    ///
+    /// Requires authentication from the approver address.
+    pub fn approve_invoice(env: Env, invoice_id: u64) {
+        require_not_paused(&env);
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        let approver = invoice.approver.as_ref().expect("no approver set on this invoice");
+        approver.require_auth();
+
+        invoice.approved = true;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("aprv"), approver);
     }
 
     /// Distribute tranches unlocked by the current ledger time (issue #23).
@@ -687,6 +715,7 @@ impl SplitContract {
                 0,
                 None,
                 Vec::new(env),
+                None,
             );
             env.storage()
                 .persistent()
@@ -886,6 +915,7 @@ impl SplitContract {
             0,
             None,
             Vec::new(&env),
+            None,
         )
     }
 

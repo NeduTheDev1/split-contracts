@@ -83,6 +83,8 @@ pub struct InvoiceOptions {
     pub prerequisite_id: Option<u64>,
     /// Issue #23: graduated release schedule; empty = release all at once.
     pub tranches: Vec<Tranche>,
+    /// Issue #25: optional approver who must approve before release.
+    pub approver: Option<Address>,
 }
 
 #[contracttype]
@@ -113,4 +115,8 @@ pub struct Invoice {
     pub tranches: Vec<Tranche>,
     /// Issue #23: cumulative basis points already distributed (0–10 000).
     pub released_bps: u32,
+    /// Issue #25: optional approver; if set, release() requires prior approval.
+    pub approver: Option<Address>,
+    /// Issue #25: whether the invoice has been approved by the approver.
+    pub approved: bool,
 }
