@@ -646,7 +646,7 @@ fn test_pause_blocks_pay() {
     env.ledger().set_timestamp(1_000);
 
     let treasury = Address::generate(&env);
-    c.initialize(&admin, &0_i128, &treasury, &token_id);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32);
     let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
     c.pause(&admin);
 
@@ -667,7 +667,7 @@ fn test_unpause_restores_pay() {
     env.ledger().set_timestamp(1_000);
 
     let treasury = Address::generate(&env);
-    c.initialize(&admin, &0_i128, &treasury, &token_id);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32);
     let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
 
     c.pause(&admin);
@@ -689,7 +689,7 @@ fn test_get_invoice_works_while_paused() {
     env.ledger().set_timestamp(1_000);
 
     let treasury = Address::generate(&env);
-    c.initialize(&admin, &0_i128, &treasury, &token_id);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32);
     let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
     c.pause(&admin);
 
@@ -1301,7 +1301,7 @@ fn test_creation_fee_charged_to_treasury() {
 
     env.ledger().set_timestamp(1_000);
 
-    c.initialize(&admin, &50_i128, &treasury, &token_id);
+    c.initialize(&admin, &50_i128, &treasury, &token_id, &0_u32);
 
     assert_eq!(c.get_creation_fee(), 50);
     assert_eq!(c.get_treasury(), treasury);
@@ -1332,7 +1332,7 @@ fn test_creation_fee_zero_by_default() {
 
     env.ledger().set_timestamp(1_000);
 
-    c.initialize(&admin, &0_i128, &treasury, &token_id);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32);
 
     let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
 
@@ -1350,7 +1350,7 @@ fn test_set_creation_fee_updates_fee() {
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
 
-    c.initialize(&admin, &10_i128, &treasury, &token_id);
+    c.initialize(&admin, &10_i128, &treasury, &token_id, &0_u32);
     assert_eq!(c.get_creation_fee(), 10);
 
     c.set_creation_fee(&admin, &25_i128);
@@ -1366,7 +1366,7 @@ fn test_set_treasury_updates_treasury() {
     let treasury1 = Address::generate(&env);
     let treasury2 = Address::generate(&env);
 
-    c.initialize(&admin, &10_i128, &treasury1, &token_id);
+    c.initialize(&admin, &10_i128, &treasury1, &token_id, &0_u32);
     assert_eq!(c.get_treasury(), treasury1);
 
     c.set_treasury(&admin, &treasury2);
@@ -1389,7 +1389,7 @@ fn test_creation_fee_charged_per_invoice_in_batch() {
 
     env.ledger().set_timestamp(1_000);
 
-    c.initialize(&admin, &10_i128, &treasury, &token_id);
+    c.initialize(&admin, &10_i128, &treasury, &token_id, &0_u32);
 
     // create_batch creates 2 invoices, each should incur a 10 unit fee.
     let mut recipients = Vec::new(&env);
@@ -1764,4 +1764,159 @@ fn test_recipient_invoice_ids_after_add_recipient() {
 
     // r1 is unaffected.
     assert_eq!(c.get_recipient_invoice_ids(&r1).len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #41 — platform fee basis points
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_platform_fee_bps_defaults_to_zero() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32);
+
+    assert_eq!(c.get_platform_fee_bps(), 0);
+}
+
+#[test]
+fn test_platform_fee_bps_deducted_on_release() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer, &1_000);
+
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &1_000_u32); // 10%
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+    c.pay(&payer, &id, &500_i128, &0_u64);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    // Recipient gets 500 - 10% = 450.
+    assert_eq!(tk.balance(&recipient), 450);
+    // Treasury gets 50.
+    assert_eq!(tk.balance(&treasury), 50);
+}
+
+#[test]
+fn test_platform_fee_bps_multi_recipient() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer, &1_000);
+
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &500_u32); // 5%
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    recipients.push_back(r3.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+    amounts.push_back(300_i128);
+    amounts.push_back(500_i128);
+
+    let id = c.create_invoice(
+        &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
+    );
+    c.pay(&payer, &id, &1_000_i128, &0_u64);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    // 200 - 5% = 190, 300 - 5% = 285, 500 - 5% = 475 → sum = 950
+    assert_eq!(tk.balance(&r1), 190);
+    assert_eq!(tk.balance(&r2), 285);
+    assert_eq!(tk.balance(&r3), 475);
+    // Treasury gets 50.
+    assert_eq!(tk.balance(&treasury), 50);
+}
+
+#[test]
+fn test_platform_fee_bps_with_tranches() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer, &1_000);
+
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &1_000_u32); // 10%
+
+    let mut tranches = Vec::new(&env);
+    tranches.push_back(types::Tranche { timestamp: 1_500, basis_points: 5_000 });
+    tranches.push_back(types::Tranche { timestamp: 2_500, basis_points: 5_000 });
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(1_000_i128);
+
+    let id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999_u64,
+        &InvoiceOptions {
+            co_creators: Vec::new(&env),
+            allow_early_withdrawal: false,
+            bonus_pool: 0,
+            bonus_max_payers: 0,
+            prerequisite_id: None,
+            tranches: tranches.clone(),
+            co_signers: Vec::new(&env),
+            required_signatures: 0,
+        },
+    );
+
+    c.pay(&payer, &id, &1_000_i128, &0_u64);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+    // First tranche: 500 unlocked.
+    env.ledger().set_timestamp(1_600);
+    c.release(&id);
+
+    // 500 - 10% = 450 to recipient, 50 to treasury.
+    assert_eq!(tk.balance(&recipient), 450);
+    assert_eq!(tk.balance(&treasury), 50);
+
+    // Second tranche: remaining 500 unlocked.
+    env.ledger().set_timestamp(2_600);
+    c.release(&id);
+
+    // Another 450 to recipient, another 50 to treasury.
+    assert_eq!(tk.balance(&recipient), 900);
+    assert_eq!(tk.balance(&treasury), 100);
 }

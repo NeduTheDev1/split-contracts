@@ -32,6 +32,9 @@ fn fee_bps_key() -> Symbol {
 fn creation_fee_key() -> Symbol {
     symbol_short!("crt_fee")
 }
+fn platform_fee_bps_key() -> Symbol {
+    symbol_short!("plat_fee")
+}
 fn treasury_key() -> Symbol {
     symbol_short!("treasury")
 }
@@ -168,17 +171,27 @@ pub struct SplitContract;
 
 #[contractimpl]
 impl SplitContract {
-    /// Set the contract admin, creation fee, treasury, and USDC token. Can only be called once.
-    pub fn initialize(env: Env, admin: Address, creation_fee: i128, treasury: Address, usdc_token: Address) {
+    /// Set the contract admin, creation fee, treasury, USDC token, and platform fee.
+    /// Can only be called once.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        creation_fee: i128,
+        treasury: Address,
+        usdc_token: Address,
+        platform_fee_bps: u32,
+    ) {
         assert!(
             !env.storage().instance().has(&admin_key()),
             "already initialized"
         );
         assert!(creation_fee >= 0, "creation_fee must be non-negative");
+        assert!(platform_fee_bps <= 10_000, "platform_fee_bps must be ≤ 10000");
         env.storage().instance().set(&admin_key(), &admin);
         env.storage().instance().set(&creation_fee_key(), &creation_fee);
         env.storage().instance().set(&treasury_key(), &treasury);
         env.storage().instance().set(&usdc_token_key(), &usdc_token);
+        env.storage().instance().set(&platform_fee_bps_key(), &platform_fee_bps);
         env.storage().persistent().set(&paused_key(), &false);
     }
 
@@ -240,6 +253,14 @@ impl SplitContract {
             .instance()
             .get(&usdc_token_key())
             .expect("usdc token not set")
+    }
+
+    /// Return the platform fee in basis points (issue #41).
+    pub fn get_platform_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&platform_fee_bps_key())
+            .unwrap_or(0u32)
     }
 
     // -----------------------------------------------------------------------
@@ -756,17 +777,36 @@ impl SplitContract {
         let token_client =
             token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
 
+        let platform_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&platform_fee_bps_key())
+            .unwrap_or(0u32);
+
+        let mut total_fee: i128 = 0;
         for i in 0..invoice.recipients.len() {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
             // integer math: avoid overflow via u128 intermediary.
-            let payout = (amount as u128)
+            let payout_raw = (amount as u128)
                 .saturating_mul(new_bps as u128)
                 / 10_000u128;
-            let payout = payout as i128;
-            if payout > 0 {
+            let payout_raw = payout_raw as i128;
+            if payout_raw > 0 {
+                let fee = (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                let payout = payout_raw - fee;
+                total_fee += fee;
                 token_client.transfer(&env.current_contract_address(), &recipient, &payout);
             }
+        }
+
+        if total_fee > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&treasury_key())
+                .expect("treasury not set");
+            token_client.transfer(&env.current_contract_address(), &treasury, &total_fee);
         }
 
         invoice.released_bps += new_bps;
@@ -786,22 +826,29 @@ impl SplitContract {
         let token_client =
             token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
 
-        let fee_bps: u32 = env
+        let platform_fee_bps: u32 = env
             .storage()
-            .persistent()
-            .get(&fee_bps_key())
+            .instance()
+            .get(&platform_fee_bps_key())
             .unwrap_or(0u32);
 
+        let mut total_fee: i128 = 0;
         for i in 0..invoice.recipients.len() {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
-            let payout = if fee_bps > 0 {
-                amount
-                    - (amount as u128 * fee_bps as u128 / 10_000u128) as i128
-            } else {
-                amount
-            };
+            let fee = (amount as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+            let payout = amount - fee;
+            total_fee += fee;
             token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+        }
+
+        if total_fee > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&treasury_key())
+                .expect("treasury not set");
+            token_client.transfer(&env.current_contract_address(), &treasury, &total_fee);
         }
 
         // Distribute bonus pool among first `bonus_max_payers` unique payers.
@@ -845,13 +892,29 @@ impl SplitContract {
                     if member.status == InvoiceStatus::Pending {
                         let member_token =
                             token::Client::new(env, &member.tokens.get(0).expect("no token"));
+                        let mut group_total_fee: i128 = 0;
                         for (recipient, amount) in
                             member.recipients.iter().zip(member.amounts.iter())
                         {
+                            let fee = (amount as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                            let payout = amount - fee;
+                            group_total_fee += fee;
                             member_token.transfer(
                                 &env.current_contract_address(),
                                 &recipient,
-                                &amount,
+                                &payout,
+                            );
+                        }
+                        if group_total_fee > 0 {
+                            let treasury: Address = env
+                                .storage()
+                                .instance()
+                                .get(&treasury_key())
+                                .expect("treasury not set");
+                            member_token.transfer(
+                                &env.current_contract_address(),
+                                &treasury,
+                                &group_total_fee,
                             );
                         }
                         member.status = InvoiceStatus::Released;
