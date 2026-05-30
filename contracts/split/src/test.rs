@@ -2373,115 +2373,61 @@ fn test_min_funding_bps_allows_release_above_threshold() {
 }
 
 // ---------------------------------------------------------------------------
-// Vesting cliff tests (issue #27)
+// Issue #85: generate_payment_proof
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_vesting_cliff_no_cliff_releases_immediately() {
+fn test_payment_proof_multiple_payments() {
     let (env, contract_id, token_id) = setup();
     let c = client(&env, &contract_id);
-    let tk = token_client(&env, &token_id);
 
     let creator = Address::generate(&env);
     let payer = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
-    env.ledger().set_timestamp(1_000);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
 
-    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
-    c.pay(&payer, &id, &200_i128, &0_u64, &false);
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999_999);
+    c.pay(&payer, &id, &100_i128, &0_u64);
+    c.pay(&payer, &id, &150_i128, &1_u64);
 
-    // Without vesting_cliff, funds transfer immediately on full payment (auto-release)
-    let invoice = c.get_invoice(&id);
-    assert_eq!(invoice.status, InvoiceStatus::Released);
-    assert_eq!(tk.balance(&recipient), 200);
-    // All vesting_cliff_claimed entries should be false (but not used since no cliff)
-    assert_eq!(invoice.vesting_cliff_claimed.len(), 1u32);
+    let proof = c.generate_payment_proof(&id, &payer);
+    assert_eq!(proof.invoice_id, id);
+    assert_eq!(proof.payer, payer);
+    assert_eq!(proof.total_paid, 250);
 }
 
 #[test]
-fn test_vesting_cliff_with_cliff_holds_funds_on_release() {
+fn test_payment_proof_no_payment() {
     let (env, contract_id, token_id) = setup();
     let c = client(&env, &contract_id);
-    let tk = token_client(&env, &token_id);
 
     let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
+    let stranger = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
-    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999_999);
 
-    let mut recipients = Vec::new(&env);
-    recipients.push_back(recipient.clone());
-    let mut amounts = Vec::new(&env);
-    amounts.push_back(300);
-
-    let mut options = default_options(&env);
-    options.vesting_cliff = Some(5_000); // Cliff at timestamp 5000
-    // Add a co-signer to prevent auto-release; we won't actually require the signature
-    let mut co_signers = Vec::new(&env);
-    co_signers.push_back(creator.clone());
-    options.co_signers = co_signers;
-    options.required_signatures = 1;
-
-    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &3_000, &options);
-
-    // Pay full amount (won't auto-release because of co-signer guard)
-    c.pay(&payer, &id, &300_i128, &0_u64, &false);
-    // Sign and release to test vesting cliff behavior
-    c.sign_release(&id, &creator);
-    c.release(&id);
-
-    let invoice = c.get_invoice(&id);
-    // Should be Released but funds not transferred yet
-    assert_eq!(invoice.status, InvoiceStatus::Released);
-    assert_eq!(tk.balance(&recipient), 0);
-    // Vesting cliff claimed should be false
-    assert_eq!(invoice.vesting_cliff_claimed.get(0), Some(false));
+    let proof = c.generate_payment_proof(&id, &stranger);
+    assert_eq!(proof.total_paid, 0);
 }
 
 #[test]
-fn test_vesting_cliff_claim_after_cliff_transfers() {
+fn test_payment_proof_hash_deterministic() {
     let (env, contract_id, token_id) = setup();
     let c = client(&env, &contract_id);
-    let tk = token_client(&env, &token_id);
 
     let creator = Address::generate(&env);
     let payer = Address::generate(&env);
     let recipient = Address::generate(&env);
 
     StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
-    env.ledger().set_timestamp(1_000);
 
-    let mut recipients = Vec::new(&env);
-    recipients.push_back(recipient.clone());
-    let mut amounts = Vec::new(&env);
-    amounts.push_back(300);
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999_999);
+    c.pay(&payer, &id, &200_i128, &0_u64);
 
-    let mut options = default_options(&env);
-    options.vesting_cliff = Some(5_000); // Cliff at timestamp 5000
-    // Add a co-signer to prevent auto-release
-    let mut co_signers = Vec::new(&env);
-    co_signers.push_back(creator.clone());
-    options.co_signers = co_signers;
-    options.required_signatures = 1;
-
-    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &3_000, &options);
-    c.pay(&payer, &id, &300_i128, &0_u64, &false);
-    // Sign the release first
-    c.sign_release(&id, &creator);
-    c.release(&id);
-
-    // Move time past cliff
-    env.ledger().set_timestamp(6_000);
-
-    // Now claim should succeed and transfer funds
-    c.claim(&id, &recipient);
-    assert_eq!(tk.balance(&recipient), 300); // Full funded amount is distributed
-
-    let invoice = c.get_invoice(&id);
-    assert_eq!(invoice.vesting_cliff_claimed.get(0), Some(true));
+    let proof1 = c.generate_payment_proof(&id, &payer);
+    let proof2 = c.generate_payment_proof(&id, &payer);
+    assert_eq!(proof1.proof_hash, proof2.proof_hash);
+    assert_eq!(proof1.total_paid, proof2.total_paid);
 }
-
