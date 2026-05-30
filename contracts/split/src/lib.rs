@@ -68,6 +68,11 @@ fn rep_key(payer: &Address) -> (Symbol, Address) {
     (symbol_short!("rep"), payer.clone())
 }
 
+/// Per-address credit score key (issue #38).
+fn credit_key(payer: &Address) -> (Symbol, Address) {
+    (symbol_short!("credit"), payer.clone())
+}
+
 /// Per-payer per-invoice nonce key (issue #21).
 fn nonce_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("nonce"), invoice_id, payer.clone())
@@ -581,6 +586,16 @@ impl SplitContract {
         env.storage()
             .persistent()
             .set(&rep_key(payer), &(rep + 1));
+
+        // Increment per-address credit score (issue #38).
+        let credit: u64 = env
+            .storage()
+            .persistent()
+            .get(&credit_key(payer))
+            .unwrap_or(0u64);
+        env.storage()
+            .persistent()
+            .set(&credit_key(payer), &(credit + 1));
 
         append_audit_entry(env, invoice_id, symbol_short!("pay"), payer);
         events::payment_received(env, invoice_id, payer, amount);
@@ -1250,6 +1265,16 @@ impl SplitContract {
             token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
         token_client.transfer(&env.current_contract_address(), &payer, &total_paid);
 
+        // Decrement credit score by 2 on early withdrawal (floor 0) (issue #38).
+        let credit: u64 = env
+            .storage()
+            .persistent()
+            .get(&credit_key(&payer))
+            .unwrap_or(0u64);
+        env.storage()
+            .persistent()
+            .set(&credit_key(&payer), &credit.saturating_sub(2));
+
         save_invoice(&env, invoice_id, &invoice);
     }
 
@@ -1373,6 +1398,17 @@ impl SplitContract {
         env.storage()
             .persistent()
             .get(&rep_key(&address))
+            .unwrap_or(0u64)
+    }
+
+    /// Returns the credit score for an address.
+    ///
+    /// Incremented by 1 on every successful `pay()`, decremented by 2 on
+    /// early `withdraw()` (floor 0). Returns 0 for an address that has never paid.
+    pub fn get_credit_score(env: Env, address: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&credit_key(&address))
             .unwrap_or(0u64)
     }
 
