@@ -1410,3 +1410,166 @@ fn test_creation_fee_charged_per_invoice_in_batch() {
     // 2 invoices x 10 fee = 20 total.
     assert_eq!(tk.balance(&treasury), 20);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #38 — credit score
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_credit_score_zero_for_new_address() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let address = Address::generate(&env);
+    assert_eq!(c.get_credit_score(&address), 0);
+}
+
+#[test]
+fn test_credit_score_increments_across_three_invoices() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    assert_eq!(c.get_credit_score(&payer), 0);
+
+    c.pay(&payer, &id1, &100_i128, &0_u64);
+    assert_eq!(c.get_credit_score(&payer), 1);
+
+    c.pay(&payer, &id2, &100_i128, &0_u64);
+    assert_eq!(c.get_credit_score(&payer), 2);
+
+    c.pay(&payer, &id3, &100_i128, &0_u64);
+    assert_eq!(c.get_credit_score(&payer), 3);
+}
+
+#[test]
+fn test_credit_score_is_per_address_globally() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer_a = Address::generate(&env);
+    let payer_b = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer_a, &1_000);
+    sa.mint(&payer_b, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 400, &token_id, 9_999);
+
+    c.pay(&payer_a, &id, &200_i128, &0_u64);
+    c.pay(&payer_b, &id, &200_i128, &0_u64);
+
+    assert_eq!(c.get_credit_score(&payer_a), 1);
+    assert_eq!(c.get_credit_score(&payer_b), 1);
+
+    let other = Address::generate(&env);
+    assert_eq!(c.get_credit_score(&other), 0);
+}
+
+#[test]
+fn test_credit_score_decremented_on_early_withdrawal() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    // Pay 3 invoices to build up a score of 3.
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    c.pay(&payer, &id1, &100_i128, &0_u64);
+    c.pay(&payer, &id2, &100_i128, &0_u64);
+    c.pay(&payer, &id3, &100_i128, &0_u64);
+    assert_eq!(c.get_credit_score(&payer), 3);
+
+    // Create an invoice with early withdrawal enabled and pay into it.
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(500_i128);
+    let id_ew = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999_u64,
+        &InvoiceOptions {
+            co_creators: Vec::new(&env),
+            allow_early_withdrawal: true,
+            bonus_pool: 0,
+            bonus_max_payers: 0,
+            prerequisite_id: None,
+            tranches: Vec::new(&env),
+            co_signers: Vec::new(&env),
+            required_signatures: 0,
+        },
+    );
+
+    c.pay(&payer, &id_ew, &200_i128, &0_u64);
+    assert_eq!(c.get_credit_score(&payer), 4); // +1 for the pay
+
+    c.withdraw(&id_ew, &payer);
+    assert_eq!(c.get_credit_score(&payer), 2); // -2 for early withdrawal
+}
+
+#[test]
+fn test_credit_score_floor_zero_on_withdrawal() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    // Pay once (score = 1), then withdraw (score should floor at 0, not underflow).
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(500_i128);
+    let id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999_u64,
+        &InvoiceOptions {
+            co_creators: Vec::new(&env),
+            allow_early_withdrawal: true,
+            bonus_pool: 0,
+            bonus_max_payers: 0,
+            prerequisite_id: None,
+            tranches: Vec::new(&env),
+            co_signers: Vec::new(&env),
+            required_signatures: 0,
+        },
+    );
+
+    c.pay(&payer, &id, &200_i128, &0_u64);
+    assert_eq!(c.get_credit_score(&payer), 1);
+
+    c.withdraw(&id, &payer);
+    // 1 - 2 would underflow; saturating_sub floors at 0.
+    assert_eq!(c.get_credit_score(&payer), 0);
+}
