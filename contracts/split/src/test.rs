@@ -1653,3 +1653,115 @@ fn test_rollover_invoice_preserves_recipients_and_amounts() {
     assert_eq!(new_invoice.amounts.get_unchecked(1), 200);
     assert_eq!(new_invoice.amounts.get_unchecked(2), 300);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #40 — recipient invoice ID index
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recipient_invoice_ids_empty_for_new_address() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let addr = Address::generate(&env);
+    let ids = c.get_recipient_invoice_ids(&addr);
+    assert_eq!(ids.len(), 0);
+}
+
+#[test]
+fn test_recipient_invoice_ids_single_invoice() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let ids = c.get_recipient_invoice_ids(&recipient);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids.get_unchecked(0), id);
+}
+
+#[test]
+fn test_recipient_invoice_ids_same_recipient_multiple_invoices() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let other = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &other, 300, &token_id, 9_999);
+
+    let ids = c.get_recipient_invoice_ids(&recipient);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.get_unchecked(0), id1);
+    assert_eq!(ids.get_unchecked(1), id2);
+
+    let other_ids = c.get_recipient_invoice_ids(&other);
+    assert_eq!(other_ids.len(), 1);
+    assert_eq!(other_ids.get_unchecked(0), id3);
+}
+
+#[test]
+fn test_recipient_invoice_ids_multi_recipient_invoice() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    amounts.push_back(200_i128);
+
+    env.ledger().set_timestamp(1_000);
+    let id = c.create_invoice(
+        &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
+    );
+
+    let r1_ids = c.get_recipient_invoice_ids(&r1);
+    assert_eq!(r1_ids.len(), 1);
+    assert_eq!(r1_ids.get_unchecked(0), id);
+
+    let r2_ids = c.get_recipient_invoice_ids(&r2);
+    assert_eq!(r2_ids.len(), 1);
+    assert_eq!(r2_ids.get_unchecked(0), id);
+}
+
+#[test]
+fn test_recipient_invoice_ids_after_add_recipient() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &r1, 100, &token_id, 9_999);
+
+    // r1 should have the invoice before adding r2.
+    assert_eq!(c.get_recipient_invoice_ids(&r1).len(), 1);
+
+    // Add r2 via add_recipient.
+    c.add_recipient(&creator, &id, &r2, &200_i128);
+
+    // r2 should now also have the invoice.
+    let r2_ids = c.get_recipient_invoice_ids(&r2);
+    assert_eq!(r2_ids.len(), 1);
+    assert_eq!(r2_ids.get_unchecked(0), id);
+
+    // r1 is unaffected.
+    assert_eq!(c.get_recipient_invoice_ids(&r1).len(), 1);
+}

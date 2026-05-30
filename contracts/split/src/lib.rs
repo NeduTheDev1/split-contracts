@@ -73,6 +73,11 @@ fn nonce_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("nonce"), invoice_id, payer.clone())
 }
 
+/// Per-recipient invoice ID index key (issue #40).
+fn recipient_invoice_ids_key(recipient: &Address) -> (Symbol, Address) {
+    (symbol_short!("rec_inv"), recipient.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Invoice storage helpers
 // ---------------------------------------------------------------------------
@@ -428,6 +433,18 @@ impl SplitContract {
 
         save_invoice(env, id, &invoice);
         events::invoice_created(env, id, &creator, total, &None);
+
+        // Index each recipient -> invoice ID (issue #40).
+        for recipient in recipients.iter() {
+            let key = recipient_invoice_ids_key(&recipient);
+            let mut ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(env));
+            ids.push_back(id);
+            env.storage().persistent().set(&key, &ids);
+        }
 
         id
     }
@@ -1122,6 +1139,16 @@ impl SplitContract {
         save_invoice(&env, invoice_id, &invoice);
         append_audit_entry(&env, invoice_id, symbol_short!("add_rec"), &caller);
         events::recipient_added(&env, invoice_id, &recipient, amount);
+
+        // Index new recipient -> invoice ID (issue #40).
+        let key = recipient_invoice_ids_key(&recipient);
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.push_back(invoice_id);
+        env.storage().persistent().set(&key, &ids);
     }
 
     // -----------------------------------------------------------------------
@@ -1419,6 +1446,14 @@ impl SplitContract {
             timestamp: env.ledger().timestamp(),
             hash: hash.into(),
         }
+    }
+
+    /// Return all invoice IDs that include `recipient` as a recipient (issue #40).
+    pub fn get_recipient_invoice_ids(env: Env, recipient: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&recipient_invoice_ids_key(&recipient))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Returns true if the invoice exists and its status matches `expected_status`.
