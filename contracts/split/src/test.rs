@@ -48,6 +48,7 @@ fn default_options(env: &Env) -> InvoiceOptions {
             required_signatures: 0,
             penalty_bps: None,
             penalty_deadline: None,
+            min_funding_bps: None,
         }
     }
     }
@@ -785,6 +786,7 @@ fn test_bonus_pool_distributed_to_first_payer() {
             required_signatures: 0,
             penalty_bps: None,
             penalty_deadline: None,
+            min_funding_bps: None,
         },
     );
 
@@ -1025,6 +1027,7 @@ fn test_release_blocked_by_prerequisite() {
             required_signatures: 0,
             penalty_bps: None,
             penalty_deadline: None,
+            min_funding_bps: None,
         },
     );
 
@@ -1072,6 +1075,7 @@ fn test_release_succeeds_after_prerequisite_released() {
             required_signatures: 0,
             penalty_bps: None,
             penalty_deadline: None,
+            min_funding_bps: None,
         },
     );
 
@@ -1152,6 +1156,7 @@ fn test_tranches_partial_then_full_release() {
             required_signatures: 0,
             penalty_bps: None,
             penalty_deadline: None,
+            min_funding_bps: None,
         },
     );
 
@@ -1214,6 +1219,7 @@ fn test_release_before_any_tranche_unlocked_panics() {
             required_signatures: 0,
             penalty_bps: None,
             penalty_deadline: None,
+            min_funding_bps: None,
         },
     );
 
@@ -1913,6 +1919,7 @@ fn test_platform_fee_bps_with_tranches() {
             required_signatures: 0,
             penalty_bps: None,
             penalty_deadline: None,
+            min_funding_bps: None,
         },
     );
 
@@ -1977,6 +1984,7 @@ fn test_penalty_not_applied_before_penalty_deadline() {
             required_signatures: 0,
             penalty_bps: Some(1_000), // 10 %
             penalty_deadline: Some(2_000),
+            min_funding_bps: None,
         },
     );
 
@@ -2026,6 +2034,7 @@ fn test_penalty_applied_after_penalty_deadline() {
             required_signatures: 0,
             penalty_bps: Some(1_000), // 10 %
             penalty_deadline: Some(2_000),
+            min_funding_bps: None,
         },
     );
 
@@ -2082,6 +2091,7 @@ fn test_penalty_distributed_proportionally_multi_recipient() {
             required_signatures: 0,
             penalty_bps: Some(1_000), // 10 %
             penalty_deadline: Some(2_000),
+            min_funding_bps: None,
         },
     );
 
@@ -2136,6 +2146,7 @@ fn test_penalty_bps_zero_no_penalty_even_after_deadline() {
             required_signatures: 0,
             penalty_bps: Some(0),
             penalty_deadline: Some(2_000),
+            min_funding_bps: None,
         },
     );
 
@@ -2145,4 +2156,177 @@ fn test_penalty_bps_zero_no_penalty_even_after_deadline() {
     // Recipient gets full 500, no penalty.
     assert_eq!(tk.balance(&recipient), 500);
     assert_eq!(tk.balance(&payer), 500);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #43 — minimum funding threshold
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_min_funding_bps_zero_requires_full_funding() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer, &1_000);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+
+    // Partial fund (300 of 500) — release should fail.
+    c.pay(&payer, &id, &300_i128, &0_u64);
+    assert_eq!(c.get_invoice(&id).funded, 300);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+    // Fund the rest.
+    c.pay(&payer, &id, &200_i128, &1_u64);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_min_funding_bps_blocks_early_release() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer, &1_000);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(1_000_i128);
+
+    let id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999_u64,
+        &InvoiceOptions {
+            co_creators: Vec::new(&env),
+            allow_early_withdrawal: false,
+            bonus_pool: 0,
+            bonus_max_payers: 0,
+            prerequisite_id: None,
+            tranches: Vec::new(&env),
+            co_signers: Vec::new(&env),
+            required_signatures: 0,
+            penalty_bps: None,
+            penalty_deadline: None,
+            min_funding_bps: Some(8_000), // 80 %
+        },
+    );
+
+    // Fund 500 of 1000 (50% — below 80% threshold). Release should panic.
+    c.pay(&payer, &id, &500_i128, &0_u64);
+    assert_eq!(c.get_invoice(&id).funded, 500);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+}
+
+#[test]
+#[should_panic(expected = "minimum funding not reached")]
+fn test_min_funding_bps_panics_below_threshold() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer, &1_000);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(1_000_i128);
+
+    let id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999_u64,
+        &InvoiceOptions {
+            co_creators: Vec::new(&env),
+            allow_early_withdrawal: false,
+            bonus_pool: 0,
+            bonus_max_payers: 0,
+            prerequisite_id: None,
+            tranches: Vec::new(&env),
+            co_signers: Vec::new(&env),
+            required_signatures: 0,
+            penalty_bps: None,
+            penalty_deadline: None,
+            min_funding_bps: Some(8_000), // 80 %
+        },
+    );
+
+    // Fund 700 of 1000 (70% — below 80%). Try to release — must panic.
+    c.pay(&payer, &id, &700_i128, &0_u64);
+    // Guarded (has min_funding_bps), so auto-release won't fire.
+    c.release(&id);
+}
+
+#[test]
+fn test_min_funding_bps_allows_release_above_threshold() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer, &2_000);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(1_000_i128);
+
+    let id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999_u64,
+        &InvoiceOptions {
+            co_creators: Vec::new(&env),
+            allow_early_withdrawal: false,
+            bonus_pool: 0,
+            bonus_max_payers: 0,
+            prerequisite_id: None,
+            tranches: Vec::new(&env),
+            co_signers: Vec::new(&env),
+            required_signatures: 0,
+            penalty_bps: None,
+            penalty_deadline: None,
+            min_funding_bps: Some(8_000), // 80 %
+        },
+    );
+
+    // Fund 900 of 1000 (90% >= 80%). Release should succeed.
+    c.pay(&payer, &id, &900_i128, &0_u64);
+    // Guarded (has min_funding_bps), so we must manually release.
+    c.release(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 900);
 }

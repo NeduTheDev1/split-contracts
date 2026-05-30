@@ -336,6 +336,7 @@ impl SplitContract {
             options.required_signatures,
             options.penalty_bps.unwrap_or(0),
             options.penalty_deadline.unwrap_or(0),
+            options.min_funding_bps.unwrap_or(0),
         )
     }
 
@@ -357,6 +358,7 @@ impl SplitContract {
         required_signatures: u32,
         penalty_bps: u32,
         penalty_deadline: u64,
+        min_funding_bps: u32,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -366,6 +368,7 @@ impl SplitContract {
         assert!(deadline > env.ledger().timestamp(), "deadline must be in the future");
         assert!(bonus_pool >= 0, "bonus_pool must be non-negative");
         assert!(penalty_bps <= 10_000, "penalty_bps must be ≤ 10000");
+        assert!(min_funding_bps <= 10_000, "min_funding_bps must be ≤ 10000");
 
         for amt in amounts.iter() {
             assert!(amt > 0, "amounts must be positive");
@@ -457,6 +460,7 @@ impl SplitContract {
             approved: false,
             penalty_bps,
             penalty_deadline,
+            min_funding_bps,
         };
 
         save_invoice(env, id, &invoice);
@@ -547,6 +551,7 @@ impl SplitContract {
             None,
             Vec::new(&env),
             Vec::new(&env),
+            0,
             0,
             0,
             0,
@@ -733,7 +738,12 @@ impl SplitContract {
         );
 
         let total: i128 = invoice.amounts.iter().sum();
-        assert!(invoice.funded >= total, "invoice not fully funded");
+        let min_required = if invoice.min_funding_bps > 0 {
+            (total as u128 * invoice.min_funding_bps as u128 / 10_000u128) as i128
+        } else {
+            total
+        };
+        assert!(invoice.funded >= min_required, "minimum funding not reached");
 
         // Approval check (issue #25).
         if invoice.approver.is_some() && !invoice.approved {
@@ -817,14 +827,18 @@ impl SplitContract {
             .get(&platform_fee_bps_key())
             .unwrap_or(0u32);
 
+        let total: i128 = invoice.amounts.iter().sum();
+        let funded = invoice.funded;
+        let n = invoice.recipients.len();
         let mut total_fee: i128 = 0;
-        for i in 0..invoice.recipients.len() {
+        for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
             // integer math: avoid overflow via u128 intermediary.
             let payout_raw = (amount as u128)
                 .saturating_mul(new_bps as u128)
-                / 10_000u128;
+                .saturating_mul(funded as u128)
+                / (10000u128 * total as u128);
             let payout_raw = payout_raw as i128;
             if payout_raw > 0 {
                 let fee = (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
@@ -866,12 +880,22 @@ impl SplitContract {
             .get(&platform_fee_bps_key())
             .unwrap_or(0u32);
 
+        let total: i128 = invoice.amounts.iter().sum();
+        let funded = invoice.funded;
+        let n = invoice.recipients.len();
+        let mut distributed: i128 = 0;
         let mut total_fee: i128 = 0;
-        for i in 0..invoice.recipients.len() {
+        for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
-            let fee = (amount as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
-            let payout = amount - fee;
+            let proportional = if i == n - 1 {
+                funded - distributed
+            } else {
+                (amount as u128 * funded as u128 / total as u128) as i128
+            };
+            let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+            let payout = proportional - fee;
+            distributed += proportional;
             total_fee += fee;
             token_client.transfer(&env.current_contract_address(), &recipient, &payout);
         }
@@ -926,12 +950,22 @@ impl SplitContract {
                     if member.status == InvoiceStatus::Pending {
                         let member_token =
                             token::Client::new(env, &member.tokens.get(0).expect("no token"));
+                        let member_total: i128 = member.amounts.iter().sum();
+                        let member_funded = member.funded;
+                        let member_n = member.recipients.len();
+                        let mut member_distributed: i128 = 0;
                         let mut group_total_fee: i128 = 0;
-                        for (recipient, amount) in
-                            member.recipients.iter().zip(member.amounts.iter())
+                        for (j, (recipient, amount)) in
+                            member.recipients.iter().zip(member.amounts.iter()).enumerate()
                         {
-                            let fee = (amount as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
-                            let payout = amount - fee;
+                            let proportional = if j == member_n - 1 {
+                                member_funded - member_distributed
+                            } else {
+                                (amount as u128 * member_funded as u128 / member_total as u128) as i128
+                            };
+                            let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                            let payout = proportional - fee;
+                            member_distributed += proportional;
                             group_total_fee += fee;
                             member_token.transfer(
                                 &env.current_contract_address(),
@@ -989,6 +1023,7 @@ impl SplitContract {
                 None,
                 Vec::new(env),
                 Vec::new(env),
+                0,
                 0,
                 0,
                 0,
@@ -1184,6 +1219,7 @@ impl SplitContract {
             old_invoice.required_signatures,
             old_invoice.penalty_bps,
             old_invoice.penalty_deadline,
+            old_invoice.min_funding_bps,
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -1307,6 +1343,7 @@ impl SplitContract {
             None,
             Vec::new(&env),
             Vec::new(&env),
+            0,
             0,
             0,
             0,

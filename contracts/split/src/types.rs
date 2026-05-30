@@ -91,6 +91,8 @@ pub struct InvoiceOptions {
     pub penalty_bps: Option<u32>,
     /// Soft deadline timestamp; payments after this incur a penalty (issue #42).
     pub penalty_deadline: Option<u64>,
+    /// Minimum funding threshold in basis points (issue #43).
+    pub min_funding_bps: Option<u32>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -167,6 +169,8 @@ pub struct Invoice {
     pub penalty_bps: u32,
     /// Soft deadline; payments after this timestamp incur a penalty (issue #42).
     pub penalty_deadline: u64,
+    /// Minimum funding threshold in basis points (issue #43); 0 means 100%.
+    pub min_funding_bps: u32,
 }
 
 impl Invoice {
@@ -202,6 +206,7 @@ impl Invoice {
             approved: false,
             penalty_bps: 0,
             penalty_deadline: 0,
+            min_funding_bps: 0,
         }
     }
 }
