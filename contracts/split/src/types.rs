@@ -121,6 +121,8 @@ pub struct LegacyInvoice {
     pub prerequisite_id: Option<u64>,
     pub tranches: Vec<Tranche>,
     pub released_bps: u32,
+    pub stake_amount: i128,
+    pub referrer: Option<Address>,
 }
 
 #[contracttype]
