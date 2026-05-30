@@ -32,6 +32,9 @@ fn fee_bps_key() -> Symbol {
 fn creation_fee_key() -> Symbol {
     symbol_short!("crt_fee")
 }
+fn platform_fee_bps_key() -> Symbol {
+    symbol_short!("plat_fee")
+}
 fn treasury_key() -> Symbol {
     symbol_short!("treasury")
 }
@@ -78,9 +81,9 @@ fn nonce_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("nonce"), invoice_id, payer.clone())
 }
 
-/// Per-address referral count key (issue #87).
-fn referral_count_key(referrer: &Address) -> (Symbol, Address) {
-    (symbol_short!("ref_cnt"), referrer.clone())
+/// Per-recipient invoice ID index key (issue #40).
+fn recipient_invoice_ids_key(recipient: &Address) -> (Symbol, Address) {
+    (symbol_short!("rec_inv"), recipient.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -173,17 +176,27 @@ pub struct SplitContract;
 
 #[contractimpl]
 impl SplitContract {
-    /// Set the contract admin, creation fee, treasury, and USDC token. Can only be called once.
-    pub fn initialize(env: Env, admin: Address, creation_fee: i128, treasury: Address, usdc_token: Address) {
+    /// Set the contract admin, creation fee, treasury, USDC token, and platform fee.
+    /// Can only be called once.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        creation_fee: i128,
+        treasury: Address,
+        usdc_token: Address,
+        platform_fee_bps: u32,
+    ) {
         assert!(
             !env.storage().instance().has(&admin_key()),
             "already initialized"
         );
         assert!(creation_fee >= 0, "creation_fee must be non-negative");
+        assert!(platform_fee_bps <= 10_000, "platform_fee_bps must be ≤ 10000");
         env.storage().instance().set(&admin_key(), &admin);
         env.storage().instance().set(&creation_fee_key(), &creation_fee);
         env.storage().instance().set(&treasury_key(), &treasury);
         env.storage().instance().set(&usdc_token_key(), &usdc_token);
+        env.storage().instance().set(&platform_fee_bps_key(), &platform_fee_bps);
         env.storage().persistent().set(&paused_key(), &false);
     }
 
@@ -245,6 +258,14 @@ impl SplitContract {
             .instance()
             .get(&usdc_token_key())
             .expect("usdc token not set")
+    }
+
+    /// Return the platform fee in basis points (issue #41).
+    pub fn get_platform_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&platform_fee_bps_key())
+            .unwrap_or(0u32)
     }
 
     // -----------------------------------------------------------------------
@@ -319,8 +340,9 @@ impl SplitContract {
             options.tranches,
             options.co_signers,
             options.required_signatures,
-            options.stake_amount,
-            options.referrer,
+            options.penalty_bps.unwrap_or(0),
+            options.penalty_deadline.unwrap_or(0),
+            options.min_funding_bps.unwrap_or(0),
         )
     }
 
@@ -340,8 +362,9 @@ impl SplitContract {
         tranches: Vec<Tranche>,
         co_signers: Vec<Address>,
         required_signatures: u32,
-        stake_amount: i128,
-        referrer: Option<Address>,
+        penalty_bps: u32,
+        penalty_deadline: u64,
+        min_funding_bps: u32,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -350,7 +373,8 @@ impl SplitContract {
         assert!(!recipients.is_empty(), "must have at least one recipient");
         assert!(deadline > env.ledger().timestamp(), "deadline must be in the future");
         assert!(bonus_pool >= 0, "bonus_pool must be non-negative");
-        assert!(stake_amount >= 0, "stake_amount must be non-negative");
+        assert!(penalty_bps <= 10_000, "penalty_bps must be ≤ 10000");
+        assert!(min_funding_bps <= 10_000, "min_funding_bps must be ≤ 10000");
 
         for amt in amounts.iter() {
             assert!(amt > 0, "amounts must be positive");
@@ -463,12 +487,25 @@ impl SplitContract {
             signatures: Vec::new(env),
             approver: None,
             approved: false,
-            stake_amount,
-            referrer,
+            penalty_bps,
+            penalty_deadline,
+            min_funding_bps,
         };
 
         save_invoice(env, id, &invoice);
         events::invoice_created(env, id, &creator, total, &None);
+
+        // Index each recipient -> invoice ID (issue #40).
+        for recipient in recipients.iter() {
+            let key = recipient_invoice_ids_key(&recipient);
+            let mut ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(env));
+            ids.push_back(id);
+            env.storage().persistent().set(&key, &ids);
+        }
 
         id
     }
@@ -500,7 +537,7 @@ impl SplitContract {
                 Vec::new(&env),
                 0,
                 0,
-                None,
+                0,
             );
             ids.push_back(id);
         }
@@ -545,7 +582,8 @@ impl SplitContract {
             Vec::new(&env),
             0,
             0,
-            None,
+            0,
+            0,
         );
 
         if months > 1 {
@@ -630,8 +668,31 @@ impl SplitContract {
             amount
         };
 
-        invoice.payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0 });
-        invoice.funded += credited_amount;
+        // Penalty for late payment (issue #42).
+        if invoice.penalty_bps > 0 && env.ledger().timestamp() > invoice.penalty_deadline {
+            let penalty_amount = (amount as u128 * invoice.penalty_bps as u128 / 10_000u128) as i128;
+            if penalty_amount > 0 {
+                let total_amounts: i128 = invoice.amounts.iter().sum();
+                let mut distributed: i128 = 0;
+                let n = invoice.recipients.len();
+                for i in 0..n {
+                    let recipient = invoice.recipients.get(i).unwrap();
+                    let amt = invoice.amounts.get(i).unwrap();
+                    let share = if i == n - 1 {
+                        penalty_amount - distributed
+                    } else {
+                        (penalty_amount as u128 * amt as u128 / total_amounts as u128) as i128
+                    };
+                    distributed += share;
+                    if share > 0 {
+                        token_client.transfer(payer, &recipient, &share);
+                    }
+                }
+            }
+        }
+
+        invoice.payments.push_back(Payment { payer: payer.clone(), amount, tip: 0 });
+        invoice.funded += amount;
 
         // Increment per-address reputation counter (issue #24).
         let rep: u64 = env
@@ -732,7 +793,12 @@ impl SplitContract {
         );
 
         let total: i128 = invoice.amounts.iter().sum();
-        assert!(invoice.funded >= total, "invoice not fully funded");
+        let min_required = if invoice.min_funding_bps > 0 {
+            (total as u128 * invoice.min_funding_bps as u128 / 10_000u128) as i128
+        } else {
+            total
+        };
+        assert!(invoice.funded >= min_required, "minimum funding not reached");
 
         // Approval check (issue #25).
         if invoice.approver.is_some() && !invoice.approved {
@@ -810,17 +876,40 @@ impl SplitContract {
         let token_client =
             token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
 
-        for i in 0..invoice.recipients.len() {
+        let platform_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&platform_fee_bps_key())
+            .unwrap_or(0u32);
+
+        let total: i128 = invoice.amounts.iter().sum();
+        let funded = invoice.funded;
+        let n = invoice.recipients.len();
+        let mut total_fee: i128 = 0;
+        for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
             // integer math: avoid overflow via u128 intermediary.
-            let payout = (amount as u128)
+            let payout_raw = (amount as u128)
                 .saturating_mul(new_bps as u128)
-                / 10_000u128;
-            let payout = payout as i128;
-            if payout > 0 {
+                .saturating_mul(funded as u128)
+                / (10000u128 * total as u128);
+            let payout_raw = payout_raw as i128;
+            if payout_raw > 0 {
+                let fee = (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                let payout = payout_raw - fee;
+                total_fee += fee;
                 token_client.transfer(&env.current_contract_address(), &recipient, &payout);
             }
+        }
+
+        if total_fee > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&treasury_key())
+                .expect("treasury not set");
+            token_client.transfer(&env.current_contract_address(), &treasury, &total_fee);
         }
 
         invoice.released_bps += new_bps;
@@ -841,22 +930,39 @@ impl SplitContract {
         let token_client =
             token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
 
-        let fee_bps: u32 = env
+        let platform_fee_bps: u32 = env
             .storage()
-            .persistent()
-            .get(&fee_bps_key())
+            .instance()
+            .get(&platform_fee_bps_key())
             .unwrap_or(0u32);
 
-        for i in 0..invoice.recipients.len() {
+        let total: i128 = invoice.amounts.iter().sum();
+        let funded = invoice.funded;
+        let n = invoice.recipients.len();
+        let mut distributed: i128 = 0;
+        let mut total_fee: i128 = 0;
+        for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
-            let payout = if fee_bps > 0 {
-                amount
-                    - (amount as u128 * fee_bps as u128 / 10_000u128) as i128
+            let proportional = if i == n - 1 {
+                funded - distributed
             } else {
-                amount
+                (amount as u128 * funded as u128 / total as u128) as i128
             };
+            let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+            let payout = proportional - fee;
+            distributed += proportional;
+            total_fee += fee;
             token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+        }
+
+        if total_fee > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&treasury_key())
+                .expect("treasury not set");
+            token_client.transfer(&env.current_contract_address(), &treasury, &total_fee);
         }
 
         // Distribute bonus pool among first `bonus_max_payers` unique payers.
@@ -915,13 +1021,39 @@ impl SplitContract {
                     if member.status == InvoiceStatus::Pending {
                         let member_token =
                             token::Client::new(env, &member.tokens.get(0).expect("no token"));
-                        for (recipient, amount) in
-                            member.recipients.iter().zip(member.amounts.iter())
+                        let member_total: i128 = member.amounts.iter().sum();
+                        let member_funded = member.funded;
+                        let member_n = member.recipients.len();
+                        let mut member_distributed: i128 = 0;
+                        let mut group_total_fee: i128 = 0;
+                        for (j, (recipient, amount)) in
+                            member.recipients.iter().zip(member.amounts.iter()).enumerate()
                         {
+                            let proportional = if j == member_n - 1 {
+                                member_funded - member_distributed
+                            } else {
+                                (amount as u128 * member_funded as u128 / member_total as u128) as i128
+                            };
+                            let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                            let payout = proportional - fee;
+                            member_distributed += proportional;
+                            group_total_fee += fee;
                             member_token.transfer(
                                 &env.current_contract_address(),
                                 &recipient,
-                                &amount,
+                                &payout,
+                            );
+                        }
+                        if group_total_fee > 0 {
+                            let treasury: Address = env
+                                .storage()
+                                .instance()
+                                .get(&treasury_key())
+                                .expect("treasury not set");
+                            member_token.transfer(
+                                &env.current_contract_address(),
+                                &treasury,
+                                &group_total_fee,
                             );
                         }
                         member.status = InvoiceStatus::Released;
@@ -964,7 +1096,8 @@ impl SplitContract {
                 Vec::new(env),
                 0,
                 0,
-                None,
+                0,
+                0,
             );
             env.storage()
                 .persistent()
@@ -1202,8 +1335,9 @@ impl SplitContract {
             old_invoice.tranches.clone(),
             old_invoice.co_signers.clone(),
             old_invoice.required_signatures,
-            0, // No stake on rollover
-            None, // No referrer on rollover
+            old_invoice.penalty_bps,
+            old_invoice.penalty_deadline,
+            old_invoice.min_funding_bps,
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -1260,6 +1394,16 @@ impl SplitContract {
         save_invoice(&env, invoice_id, &invoice);
         append_audit_entry(&env, invoice_id, symbol_short!("add_rec"), &caller);
         events::recipient_added(&env, invoice_id, &recipient, amount);
+
+        // Index new recipient -> invoice ID (issue #40).
+        let key = recipient_invoice_ids_key(&recipient);
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.push_back(invoice_id);
+        env.storage().persistent().set(&key, &ids);
     }
 
     // -----------------------------------------------------------------------
@@ -1319,7 +1463,8 @@ impl SplitContract {
             Vec::new(&env),
             0,
             0,
-            None,
+            0,
+            0,
         )
     }
 
@@ -1580,6 +1725,14 @@ impl SplitContract {
             timestamp: env.ledger().timestamp(),
             hash: hash.into(),
         }
+    }
+
+    /// Return all invoice IDs that include `recipient` as a recipient (issue #40).
+    pub fn get_recipient_invoice_ids(env: Env, recipient: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&recipient_invoice_ids_key(&recipient))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Returns true if the invoice exists and its status matches `expected_status`.

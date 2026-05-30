@@ -87,10 +87,12 @@ pub struct InvoiceOptions {
     pub co_signers: Vec<Address>,
     /// How many co-signer approvals are needed (≤ `co_signers.len()`).
     pub required_signatures: u32,
-    /// Issue #89: optional reputation stake deposited by creator.
-    pub stake_amount: i128,
-    /// Issue #87: optional referrer address for referral tracking.
-    pub referrer: Option<Address>,
+    /// Penalty basis points for late payments (issue #42).
+    pub penalty_bps: Option<u32>,
+    /// Soft deadline timestamp; payments after this incur a penalty (issue #42).
+    pub penalty_deadline: Option<u64>,
+    /// Minimum funding threshold in basis points (issue #43).
+    pub min_funding_bps: Option<u32>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -165,10 +167,12 @@ pub struct Invoice {
     pub approver: Option<Address>,
     /// Whether the approver has approved the invoice (issue #25).
     pub approved: bool,
-    /// Issue #89: optional reputation stake deposited by creator in USDC.
-    pub stake_amount: i128,
-    /// Issue #87: optional referrer address for referral tracking.
-    pub referrer: Option<Address>,
+    /// Penalty basis points for payments after `penalty_deadline` (issue #42).
+    pub penalty_bps: u32,
+    /// Soft deadline; payments after this timestamp incur a penalty (issue #42).
+    pub penalty_deadline: u64,
+    /// Minimum funding threshold in basis points (issue #43); 0 means 100%.
+    pub min_funding_bps: u32,
 }
 
 impl Invoice {
@@ -202,8 +206,9 @@ impl Invoice {
             signatures: Vec::new(env),
             approver: None,
             approved: false,
-            stake_amount: old.stake_amount,
-            referrer: old.referrer,
+            penalty_bps: 0,
+            penalty_deadline: 0,
+            min_funding_bps: 0,
         }
     }
 }
