@@ -315,7 +315,7 @@ impl SplitContract {
     /// * `token`   – token contract address (same for all recipients)
     /// * `options` – optional fields: co_creators, allow_early_withdrawal, bonus_pool,
     ///               bonus_max_payers, prerequisite_id (#22), tranches (#23),
-    ///               stake_amount (#89), referrer (#87)
+    ///               stake_amount (#89), referrer (#87), max_payers (#26)
     pub fn create_invoice(
         env: Env,
         creator: Address,
@@ -649,6 +649,26 @@ impl SplitContract {
         env.storage()
             .persistent()
             .set(&nonce_key(invoice_id, payer), &(stored_nonce + 1));
+
+        // Check payer limit (issue #26).
+        if let Some(max_payers_cap) = invoice.max_payers {
+            let is_existing_payer = invoice.payments.iter().any(|p| p.payer == *payer);
+            if !is_existing_payer {
+                let unique_payer_count = {
+                    let mut seen: Vec<Address> = Vec::new(env);
+                    for payment in invoice.payments.iter() {
+                        if !seen.contains(&payment.payer) {
+                            seen.push_back(payment.payer.clone());
+                        }
+                    }
+                    seen.len() as u32
+                };
+                assert!(
+                    unique_payer_count < max_payers_cap,
+                    "payer limit reached"
+                );
+            }
+        }
 
         let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
         
