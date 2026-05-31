@@ -494,7 +494,7 @@ impl SplitContract {
         events::invoice_created(env, id, &creator, total);
 
         // Index each recipient -> invoice ID (issue #40).
-        for recipient in recipients.iter() {
+        for recipient in invoice.recipients.iter() {
             let key = recipient_invoice_ids_key(&recipient);
             let mut ids: Vec<u64> = env
                 .storage()
@@ -1321,25 +1321,23 @@ impl SplitContract {
     }
 
     /// Extend the deadline for an invoice (creator only).
-    pub fn extend_deadline(env: Env, caller: Address, invoice_id: u64, new_deadline: u64) {
+    pub fn extend_deadline(env: Env, invoice_id: u64, new_deadline: u64) {
         require_not_paused(&env);
-        caller.require_auth();
-
         let mut invoice = load_invoice(&env, invoice_id);
 
+        invoice.creator.require_auth();
         assert!(
             invoice.status == InvoiceStatus::Pending,
-            "invoice is not pending"
+            "invoice not pending"
         );
-        assert!(invoice.creator == caller, "only creator can extend deadline");
         assert!(
-            new_deadline > env.ledger().timestamp(),
-            "new deadline must be in the future"
+            new_deadline > invoice.deadline,
+            "new deadline must be after current deadline"
         );
 
         invoice.deadline = new_deadline;
         save_invoice(&env, invoice_id, &invoice);
-        append_audit_entry(&env, invoice_id, symbol_short!("extend"), &caller);
+        append_audit_entry(&env, invoice_id, symbol_short!("extend"), &invoice.creator);
     }
 
     /// Roll over a partially funded invoice to a new invoice with the same recipients,
@@ -1531,7 +1529,16 @@ impl SplitContract {
         for amt in amounts.iter() {
             assert!(amt > 0, "amounts must be positive");
         }
-        let template = InvoiceTemplate { recipients, amounts, token };
+        let template = InvoiceTemplate {
+            recipients,
+            amounts,
+            token,
+            deadline: 0,
+            funded: 0,
+            status: InvoiceStatus::Pending,
+            payments: Vec::new(&env),
+            allowed_payers: None,
+        };
         env.storage()
             .persistent()
             .set(&template_key(&creator, &name), &template);
