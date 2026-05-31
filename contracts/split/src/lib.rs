@@ -223,6 +223,7 @@ impl SplitContract {
     /// Update the creation fee. Requires admin auth.
     pub fn set_creation_fee(env: Env, admin: Address, creation_fee: i128) {
         require_admin(&env);
+        let _ = admin;
         assert!(creation_fee >= 0, "creation_fee must be non-negative");
         env.storage().instance().set(&creation_fee_key(), &creation_fee);
     }
@@ -230,6 +231,7 @@ impl SplitContract {
     /// Update the treasury address. Requires admin auth.
     pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
         require_admin(&env);
+        let _ = admin;
         env.storage().instance().set(&treasury_key(), &treasury);
     }
 
@@ -276,6 +278,7 @@ impl SplitContract {
     /// times — already-migrated invoices are a no-op. Requires admin auth.
     pub fn migrate_invoice(env: Env, admin: Address, invoice_id: u64) {
         require_admin(&env);
+        let _ = admin;
 
         // Already migrated?
         if let Some(invoice) = env
@@ -341,9 +344,11 @@ impl SplitContract {
             options.penalty_deadline.unwrap_or(0),
             options.min_funding_bps.unwrap_or(0),
             options.release_stages,
+            options.price_oracle,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn _create_invoice_inner(
         env: &Env,
@@ -364,6 +369,7 @@ impl SplitContract {
         penalty_deadline: u64,
         min_funding_bps: u32,
         release_stages: Vec<u32>,
+        price_oracle: Option<Address>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -452,6 +458,7 @@ impl SplitContract {
             creator: creator.clone(),
             co_creators,
             recipients,
+            base_amounts: amounts.clone(),
             amounts,
             tokens,
             deadline,
@@ -479,6 +486,8 @@ impl SplitContract {
             min_funding_bps,
             release_stages,
             released_stages: 0,
+            allowed_payers: None,
+            price_oracle,
         };
 
         save_invoice(env, id, &invoice);
@@ -529,6 +538,7 @@ impl SplitContract {
                 0,
                 0,
                 Vec::new(&env),
+                None,
             );
             ids.push_back(id);
         }
@@ -576,6 +586,7 @@ impl SplitContract {
             0,
             0,
             Vec::new(&env),
+            None,
         );
 
         if months > 1 {
@@ -629,7 +640,19 @@ impl SplitContract {
         );
         assert!(amount > 0, "payment amount must be positive");
 
-        let total: i128 = invoice.amounts.iter().sum();
+        // Issue #142: when a price oracle is configured, query current price and
+        // compute the oracle-adjusted total. oracle_price of 1_000_000 = 1.0 (identity).
+        let total: i128 = if let Some(ref oracle) = invoice.price_oracle {
+            let oracle_price: i128 = env.invoke_contract(
+                oracle,
+                &Symbol::new(env, "get_price"),
+                Vec::new(env),
+            );
+            let base_total: i128 = invoice.base_amounts.iter().sum();
+            base_total * oracle_price / 1_000_000
+        } else {
+            invoice.amounts.iter().sum()
+        };
         let remaining = total - invoice.funded;
         assert!(amount <= remaining, "payment exceeds remaining balance");
 
@@ -643,9 +666,6 @@ impl SplitContract {
         env.storage()
             .persistent()
             .set(&nonce_key(invoice_id, payer), &(stored_nonce + 1));
-
-        // Check payer limit (issue #26).
-        // TODO: Implement max_payers field on Invoice when issue #26 is resolved.
 
         let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
         
@@ -1167,6 +1187,7 @@ impl SplitContract {
                 0,
                 0,
                 Vec::new(env),
+                None,
             );
             env.storage()
                 .persistent()
@@ -1368,6 +1389,7 @@ impl SplitContract {
             old_invoice.penalty_deadline,
             old_invoice.min_funding_bps,
             old_invoice.release_stages.clone(),
+            old_invoice.price_oracle.clone(),
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -1387,6 +1409,15 @@ impl SplitContract {
         new_id
     }
 
+    // -----------------------------------------------------------------------
+    // Adjust split
+    // -----------------------------------------------------------------------
+
+    /// Update recipient amounts before any payment has been received.
+    ///
+    /// Only the creator may call this. Panics if any payment has already been
+    /// made (`invoice.funded > 0`). The length of `new_amounts` must match the
+    /// current number of recipients, and every amount must be positive.
     // -----------------------------------------------------------------------
     // Add recipient
     // -----------------------------------------------------------------------
@@ -1545,6 +1576,7 @@ impl SplitContract {
             0,
             0,
             Vec::new(&env),
+            None,
         )
     }
 
