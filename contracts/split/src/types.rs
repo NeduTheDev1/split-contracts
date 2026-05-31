@@ -59,6 +59,17 @@ pub struct InvoiceTemplate {
     pub recipients: Vec<Address>,
     pub amounts: Vec<i128>,
     pub token: Address,
+    /// Unix timestamp after which unfunded invoices can be refunded.
+    pub deadline: u64,
+    /// Total amount collected so far.
+    pub funded: i128,
+    /// Current lifecycle status.
+    pub status: InvoiceStatus,
+    /// All payments made toward this invoice.
+    pub payments: Vec<Payment>,
+    /// Optional whitelist of addresses allowed to pay this invoice.
+    /// When None, any address may pay.
+    pub allowed_payers: Option<Vec<Address>>,
 }
 
 #[contracttype]

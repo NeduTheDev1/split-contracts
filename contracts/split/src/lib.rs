@@ -92,6 +92,10 @@ fn recipient_invoice_ids_key(recipient: &Address) -> (Symbol, Address) {
 // Invoice storage helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Storage helpers
+// ---------------------------------------------------------------------------
+
 fn load_invoice(env: &Env, id: u64) -> Invoice {
     env.storage()
         .persistent()
@@ -137,14 +141,14 @@ fn require_not_paused(env: &Env) {
     assert!(!is_paused(env), "contract is paused");
 }
 
-fn require_admin(env: &Env, caller: &Address) {
+fn require_admin(env: &Env) -> Address {
     let admin: Address = env
         .storage()
         .instance()
         .get(&admin_key())
         .expect("admin not set");
-    assert!(admin == *caller, "caller is not admin");
-    caller.require_auth();
+    admin.require_auth();
+    admin
 }
 
 // ---------------------------------------------------------------------------
@@ -202,15 +206,18 @@ impl SplitContract {
         env.storage().persistent().set(&paused_key(), &false);
     }
 
-    /// Upgrade the contract WASM. Requires admin auth.
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&admin_key())
-            .expect("not initialized");
-        admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    /// Pause the contract. Requires admin auth.
+    pub fn pause(env: Env, admin: Address) {
+        require_admin(&env);
+        let _ = admin;
+        env.storage().persistent().set(&paused_key(), &true);
+    }
+
+    /// Unpause the contract. Requires admin auth.
+    pub fn unpause(env: Env, admin: Address) {
+        require_admin(&env);
+        let _ = admin;
+        env.storage().persistent().set(&paused_key(), &false);
     }
 
     /// Pause all mutating operations. Requires admin auth.
@@ -455,10 +462,9 @@ impl SplitContract {
         let invoice = Invoice {
             version: 1u32,
             creator: creator.clone(),
-            co_creators,
-            recipients: recipients.clone(),
+            recipients,
             amounts,
-            tokens,
+            token,
             deadline,
             funded: 0,
             status: InvoiceStatus::Pending,
@@ -624,7 +630,6 @@ impl SplitContract {
     fn _pay(env: &Env, payer: &Address, invoice_id: u64, amount: i128, nonce: u64, auto_convert: bool) {
         let mut invoice = load_invoice(env, invoice_id);
 
-        assert!(!invoice.frozen, "invoice is frozen");
         assert!(
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
@@ -847,6 +852,7 @@ impl SplitContract {
                 invoice.signatures.len() >= invoice.required_signatures,
                 "not enough co-signer approvals"
             );
+            events::payer_refunded(&env, invoice_id, &payment.payer, payment.amount);
         }
 
         Self::_release(&env, invoice_id, &mut invoice, &caller);
