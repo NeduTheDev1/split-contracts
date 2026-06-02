@@ -192,6 +192,10 @@ pub struct InvoiceOptions {
     pub split_rules: Vec<SplitRule>,
     /// Issue: pre-agreed auto-resolution rules evaluated in order when auto_resolve() is called.
     pub auto_resolve_rules: Vec<ResolveRule>,
+    /// Optional oracle address that must confirm the condition before release.
+    pub oracle_address: Option<Address>,
+    /// Optional cross-chain reference carried through invoice creation.
+    pub cross_chain_ref: Option<String>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -271,6 +275,10 @@ pub struct Invoice {
     pub approver: Option<Address>,
     /// Whether the approver has approved the invoice (issue #25).
     pub approved: bool,
+    /// Optional oracle address that must confirm a condition before release.
+    pub oracle_address: Option<Address>,
+    /// Whether the oracle condition has been met.
+    pub condition_met: bool,
     /// Penalty basis points for payments after `penalty_deadline` (issue #42).
     pub penalty_bps: u32,
     /// Soft deadline; payments after this timestamp incur a penalty (issue #42).
@@ -307,9 +315,17 @@ pub struct Invoice {
     pub split_rules: Vec<SplitRule>,
     /// Issue: pre-agreed auto-resolution rules evaluated in order when auto_resolve() is called.
     pub auto_resolve_rules: Vec<ResolveRule>,
+    pub cross_chain_ref: Option<String>,
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TreasuryRecord {
+    pub invoice_ids: Vec<u64>,
+    pub treasury: Address,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct InvoiceStats {
@@ -358,6 +374,8 @@ impl Invoice {
             signatures: Vec::new(env),
             approver: None,
             approved: false,
+            oracle_address: None,
+            condition_met: false,
             penalty_bps: 0,
             penalty_deadline: 0,
             min_funding_bps: 0,
