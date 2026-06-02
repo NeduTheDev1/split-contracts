@@ -51,6 +51,7 @@ fn default_options(env: &Env) -> InvoiceOptions {
             release_stages: Vec::new(env),
             price_oracle: None,
             swap_tokens: Vec::new(env),
+            cross_chain_ref: None,
         }
     }
 
@@ -3279,4 +3280,33 @@ fn test_invoice_created_with_swap_tokens_field() {
     let invoice = c.get_invoice(&id);
     assert_eq!(invoice.swap_tokens.len(), 1);
     assert_eq!(invoice.swap_tokens.get(0).unwrap(), Some(token_id.clone()));
+}
+
+#[test]
+fn test_cross_chain_ref() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut options = default_options(&env);
+    options.cross_chain_ref = Some(soroban_sdk::String::from_str(&env, "evm:0x1234"));
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100);
+
+    let id = c.create_invoice(
+        &creator, &recipients, &amounts, &token_id, &2_000_u64, &options,
+    );
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.cross_chain_ref, Some(soroban_sdk::String::from_str(&env, "evm:0x1234")));
+
+    // Note: We can't easily assert on the emitted event here without env.events().all(),
+    // but the test verifies the struct and ensures it doesn't panic.
 }

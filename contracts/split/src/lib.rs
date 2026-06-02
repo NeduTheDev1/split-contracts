@@ -9,6 +9,8 @@ mod types;
 mod test;
 
 use soroban_sdk::{
+    String,
+    String,
     contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec,
 };
 use types::{
@@ -375,6 +377,7 @@ impl SplitContract {
             options.release_stages,
             options.price_oracle,
             options.swap_tokens,
+            options.cross_chain_ref,
         )
     }
 
@@ -401,6 +404,7 @@ impl SplitContract {
         release_stages: Vec<u32>,
         price_oracle: Option<Address>,
         swap_tokens: Vec<Option<Address>>,
+        cross_chain_ref: Option<String>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -526,10 +530,11 @@ impl SplitContract {
             allowed_payers: None,
             price_oracle,
             swap_tokens,
+            cross_chain_ref: cross_chain_ref.clone(),
         };
 
         save_invoice(env, id, &invoice);
-        events::invoice_created(env, id, &creator, total);
+        events::invoice_created(env, id, &creator, total, &cross_chain_ref);
 
         // Index each recipient -> invoice ID (issue #40).
         for recipient in invoice.recipients.iter() {
@@ -589,6 +594,7 @@ impl SplitContract {
                 Vec::new(&env),
                 None,
                 Vec::new(&env),
+                None,
             );
             ids.push_back(id);
         }

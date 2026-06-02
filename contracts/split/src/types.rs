@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec, String};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -120,6 +120,7 @@ pub struct InvoiceOptions {
     pub price_oracle: Option<Address>,
     /// Issue #41: optional preferred output token per recipient for DEX swap on release.
     pub swap_tokens: Vec<Option<Address>>,
+    pub cross_chain_ref: Option<String>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -213,6 +214,7 @@ pub struct Invoice {
     /// Issue #41: optional preferred output token per recipient for DEX swap on release.
     /// Parallel to `recipients`; None means pay in the invoice token as normal.
     pub swap_tokens: Vec<Option<Address>>,
+    pub cross_chain_ref: Option<String>,
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
@@ -272,6 +274,7 @@ impl Invoice {
             allowed_payers: None,
             price_oracle: None,
             swap_tokens: Vec::new(env),
+            cross_chain_ref: None,
         }
     }
 }
