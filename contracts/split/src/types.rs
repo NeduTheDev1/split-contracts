@@ -38,6 +38,13 @@ pub struct InvoicePayment {
 }
 
 #[contracttype]
+#[derive(Clone, Debug)]
+pub struct Bid {
+    pub bidder: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum InvoiceStatus {
     Pending,
@@ -366,6 +373,11 @@ impl Invoice {
             smart_route: false,
             convert_to_stream: false,
             accepted_tokens: Vec::new(env),
+            require_kyc: false,
+            auction_on_expiry: false,
+            auction_end: 0,
+            bids: Vec::new(env),
+            min_payment: 0,
             split_rules: Vec::new(env),
             auto_resolve_rules: Vec::new(env),
             creator_cosigner: None,
