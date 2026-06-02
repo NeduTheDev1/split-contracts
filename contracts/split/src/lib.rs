@@ -377,6 +377,7 @@ impl SplitContract {
             options.release_stages,
             options.price_oracle,
             options.swap_tokens,
+            options.insurance_premium_bps.unwrap_or(0),
             tax_bps,
             tax_authority,
         )
@@ -405,6 +406,7 @@ impl SplitContract {
         release_stages: Vec<u32>,
         price_oracle: Option<Address>,
         swap_tokens: Vec<Option<Address>>,
+        insurance_premium_bps: u32,
         tax_bps: u32,
         tax_authority: Option<Address>,
     ) -> u64 {
@@ -532,6 +534,8 @@ impl SplitContract {
             allowed_payers: None,
             price_oracle,
             swap_tokens,
+            insurance_premium_bps,
+            insurance_fund: 0,
             tax_bps,
             tax_authority,
         };
@@ -598,6 +602,7 @@ impl SplitContract {
                 None,
                 Vec::new(&env),
                 0,
+                0,
                 None,
             );
             ids.push_back(id);
@@ -648,6 +653,7 @@ impl SplitContract {
             Vec::new(&env),
             None,
             Vec::new(&env),
+            0,
             0,
             None,
         );
@@ -732,18 +738,22 @@ impl SplitContract {
 
         let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
         
+        let premium = (amount as u128 * invoice.insurance_premium_bps as u128 / 10_000u128) as i128;
+        let total_charge = amount + premium;
+
         // Issue #88: Auto-convert if requested.
         let credited_amount = if auto_convert {
             // In production, this would call a DEX swap contract.
             // For now, we assume a 1:1 swap and transfer the amount directly.
             // Mock DEX swap: payer's source asset -> invoice token.
             // The swapped amount is what gets credited.
-            token_client.transfer(payer, &env.current_contract_address(), &amount);
+            token_client.transfer(payer, &env.current_contract_address(), &total_charge);
             amount // In a real implementation, this would be the swapped output amount.
         } else {
-            token_client.transfer(payer, &env.current_contract_address(), &amount);
+            token_client.transfer(payer, &env.current_contract_address(), &total_charge);
             amount
         };
+        invoice.insurance_fund += premium;
 
         // Penalty for late payment (issue #42).
         if invoice.penalty_bps > 0 && env.ledger().timestamp() > invoice.penalty_deadline {
@@ -1106,6 +1116,10 @@ impl SplitContract {
         if invoice.released_bps >= 10_000 {
             invoice.status = InvoiceStatus::Released;
             invoice.completion_time = Some(now);
+            if invoice.insurance_fund > 0 {
+                token_client.transfer(&env.current_contract_address(), &invoice.creator, &invoice.insurance_fund);
+                invoice.insurance_fund = 0;
+            }
             append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
             events::invoice_released(env, invoice_id, &invoice.recipients);
         }
@@ -1396,6 +1410,12 @@ impl SplitContract {
             }
         }
 
+        // Return insurance fund to creator on successful release.
+        if invoice.insurance_fund > 0 {
+            token_client.transfer(&env.current_contract_address(), &invoice.creator, &invoice.insurance_fund);
+            invoice.insurance_fund = 0;
+        }
+
         invoice.status = InvoiceStatus::Released;
         invoice.completion_time = Some(env.ledger().timestamp());
         save_invoice(env, invoice_id, invoice);
@@ -1550,8 +1570,17 @@ impl SplitContract {
 
             let mut total_refunded_amount: i128 = 0;
             for (payer, amount) in totals.iter() {
-                token_client.transfer(&env.current_contract_address(), &payer, &amount);
+                let mut refund = amount;
+                if invoice.insurance_fund > 0 {
+                    let premium_refund = (amount as u128 * invoice.insurance_fund as u128 / invoice.funded as u128) as i128;
+                    refund += premium_refund;
+                }
+                token_client.transfer(&env.current_contract_address(), &payer, &refund);
                 total_refunded_amount += amount;
+            }
+
+            if invoice.insurance_fund > 0 {
+                invoice.insurance_fund = 0;
             }
 
             if invoice.bonus_pool > 0 {

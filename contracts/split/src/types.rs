@@ -120,6 +120,7 @@ pub struct InvoiceOptions {
     pub price_oracle: Option<Address>,
     /// Issue #41: optional preferred output token per recipient for DEX swap on release.
     pub swap_tokens: Vec<Option<Address>>,
+    pub insurance_premium_bps: Option<u32>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -152,6 +153,8 @@ pub struct LegacyInvoice {
     pub referrer: Option<Address>,
     pub tax_bps: u32,
     pub tax_authority: Option<Address>,
+    pub insurance_premium_bps: u32,
+    pub insurance_fund: i128,
 }
 
 #[contracttype]
@@ -217,6 +220,8 @@ pub struct Invoice {
     pub swap_tokens: Vec<Option<Address>>,
     pub tax_bps: u32,
     pub tax_authority: Option<Address>,
+    pub insurance_premium_bps: u32,
+    pub insurance_fund: i128,
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
@@ -278,6 +283,8 @@ impl Invoice {
             swap_tokens: Vec::new(env),
             tax_bps: old.tax_bps,
             tax_authority: old.tax_authority,
+            insurance_premium_bps: old.insurance_premium_bps,
+            insurance_fund: old.insurance_fund,
         }
     }
 }
