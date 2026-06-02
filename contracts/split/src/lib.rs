@@ -113,6 +113,11 @@ fn total_refunded_key() -> Symbol {
     symbol_short!("tot_ref")
 }
 
+/// Compliance contract address key.
+fn compliance_key() -> Symbol {
+    symbol_short!("comply")
+}
+
 // ---------------------------------------------------------------------------
 // Invoice storage helpers
 // ---------------------------------------------------------------------------
@@ -220,6 +225,7 @@ impl SplitContract {
         treasury: Address,
         usdc_token: Address,
         platform_fee_bps: u32,
+        compliance_contract: Option<Address>,
     ) {
         assert!(
             !env.storage().instance().has(&admin_key()),
@@ -233,6 +239,9 @@ impl SplitContract {
         env.storage().instance().set(&usdc_token_key(), &usdc_token);
         env.storage().instance().set(&platform_fee_bps_key(), &platform_fee_bps);
         env.storage().persistent().set(&paused_key(), &false);
+        if let Some(ref cc) = compliance_contract {
+            env.storage().persistent().set(&compliance_key(), cc);
+        }
     }
 
     /// Pause the contract. Requires admin auth.
@@ -438,6 +447,20 @@ impl SplitContract {
         if !release_stages.is_empty() {
             let total_bps: u32 = release_stages.iter().sum();
             assert!(total_bps == 10_000, "release_stages must sum to 10000 basis points");
+        }
+
+        // Compliance check: if a compliance contract is configured, verify creator and all recipients.
+        if let Some(cc) = env.storage().persistent().get::<Symbol, Address>(&compliance_key()) {
+            let mut check_args: Vec<Val> = Vec::new(env);
+            check_args.push_back(creator.clone().into_val(env));
+            let creator_ok: bool = env.invoke_contract(&cc, &Symbol::new(env, "is_compliant"), check_args);
+            assert!(creator_ok, "compliance check failed");
+            for recipient in recipients.iter() {
+                let mut r_args: Vec<Val> = Vec::new(env);
+                r_args.push_back(recipient.clone().into_val(env));
+                let r_ok: bool = env.invoke_contract(&cc, &Symbol::new(env, "is_compliant"), r_args);
+                assert!(r_ok, "compliance check failed");
+            }
         }
 
         // Charge configurable creation fee in USDC.
