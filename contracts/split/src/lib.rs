@@ -375,6 +375,8 @@ impl SplitContract {
             options.release_stages,
             options.price_oracle,
             options.swap_tokens,
+            options.tax_bps.unwrap_or(0),
+            options.tax_authority,
         )
     }
 
@@ -401,6 +403,8 @@ impl SplitContract {
         release_stages: Vec<u32>,
         price_oracle: Option<Address>,
         swap_tokens: Vec<Option<Address>>,
+        tax_bps: u32,
+        tax_authority: Option<Address>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -411,6 +415,10 @@ impl SplitContract {
         assert!(bonus_pool >= 0, "bonus_pool must be non-negative");
         assert!(penalty_bps <= 10_000, "penalty_bps must be ≤ 10000");
         assert!(min_funding_bps <= 10_000, "min_funding_bps must be ≤ 10000");
+        assert!(tax_bps <= 10_000, "tax_bps must be ≤ 10000");
+        if tax_bps > 0 {
+            assert!(tax_authority.is_some(), "tax_authority must be set if tax_bps > 0");
+        }
 
         for amt in amounts.iter() {
             assert!(amt > 0, "amounts must be positive");
@@ -526,6 +534,8 @@ impl SplitContract {
             allowed_payers: None,
             price_oracle,
             swap_tokens,
+            tax_bps,
+            tax_authority,
         };
 
         save_invoice(env, id, &invoice);
@@ -589,6 +599,8 @@ impl SplitContract {
                 Vec::new(&env),
                 None,
                 Vec::new(&env),
+                0,
+                None,
             );
             ids.push_back(id);
         }
@@ -638,6 +650,8 @@ impl SplitContract {
             Vec::new(&env),
             None,
             Vec::new(&env),
+            0,
+            None,
         );
 
         if months > 1 {
@@ -989,9 +1003,16 @@ impl SplitContract {
             .unwrap_or(0u32);
 
         let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
-        let payout = proportional - fee;
+        let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
+        let payout = proportional - fee - tax;
 
         let token_client = token::Client::new(&env, &invoice.tokens.get(idx).expect("no token"));
+        
+        if tax > 0 {
+            let tax_authority = invoice.tax_authority.as_ref().unwrap();
+            token_client.transfer(&env.current_contract_address(), tax_authority, &tax);
+        }
+        
         token_client.transfer(&env.current_contract_address(), &recipient, &payout);
 
         append_audit_entry(&env, invoice_id, symbol_short!("claim"), &recipient);
@@ -1026,6 +1047,7 @@ impl SplitContract {
         let funded = invoice.funded;
         let n = invoice.recipients.len();
         let mut total_fee: i128 = 0;
+        let mut total_tax: i128 = 0;
         for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
@@ -1050,6 +1072,11 @@ impl SplitContract {
                 .get(&treasury_key())
                 .expect("treasury not set");
             token_client.transfer(&env.current_contract_address(), &treasury, &total_fee);
+        }
+
+        if total_tax > 0 {
+            let tax_authority = invoice.tax_authority.as_ref().unwrap();
+            token_client.transfer(&env.current_contract_address(), tax_authority, &total_tax);
         }
 
         invoice.released_bps += new_bps;
@@ -1135,6 +1162,7 @@ impl SplitContract {
         let funded = invoice.funded;
         let n = invoice.recipients.len();
         let mut total_fee: i128 = 0;
+        let mut total_tax: i128 = 0;
         for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
@@ -1145,8 +1173,10 @@ impl SplitContract {
             let payout_raw = payout_raw as i128;
             if payout_raw > 0 {
                 let fee = (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
-                let payout = payout_raw - fee;
+                let tax = (payout_raw as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
+                let payout = payout_raw - fee - tax;
                 total_fee += fee;
+                total_tax += tax;
                 token_client.transfer(&env.current_contract_address(), &recipient, &payout);
             }
         }
@@ -1158,6 +1188,11 @@ impl SplitContract {
                 .get(&treasury_key())
                 .expect("treasury not set");
             token_client.transfer(&env.current_contract_address(), &treasury, &total_fee);
+        }
+
+        if total_tax > 0 {
+            let tax_authority = invoice.tax_authority.as_ref().unwrap();
+            token_client.transfer(&env.current_contract_address(), tax_authority, &total_tax);
         }
 
         invoice.released_stages += 1;
@@ -1229,6 +1264,7 @@ impl SplitContract {
         let n = invoice.recipients.len();
         let mut distributed: i128 = 0;
         let mut total_fee: i128 = 0;
+        let mut total_tax: i128 = 0;
         for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
@@ -1238,9 +1274,11 @@ impl SplitContract {
                 (amount as u128 * funded as u128 / total as u128) as i128
             };
             let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
-            let payout = proportional - fee;
+            let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
+            let payout = proportional - fee - tax;
             distributed += proportional;
             total_fee += fee;
+            total_tax += tax;
 
             // Issue #41: if a swap token is configured for this recipient, invoke DEX swap.
             let swap_token: Option<Address> = invoice
@@ -1270,6 +1308,11 @@ impl SplitContract {
                 .get(&treasury_key())
                 .expect("treasury not set");
             token_client.transfer(&env.current_contract_address(), &treasury, &total_fee);
+        }
+
+        if total_tax > 0 {
+            let tax_authority = invoice.tax_authority.as_ref().unwrap();
+            token_client.transfer(&env.current_contract_address(), tax_authority, &total_tax);
         }
 
         // Distribute bonus pool among first `bonus_max_payers` unique payers.
@@ -1330,9 +1373,14 @@ impl SplitContract {
                                 (amount as u128 * member_funded as u128 / member_total as u128) as i128
                             };
                             let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
-                            let payout = proportional - fee;
+                            let tax = (proportional as u128 * member.tax_bps as u128 / 10_000u128) as i128;
+                            let payout = proportional - fee - tax;
                             member_distributed += proportional;
                             group_total_fee += fee;
+                            if tax > 0 {
+                                let tax_authority = member.tax_authority.as_ref().unwrap();
+                                member_token.transfer(&env.current_contract_address(), tax_authority, &tax);
+                            }
                             member_token.transfer(
                                 &env.current_contract_address(),
                                 &recipient,
@@ -1417,6 +1465,8 @@ impl SplitContract {
                 Vec::new(env),
                 None,
                 Vec::new(env),
+                0,
+                None,
             );
             env.storage()
                 .persistent()
