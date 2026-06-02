@@ -1,5 +1,34 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec, String};
 
+/// Issue: Split rule for a single recipient — evaluated at release time.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum SplitRule {
+    /// Pay this exact amount regardless of funded total.
+    Fixed(i128),
+    /// Pay `funded * bps / 10_000` to the recipient.
+    Percentage(u32),
+    /// Pay `funded * bps / 10_000` only when `funded > threshold`; else 0.
+    Tiered { threshold: i128, bps: u32 },
+}
+
+/// Issue: Action taken by an auto-resolve rule.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResolveAction {
+    Release,
+    Refund,
+}
+
+/// Issue: Auto-resolve rule — if funded/total >= min_funded_bps/10_000, execute action.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ResolveRule {
+    /// Minimum funding threshold in basis points (e.g. 5000 = 50%).
+    pub min_funded_bps: u32,
+    pub action: ResolveAction,
+}
+
 /// Issue #: A single (invoice_id, amount) pair for pool_pay.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -136,6 +165,10 @@ pub struct InvoiceOptions {
     pub convert_to_stream: bool,
     /// Issue #2: tokens accepted in pay_with_token(); base token is always accepted implicitly.
     pub accepted_tokens: Vec<Address>,
+    /// Issue: per-recipient split rules evaluated at release time; empty = use amounts[].
+    pub split_rules: Vec<SplitRule>,
+    /// Issue: pre-agreed auto-resolution rules evaluated in order when auto_resolve() is called.
+    pub auto_resolve_rules: Vec<ResolveRule>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -243,6 +276,10 @@ pub struct Invoice {
     pub convert_to_stream: bool,
     /// Issue #2: additional tokens accepted by pay_with_token().
     pub accepted_tokens: Vec<Address>,
+    /// Issue: per-recipient split rules evaluated at release time; empty = use amounts[].
+    pub split_rules: Vec<SplitRule>,
+    /// Issue: pre-agreed auto-resolution rules evaluated in order when auto_resolve() is called.
+    pub auto_resolve_rules: Vec<ResolveRule>,
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
@@ -309,6 +346,8 @@ impl Invoice {
             smart_route: false,
             convert_to_stream: false,
             accepted_tokens: Vec::new(env),
+            split_rules: Vec::new(env),
+            auto_resolve_rules: Vec::new(env),
         }
     }
 }
