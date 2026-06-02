@@ -23,6 +23,10 @@ use types::{
 // Storage key helpers
 // ---------------------------------------------------------------------------
 
+fn governance_contract_key() -> Symbol {
+    symbol_short!("gov_ctr")
+}
+
 fn admin_key() -> Symbol {
     symbol_short!("admin")
 }
@@ -222,6 +226,7 @@ impl SplitContract {
         treasury: Address,
         usdc_token: Address,
         platform_fee_bps: u32,
+        governance_contract: Option<Address>,
     ) {
         assert!(
             !env.storage().instance().has(&admin_key()),
@@ -234,6 +239,7 @@ impl SplitContract {
         env.storage().instance().set(&treasury_key(), &treasury);
         env.storage().instance().set(&usdc_token_key(), &usdc_token);
         env.storage().instance().set(&platform_fee_bps_key(), &platform_fee_bps);
+        env.storage().instance().set(&governance_contract_key(), &governance_contract);
         env.storage().persistent().set(&paused_key(), &false);
     }
 
@@ -466,7 +472,15 @@ impl SplitContract {
             + 1;
         env.storage().persistent().set(&counter_key(), &id);
 
+
         let total: i128 = amounts.iter().sum();
+
+        let gov_opt: Option<Option<Address>> = env.storage().instance().get(&governance_contract_key());
+        if let Some(Some(gov)) = gov_opt {
+            let approved: bool = env.invoke_contract(&gov, &Symbol::new(env, "check_approval"), (creator.clone(), total).into_val(env));
+            assert!(approved, "governance approval required");
+        }
+
 
         if bonus_pool > 0 {
             let token_client = token::Client::new(env, &token);
