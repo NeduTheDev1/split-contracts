@@ -38,6 +38,13 @@ pub struct InvoicePayment {
 }
 
 #[contracttype]
+#[derive(Clone, Debug)]
+pub struct Bid {
+    pub bidder: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum InvoiceStatus {
     Pending,
@@ -165,6 +172,12 @@ pub struct InvoiceOptions {
     pub convert_to_stream: bool,
     /// Issue #2: tokens accepted in pay_with_token(); base token is always accepted implicitly.
     pub accepted_tokens: Vec<Address>,
+    /// Require KYC verification for pay() calls on this invoice.
+    pub require_kyc: bool,
+    /// When true, expired invoices enter a 24-hour auction instead of refunding immediately.
+    pub auction_on_expiry: bool,
+    /// Minimum granular payment amount that must be accumulated before funding the invoice.
+    pub min_payment: i128,
     /// Issue: per-recipient split rules evaluated at release time; empty = use amounts[].
     pub split_rules: Vec<SplitRule>,
     /// Issue: pre-agreed auto-resolution rules evaluated in order when auto_resolve() is called.
@@ -276,6 +289,18 @@ pub struct Invoice {
     pub convert_to_stream: bool,
     /// Issue #2: additional tokens accepted by pay_with_token().
     pub accepted_tokens: Vec<Address>,
+    /// Require KYC verification for pay() calls on this invoice.
+    pub require_kyc: bool,
+    /// When true, expired invoices enter a 24-hour auction instead of refunding immediately.
+    pub auction_on_expiry: bool,
+    /// Auction end timestamp; 0 means no auction is active.
+    pub auction_end: u64,
+    /// Bids placed during an auction.
+    pub bids: Vec<Bid>,
+    /// Minimum micropayment amount that must be accumulated before the invoice is funded.
+    pub min_payment: i128,
+    /// Payers who have outstanding accumulated micro-payments.
+    pub accumulator_payers: Vec<Address>,
     /// Issue: per-recipient split rules evaluated at release time; empty = use amounts[].
     pub split_rules: Vec<SplitRule>,
     /// Issue: pre-agreed auto-resolution rules evaluated in order when auto_resolve() is called.
@@ -346,6 +371,11 @@ impl Invoice {
             smart_route: false,
             convert_to_stream: false,
             accepted_tokens: Vec::new(env),
+            require_kyc: false,
+            auction_on_expiry: false,
+            auction_end: 0,
+            bids: Vec::new(env),
+            min_payment: 0,
             split_rules: Vec::new(env),
             auto_resolve_rules: Vec::new(env),
         }

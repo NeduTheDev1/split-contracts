@@ -14,9 +14,9 @@ use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec,
 };
 use types::{
-    AuditEntry, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions, InvoicePayment,
-    InvoiceStats, InvoiceStatus, InvoiceTemplate, LegacyInvoice, Payment, PaymentProof,
-    ResolveAction, ResolveRule, SplitRule, SubscriptionParams, Tranche,
+    AuditEntry, Bid, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions,
+    InvoicePayment, InvoiceStats, InvoiceStatus, InvoiceTemplate, LegacyInvoice, Payment,
+    PaymentProof, ResolveAction, ResolveRule, SplitRule, SubscriptionParams, Tranche,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,26 @@ fn compliance_key() -> Symbol {
     symbol_short!("comply")
 }
 
+/// Per-creator invoice creation rate limit usage key.
+fn rate_usage_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("rate"), creator.clone())
+}
+
+/// Global per-creator rate limit value.
+fn rate_limit_key() -> Symbol {
+    symbol_short!("rate_lim")
+}
+
+/// Global per-creator rate window value.
+fn rate_window_key() -> Symbol {
+    symbol_short!("rate_win")
+}
+
+/// KYC verification contract address key.
+fn kyc_contract_key() -> Symbol {
+    symbol_short!("kyc_ctr")
+}
+
 /// Issue: per-creator invoice creation count key (cancellation rate limit).
 fn invoice_count_key(creator: &Address) -> (Symbol, Address) {
     (symbol_short!("inv_count"), creator.clone())
@@ -162,6 +182,11 @@ fn receipt_factory_key() -> Symbol {
 /// Issue: per-payer per-invoice receipt token address key.
 fn receipt_token_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("rcpt"), invoice_id, payer.clone())
+}
+
+/// Per-invoice per-payer micro-payment accumulator key.
+fn accum_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("accum"), invoice_id, payer.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +300,12 @@ impl SplitContract {
         governance_contract: Option<Address>,
         /// Issue: max cancellation rate in basis points (e.g. 3000 = 30%). 0 means no limit.
         max_cancel_bps: u32,
+        /// Issue: max invoices per creator within the rate window.
+        rate_limit: u32,
+        /// Issue: duration in seconds of the invoice creation rate window.
+        rate_window: u64,
+        /// Issue: optional KYC attestation contract address used by pay().
+        kyc_contract: Option<Address>,
     ) {
         assert!(
             !env.storage().instance().has(&admin_key()),
@@ -283,6 +314,7 @@ impl SplitContract {
         assert!(creation_fee >= 0, "creation_fee must be non-negative");
         assert!(platform_fee_bps <= 10_000, "platform_fee_bps must be ≤ 10000");
         assert!(max_cancel_bps <= 10_000, "max_cancel_bps must be ≤ 10000");
+        assert!(rate_window > 0 || rate_limit == 0, "rate_window must be positive when rate_limit is enabled");
         env.storage().instance().set(&admin_key(), &admin);
         env.storage().instance().set(&creation_fee_key(), &creation_fee);
         env.storage().instance().set(&treasury_key(), &treasury);
@@ -291,6 +323,11 @@ impl SplitContract {
         env.storage().instance().set(&governance_contract_key(), &governance_contract);
         env.storage().persistent().set(&paused_key(), &false);
         env.storage().persistent().set(&max_cancel_bps_key(), &max_cancel_bps);
+        env.storage().persistent().set(&rate_limit_key(), &rate_limit);
+        env.storage().persistent().set(&rate_window_key(), &rate_window);
+        if let Some(contract) = kyc_contract {
+            env.storage().persistent().set(&kyc_contract_key(), &contract);
+        }
         if let Some(contract) = compliance_contract {
             env.storage().persistent().set(&soroban_sdk::symbol_short!("comp_ctr"), &contract);
         }
@@ -493,6 +530,7 @@ impl SplitContract {
     ) -> u64 {
         require_not_paused(&env);
         creator.require_auth();
+        Self::_apply_rate_limit(&env, &creator);
 
         // Issue #4: reject creator if whitelist is non-empty and creator is not on it.
         let wl: Vec<Address> = env
@@ -531,6 +569,9 @@ impl SplitContract {
             options.smart_route.unwrap_or(false),
             options.convert_to_stream,
             options.accepted_tokens,
+            options.require_kyc,
+            options.auction_on_expiry,
+            options.min_payment,
             options.split_rules,
             options.auto_resolve_rules,
         )
@@ -564,6 +605,9 @@ impl SplitContract {
         smart_route: bool,
         convert_to_stream: bool,
         accepted_tokens: Vec<Address>,
+        require_kyc: bool,
+        auction_on_expiry: bool,
+        min_payment: i128,
         split_rules: Vec<SplitRule>,
         auto_resolve_rules: Vec<ResolveRule>,
     ) -> u64 {
@@ -578,6 +622,7 @@ impl SplitContract {
         assert!(min_funding_bps <= 10_000, "min_funding_bps must be ≤ 10000");
         assert!(tax_bps <= 10_000, "tax_bps must be ≤ 10000");
         assert!(insurance_premium_bps <= 10_000, "insurance_premium_bps must be ≤ 10000");
+        assert!(min_payment >= 0, "min_payment must be non-negative");
         if tax_bps > 0 {
             assert!(tax_authority.is_some(), "tax_authority must be set if tax_bps > 0");
         }
@@ -585,6 +630,9 @@ impl SplitContract {
         for amt in amounts.iter() {
             assert!(amt > 0, "amounts must be positive");
         }
+
+        let total_amount: i128 = amounts.iter().sum();
+        assert!(min_payment <= total_amount, "min_payment must not exceed invoice total");
 
         if let Some(compliance_contract) = env.storage().persistent().get::<_, Address>(&soroban_sdk::symbol_short!("comp_ctr")) {
             let creator_ok: bool = env.invoke_contract(&compliance_contract, &soroban_sdk::Symbol::new(env, "check"), (creator.clone(),).into_val(env));
@@ -770,6 +818,11 @@ impl SplitContract {
             smart_route,
             convert_to_stream,
             accepted_tokens,
+            require_kyc,
+            auction_on_expiry,
+            auction_end: 0,
+            bids: Vec::new(env),
+            min_payment,
             split_rules,
             auto_resolve_rules,
         };
@@ -815,6 +868,37 @@ impl SplitContract {
     }
 
     /// Create up to 5 invoices in a single transaction.
+    fn _apply_rate_limit(env: &Env, creator: &Address) {
+        let rate_limit: u32 = env
+            .storage()
+            .persistent()
+            .get(&rate_limit_key())
+            .unwrap_or(0u32);
+        if rate_limit == 0 {
+            return;
+        }
+
+        let rate_window: u64 = env
+            .storage()
+            .persistent()
+            .get(&rate_window_key())
+            .unwrap_or(0u64);
+        let now = env.ledger().timestamp();
+        let mut usage: (u64, u32) = env
+            .storage()
+            .persistent()
+            .get(&rate_usage_key(creator))
+            .unwrap_or((0u64, 0u32));
+        if now >= usage.0.saturating_add(rate_window) {
+            usage = (now, 0u32);
+        }
+        assert!(usage.1 < rate_limit, "rate limit exceeded");
+        usage.1 = usage.1.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&rate_usage_key(creator), &usage);
+    }
+
     pub fn create_batch(
         env: Env,
         creator: Address,
@@ -825,6 +909,7 @@ impl SplitContract {
 
         let mut ids: Vec<u64> = Vec::new(&env);
         for params in invoices.iter() {
+            Self::_apply_rate_limit(&env, &creator);
             let id = Self::_create_invoice_inner(
                 &env,
                 creator.clone(),
@@ -851,6 +936,10 @@ impl SplitContract {
                 0,
                 false,
                 false,
+                Vec::new(&env),
+                false,
+                false,
+                0,
                 Vec::new(&env),
                 Vec::new(&env),
                 Vec::new(&env),
@@ -909,6 +998,9 @@ impl SplitContract {
             false,
             false,
             Vec::new(&env),
+            false,
+            false,
+            0,
             Vec::new(&env),
             Vec::new(&env),
         );
@@ -1096,6 +1188,39 @@ impl SplitContract {
         let remaining = total - invoice.funded;
         assert!(amount <= remaining, "payment exceeds remaining balance");
 
+        if invoice.require_kyc {
+            let kyc_contract: Address = env
+                .storage()
+                .persistent()
+                .get(&kyc_contract_key())
+                .expect("kyc contract not set");
+            let verified: bool = env.invoke_contract(
+                &kyc_contract,
+                &Symbol::new(env, "is_verified"),
+                (payer.clone(),).into_val(env),
+            );
+            assert!(verified, "kyc required");
+        }
+
+        // Micro-payments below the configured threshold accumulate off-chain
+        // until the threshold is reached, then flush as a single credited payment.
+        let mut credited_amount: i128 = amount;
+        if invoice.min_payment > 0 {
+            let mut accumulator: i128 = env
+                .storage()
+                .persistent()
+                .get(&accum_key(invoice_id, payer))
+                .unwrap_or(0i128);
+            accumulator += amount;
+            if accumulator < invoice.min_payment {
+                env.storage().persistent().set(&accum_key(invoice_id, payer), &accumulator);
+                return;
+            }
+            assert!(accumulator <= remaining, "payment exceeds remaining balance");
+            env.storage().persistent().remove(&accum_key(invoice_id, payer));
+            credited_amount = accumulator;
+        }
+
         // Validate and increment per-payer per-invoice nonce (issue #21).
         let stored_nonce: u64 = env
             .storage()
@@ -1150,8 +1275,8 @@ impl SplitContract {
             }
         }
 
-        invoice.payments.push_back(Payment { payer: payer.clone(), amount, tip: 0 });
-        invoice.funded += amount;
+        invoice.payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0 });
+        invoice.funded += credited_amount;
 
         // Increment per-address reputation counter (issue #24).
         let rep: u64 = env
@@ -2164,6 +2289,10 @@ impl SplitContract {
                 false,
                 false,
                 Vec::new(env),
+                false,
+                false,
+                0,
+                Vec::new(env),
                 Vec::new(env),
                 Vec::new(env),
             );
@@ -2268,6 +2397,18 @@ impl SplitContract {
             "deadline has not passed"
         );
 
+        if invoice.auction_on_expiry {
+            let now = env.ledger().timestamp();
+            if invoice.auction_end == 0 {
+                invoice.auction_end = now.saturating_add(24 * 60 * 60);
+                save_invoice(&env, invoice_id, &invoice);
+                append_audit_entry(&env, invoice_id, symbol_short!("auc_strt"), &env.current_contract_address());
+                return;
+            }
+            assert!(now > invoice.auction_end, "auction in progress");
+            panic!("auction ended; settle auction");
+        }
+
         let token_client =
             token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
 
@@ -2319,6 +2460,102 @@ impl SplitContract {
         env.storage().persistent().set(
             &creator_stats_refunded_key(&invoice.creator),
             &creator_refunded.checked_add(1).expect("creator_refunded overflow"),
+        );
+    }
+
+    /// Place a bid on an active auction for an expired invoice.
+    pub fn place_bid(env: Env, bidder: Address, invoice_id: u64, amount: i128) {
+        require_not_paused(&env);
+        bidder.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(invoice.auction_on_expiry, "auction not enabled");
+        assert!(invoice.auction_end > 0, "auction not started");
+        let now = env.ledger().timestamp();
+        assert!(now <= invoice.auction_end, "auction not active");
+        assert!(amount > 0, "bid amount must be positive");
+
+        let current_highest = invoice
+            .bids
+            .iter()
+            .map(|b| b.amount)
+            .fold(0, |max, amt| if amt > max { amt } else { max });
+        assert!(amount > current_highest, "bid must be higher than current highest bid");
+
+        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        token_client.transfer(&bidder, &env.current_contract_address(), &amount);
+
+        invoice.bids.push_back(Bid { bidder: bidder.clone(), amount });
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("bid"), &bidder);
+    }
+
+    /// Settle an auction after the 24-hour auction window ends.
+    pub fn settle_auction(env: Env, invoice_id: u64) {
+        require_not_paused(&env);
+
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(invoice.auction_on_expiry, "auction not enabled");
+        assert!(invoice.auction_end > 0, "auction not started");
+        let now = env.ledger().timestamp();
+        assert!(now > invoice.auction_end, "auction not ended");
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+
+        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+
+        let mut winner_idx: Option<u32> = None;
+        let mut highest_amount: i128 = 0;
+        for i in 0..invoice.bids.len() {
+            let bid = invoice.bids.get(i).unwrap();
+            if winner_idx.is_none() || bid.amount > highest_amount {
+                winner_idx = Some(i);
+                highest_amount = bid.amount;
+            }
+        }
+
+        if let Some(idx) = winner_idx {
+            let winner = invoice.bids.get(idx).unwrap();
+            token_client.transfer(&env.current_contract_address(), &winner.bidder, &invoice.funded);
+            for i in 0..invoice.bids.len() {
+                if i != idx {
+                    let bid = invoice.bids.get(i).unwrap();
+                    token_client.transfer(&env.current_contract_address(), &bid.bidder, &bid.amount);
+                }
+            }
+            invoice.status = InvoiceStatus::Refunded;
+            invoice.completion_time = Some(now);
+            save_invoice(&env, invoice_id, &invoice);
+            append_audit_entry(&env, invoice_id, symbol_short!("auc_stl"), &env.current_contract_address());
+            return;
+        }
+
+        // No bids were placed; refund payers as normal.
+        let mut totals: Map<Address, i128> = Map::new(&env);
+        for payment in invoice.payments.iter() {
+            let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+            totals.set(payment.payer.clone(), prev + payment.amount);
+        }
+
+        let mut total_refunded_amount: i128 = 0;
+        for (payer, amount) in totals.iter() {
+            token_client.transfer(&env.current_contract_address(), &payer, &amount);
+            total_refunded_amount += amount;
+            events::payer_refunded(&env, invoice_id, &payer, amount);
+        }
+
+        if invoice.bonus_pool > 0 {
+            token_client.transfer(&env.current_contract_address(), &invoice.creator, &invoice.bonus_pool);
+        }
+
+        invoice.status = InvoiceStatus::Refunded;
+        invoice.completion_time = Some(now);
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("auc_stl"), &env.current_contract_address());
+
+        let total_refunded: i128 = env.storage().persistent().get(&total_refunded_key()).unwrap_or(0i128);
+        env.storage().persistent().set(
+            &total_refunded_key(),
+            &total_refunded.checked_add(total_refunded_amount).expect("total_refunded overflow"),
         );
     }
 
@@ -2560,6 +2797,9 @@ impl SplitContract {
             old_invoice.smart_route,
             old_invoice.convert_to_stream,
             old_invoice.accepted_tokens.clone(),
+            old_invoice.require_kyc,
+            old_invoice.auction_on_expiry,
+            old_invoice.min_payment,
             old_invoice.split_rules.clone(),
             old_invoice.auto_resolve_rules.clone(),
         );
@@ -2756,6 +2996,9 @@ impl SplitContract {
             false,
             false,
             Vec::new(&env),
+            false,
+            false,
+            0,
             Vec::new(&env),
             Vec::new(&env),
         )

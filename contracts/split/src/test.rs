@@ -57,6 +57,9 @@ fn default_options(env: &Env) -> InvoiceOptions {
         smart_route: None,
         convert_to_stream: false,
         accepted_tokens: Vec::new(env),
+        require_kyc: false,
+        auction_on_expiry: false,
+        min_payment: 0,
     }
 }
 
