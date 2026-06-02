@@ -29,6 +29,14 @@ pub struct ResolveRule {
     pub action: ResolveAction,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum OverflowBehavior {
+    Reject,
+    Refund,
+    Donate,
+}
+
 /// Issue #: A single (invoice_id, amount) pair for pool_pay.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -161,6 +169,8 @@ pub struct InvoiceOptions {
     pub tax_authority: Option<Address>,
     pub insurance_premium_bps: Option<u32>,
     pub smart_route: Option<bool>,
+    pub notification_contract: Option<Address>,
+    pub overflow_behavior: OverflowBehavior,
     /// Issue #1: when true, _release() registers funds with the stream contract instead of direct transfer.
     pub convert_to_stream: bool,
     /// Issue #2: tokens accepted in pay_with_token(); base token is always accepted implicitly.
@@ -280,6 +290,8 @@ pub struct Invoice {
     pub split_rules: Vec<SplitRule>,
     /// Issue: pre-agreed auto-resolution rules evaluated in order when auto_resolve() is called.
     pub auto_resolve_rules: Vec<ResolveRule>,
+    pub overflow_behavior: OverflowBehavior,
+    pub notification_contract: Option<Address>,
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
@@ -348,6 +360,8 @@ impl Invoice {
             accepted_tokens: Vec::new(env),
             split_rules: Vec::new(env),
             auto_resolve_rules: Vec::new(env),
+            overflow_behavior: OverflowBehavior::Reject,
+            notification_contract: None,
         }
     }
 }
