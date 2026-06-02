@@ -16,7 +16,7 @@ use soroban_sdk::{
 use types::{
     AuditEntry, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions, InvoicePayment,
     InvoiceStats, InvoiceStatus, InvoiceTemplate, LegacyInvoice, Payment, PaymentProof,
-    SubscriptionParams, Tranche,
+    ResolveAction, ResolveRule, SplitRule, SubscriptionParams, Tranche,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,31 @@ fn compliance_key() -> Symbol {
     symbol_short!("comply")
 }
 
+/// Issue: per-creator invoice creation count key (cancellation rate limit).
+fn invoice_count_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("inv_count"), creator.clone())
+}
+
+/// Issue: per-creator invoice cancellation count key (cancellation rate limit).
+fn cancel_count_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cnl_count"), creator.clone())
+}
+
+/// Issue: maximum cancellation rate in basis points, stored globally.
+fn max_cancel_bps_key() -> Symbol {
+    symbol_short!("mx_cnl_bps")
+}
+
+/// Issue: receipt token factory contract address key.
+fn receipt_factory_key() -> Symbol {
+    symbol_short!("rcpt_fac")
+}
+
+/// Issue: per-payer per-invoice receipt token address key.
+fn receipt_token_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("rcpt"), invoice_id, payer.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Invoice storage helpers
 // ---------------------------------------------------------------------------
@@ -247,6 +272,9 @@ impl SplitContract {
         usdc_token: Address,
         platform_fee_bps: u32,
         compliance_contract: Option<Address>,
+        governance_contract: Option<Address>,
+        /// Issue: max cancellation rate in basis points (e.g. 3000 = 30%). 0 means no limit.
+        max_cancel_bps: u32,
     ) {
         assert!(
             !env.storage().instance().has(&admin_key()),
@@ -254,6 +282,7 @@ impl SplitContract {
         );
         assert!(creation_fee >= 0, "creation_fee must be non-negative");
         assert!(platform_fee_bps <= 10_000, "platform_fee_bps must be ≤ 10000");
+        assert!(max_cancel_bps <= 10_000, "max_cancel_bps must be ≤ 10000");
         env.storage().instance().set(&admin_key(), &admin);
         env.storage().instance().set(&creation_fee_key(), &creation_fee);
         env.storage().instance().set(&treasury_key(), &treasury);
@@ -261,6 +290,7 @@ impl SplitContract {
         env.storage().instance().set(&platform_fee_bps_key(), &platform_fee_bps);
         env.storage().instance().set(&governance_contract_key(), &governance_contract);
         env.storage().persistent().set(&paused_key(), &false);
+        env.storage().persistent().set(&max_cancel_bps_key(), &max_cancel_bps);
         if let Some(contract) = compliance_contract {
             env.storage().persistent().set(&soroban_sdk::symbol_short!("comp_ctr"), &contract);
         }
@@ -311,6 +341,26 @@ impl SplitContract {
         require_admin(&env);
         let _ = admin;
         env.storage().persistent().set(&soroban_sdk::symbol_short!("dex_ctr"), &contract);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue: receipt token factory (Issue 3)
+    // -----------------------------------------------------------------------
+
+    /// Store the address of the receipt token factory contract. Requires admin auth.
+    /// The factory must expose: mint_receipt(invoice_id: u64, payer: Address, amount: i128) -> Address
+    pub fn set_receipt_factory(env: Env, admin: Address, factory: Address) {
+        require_admin(&env);
+        let _ = admin;
+        env.storage().persistent().set(&receipt_factory_key(), &factory);
+    }
+
+    /// Return the receipt token address minted for a specific payer on a specific invoice.
+    /// Returns None if no receipt token exists (factory not set or payment not made).
+    pub fn get_receipt_token(env: Env, invoice_id: u64, payer: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&receipt_token_key(invoice_id, &payer))
     }
 
     // -----------------------------------------------------------------------
@@ -481,6 +531,8 @@ impl SplitContract {
             options.smart_route.unwrap_or(false),
             options.convert_to_stream,
             options.accepted_tokens,
+            options.split_rules,
+            options.auto_resolve_rules,
         )
     }
 
@@ -512,6 +564,8 @@ impl SplitContract {
         smart_route: bool,
         convert_to_stream: bool,
         accepted_tokens: Vec<Address>,
+        split_rules: Vec<SplitRule>,
+        auto_resolve_rules: Vec<ResolveRule>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -554,6 +608,31 @@ impl SplitContract {
         if !release_stages.is_empty() {
             let total_bps: u32 = release_stages.iter().sum();
             assert!(total_bps == 10_000, "release_stages must sum to 10000 basis points");
+        }
+
+        // Issue: validate split_rules — must have one rule per recipient, rules must sum to 100%.
+        if !split_rules.is_empty() {
+            assert!(
+                split_rules.len() == recipients.len(),
+                "split_rules length must match recipients"
+            );
+            let total_amounts: i128 = amounts.iter().sum();
+            assert!(total_amounts > 0, "total amounts must be positive");
+            let mut total_bps: u32 = 0;
+            for rule in split_rules.iter() {
+                match rule {
+                    SplitRule::Fixed(amt) => {
+                        total_bps += (amt as u128 * 10_000u128 / total_amounts as u128) as u32;
+                    }
+                    SplitRule::Percentage(bps) => {
+                        total_bps += bps;
+                    }
+                    SplitRule::Tiered { threshold: _, bps } => {
+                        total_bps += bps;
+                    }
+                }
+            }
+            assert!(total_bps == 10_000, "split_rules must sum to 100% of funded amount");
         }
 
         // Compliance check: if a compliance contract is configured, verify creator and all recipients.
@@ -601,6 +680,16 @@ impl SplitContract {
             .unwrap_or(0u64)
             + 1;
         env.storage().persistent().set(&counter_key(), &id);
+
+        // Issue: increment per-creator invoice count for cancellation rate tracking.
+        let inv_cnt: u64 = env
+            .storage()
+            .persistent()
+            .get(&invoice_count_key(&creator))
+            .unwrap_or(0u64);
+        env.storage()
+            .persistent()
+            .set(&invoice_count_key(&creator), &(inv_cnt + 1));
 
 
         let total: i128 = amounts.iter().sum();
@@ -681,6 +770,8 @@ impl SplitContract {
             smart_route,
             convert_to_stream,
             accepted_tokens,
+            split_rules,
+            auto_resolve_rules,
         };
 
         save_invoice(env, id, &invoice);
@@ -750,6 +841,8 @@ impl SplitContract {
                 false,
                 false,
                 Vec::new(&env),
+                Vec::new(&env),
+                Vec::new(&env),
             );
             ids.push_back(id);
         }
@@ -804,6 +897,8 @@ impl SplitContract {
             0,
             false,
             false,
+            Vec::new(&env),
+            Vec::new(&env),
             Vec::new(&env),
         );
 
@@ -1069,6 +1164,26 @@ impl SplitContract {
 
         append_audit_entry(env, invoice_id, symbol_short!("pay"), payer);
         events::payment_received(env, invoice_id, payer, credited_amount);
+
+        // Issue: mint a receipt token to the payer via the receipt factory if configured.
+        if let Some(factory) = env
+            .storage()
+            .persistent()
+            .get::<Symbol, Address>(&receipt_factory_key())
+        {
+            let mut args: Vec<Val> = Vec::new(env);
+            args.push_back(invoice_id.into_val(env));
+            args.push_back(payer.clone().into_val(env));
+            args.push_back(amount.into_val(env));
+            let receipt_addr: Address = env.invoke_contract(
+                &factory,
+                &Symbol::new(env, "mint_receipt"),
+                args,
+            );
+            env.storage()
+                .persistent()
+                .set(&receipt_token_key(invoice_id, payer), &receipt_addr);
+        }
 
         if invoice.funded >= total {
             // Auto-release only when no tranches, prerequisite, or group constraint
@@ -1763,14 +1878,28 @@ impl SplitContract {
         for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
-            let proportional = if i == n - 1 {
+
+            // Issue: if split_rules are defined, compute payout from rule instead of amounts[].
+            let proportional = if !invoice.split_rules.is_empty() {
+                let rule = invoice.split_rules.get(i as u32).unwrap();
+                match rule {
+                    SplitRule::Fixed(fixed_amt) => fixed_amt,
+                    SplitRule::Percentage(bps) => {
+                        (funded as u128 * bps as u128 / 10_000u128) as i128
+                    }
+                    SplitRule::Tiered { threshold, bps } => {
+                        if funded > threshold {
+                            (funded as u128 * bps as u128 / 10_000u128) as i128
+                        } else {
+                            0
+                        }
+                    }
+                }
+            } else if i == n - 1 {
                 funded - distributed
             } else {
                 (amount as u128 * funded as u128 / total as u128) as i128
             };
-            let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
-            let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
-            let payout = proportional - fee - tax;
             distributed += proportional;
 
             let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
@@ -1780,7 +1909,6 @@ impl SplitContract {
             let fee = (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
             let payout = post_tax - fee;
             total_fee += fee;
-            total_tax += tax;
 
             // Issue #41: if a swap token is configured for this recipient, invoke DEX swap.
             let swap_token: Option<Address> = invoice
@@ -2004,11 +2132,90 @@ impl SplitContract {
                 false,
                 false,
                 Vec::new(env),
+                Vec::new(env),
+                Vec::new(env),
             );
             env.storage()
                 .persistent()
                 .remove(&subscription_params_key(invoice_id));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue: Auto-resolve (Issue 4)
+    // -----------------------------------------------------------------------
+
+    /// Evaluate auto_resolve_rules in order against the current funding ratio.
+    /// Executes the first matching rule — Release calls _release(), Refund refunds payers.
+    /// Panics with "no matching resolution rule" if no rule matches.
+    pub fn auto_resolve(env: Env, invoice_id: u64) {
+        require_not_paused(&env);
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+        assert!(!invoice.auto_resolve_rules.is_empty(), "no auto-resolve rules defined");
+
+        let total: i128 = invoice.amounts.iter().sum();
+        assert!(total > 0, "invoice total must be positive");
+
+        let funded_bps = (invoice.funded as u128 * 10_000u128 / total as u128) as u32;
+
+        // Evaluate rules in order; execute first match.
+        for rule in invoice.auto_resolve_rules.clone().iter() {
+            if funded_bps >= rule.min_funded_bps {
+                match rule.action {
+                    ResolveAction::Release => {
+                        // Reuse existing release guards (prerequisite, co-signers, etc.).
+                        let caller = env.current_contract_address();
+                        Self::_release(&env, invoice_id, &mut invoice, &caller);
+                    }
+                    ResolveAction::Refund => {
+                        let token_client = token::Client::new(
+                            &env,
+                            &invoice.tokens.get(0).expect("no token"),
+                        );
+                        let mut totals: Map<Address, i128> = Map::new(&env);
+                        for payment in invoice.payments.iter() {
+                            let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+                            totals.set(payment.payer.clone(), prev + payment.amount);
+                        }
+                        let mut total_refunded_amount: i128 = 0;
+                        for (payer, amount) in totals.iter() {
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &payer,
+                                &amount,
+                            );
+                            total_refunded_amount += amount;
+                            events::payer_refunded(&env, invoice_id, &payer, amount);
+                        }
+                        invoice.status = InvoiceStatus::Refunded;
+                        invoice.completion_time = Some(env.ledger().timestamp());
+                        save_invoice(&env, invoice_id, &invoice);
+                        let actor = env.current_contract_address();
+                        append_audit_entry(&env, invoice_id, symbol_short!("auto_ref"), &actor);
+                        events::invoice_refunded(&env, invoice_id);
+                        let total_refunded: i128 = env
+                            .storage()
+                            .persistent()
+                            .get(&total_refunded_key())
+                            .unwrap_or(0i128);
+                        env.storage().persistent().set(
+                            &total_refunded_key(),
+                            &total_refunded
+                                .checked_add(total_refunded_amount)
+                                .expect("total_refunded overflow"),
+                        );
+                    }
+                }
+                return;
+            }
+        }
+
+        panic!("no matching resolution rule");
     }
 
     // -----------------------------------------------------------------------
@@ -2085,6 +2292,32 @@ impl SplitContract {
             "invoice is not pending"
         );
         assert!(invoice.creator == caller, "only creator can cancel");
+
+        // Issue: check cancellation rate limit before allowing cancel.
+        let inv_cnt: u64 = env
+            .storage()
+            .persistent()
+            .get(&invoice_count_key(&caller))
+            .unwrap_or(0u64);
+        if inv_cnt > 0 {
+            let max_cancel_bps: u32 = env
+                .storage()
+                .persistent()
+                .get(&max_cancel_bps_key())
+                .unwrap_or(0u32);
+            if max_cancel_bps > 0 {
+                let cnl_cnt: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&cancel_count_key(&caller))
+                    .unwrap_or(0u64);
+                let cancel_rate = cnl_cnt * 10_000 / inv_cnt;
+                assert!(
+                    cancel_rate < max_cancel_bps as u64,
+                    "cancellation rate too high"
+                );
+            }
+        }
 
         if invoice.funded > 0 {
             // Refund all payments.
@@ -2170,6 +2403,16 @@ impl SplitContract {
 
         save_invoice(&env, invoice_id, &invoice);
         append_audit_entry(&env, invoice_id, symbol_short!("cancel"), &caller);
+
+        // Issue: increment per-creator cancel count for cancellation rate tracking.
+        let cnl_cnt: u64 = env
+            .storage()
+            .persistent()
+            .get(&cancel_count_key(&caller))
+            .unwrap_or(0u64);
+        env.storage()
+            .persistent()
+            .set(&cancel_count_key(&caller), &(cnl_cnt + 1));
     }
 
     /// Transfer invoice ownership to a new creator.
@@ -2274,6 +2517,8 @@ impl SplitContract {
             old_invoice.smart_route,
             old_invoice.convert_to_stream,
             old_invoice.accepted_tokens.clone(),
+            old_invoice.split_rules.clone(),
+            old_invoice.auto_resolve_rules.clone(),
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -2467,6 +2712,8 @@ impl SplitContract {
             0,
             false,
             false,
+            Vec::new(&env),
+            Vec::new(&env),
             Vec::new(&env),
         )
     }
