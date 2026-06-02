@@ -120,7 +120,10 @@ pub struct InvoiceOptions {
     pub price_oracle: Option<Address>,
     /// Issue #41: optional preferred output token per recipient for DEX swap on release.
     pub swap_tokens: Vec<Option<Address>>,
-    pub cross_chain_ref: Option<String>,
+    pub tax_bps: Option<u32>,
+    pub tax_authority: Option<Address>,
+    pub insurance_premium_bps: Option<u32>,
+    pub smart_route: Option<bool>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -214,7 +217,11 @@ pub struct Invoice {
     /// Issue #41: optional preferred output token per recipient for DEX swap on release.
     /// Parallel to `recipients`; None means pay in the invoice token as normal.
     pub swap_tokens: Vec<Option<Address>>,
-    pub cross_chain_ref: Option<String>,
+    pub tax_bps: u32,
+    pub tax_authority: Option<Address>,
+    pub insurance_premium_bps: u32,
+    pub insurance_fund: i128,
+    pub smart_route: bool,
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
@@ -274,7 +281,11 @@ impl Invoice {
             allowed_payers: None,
             price_oracle: None,
             swap_tokens: Vec::new(env),
-            cross_chain_ref: None,
+            tax_bps: 0,
+            tax_authority: None,
+            insurance_premium_bps: 0,
+            insurance_fund: 0,
+            smart_route: false,
         }
     }
 }
