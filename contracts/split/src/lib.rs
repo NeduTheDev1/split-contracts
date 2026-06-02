@@ -378,6 +378,7 @@ impl SplitContract {
             options.tax_bps.unwrap_or(0),
             options.tax_authority,
             options.insurance_premium_bps.unwrap_or(0),
+            options.smart_route.unwrap_or(false),
         )
     }
 
@@ -407,6 +408,7 @@ impl SplitContract {
         tax_bps: u32,
         tax_authority: Option<Address>,
         insurance_premium_bps: u32,
+        smart_route: bool,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -541,6 +543,7 @@ impl SplitContract {
             tax_authority,
             insurance_premium_bps,
             insurance_fund: 0,
+            smart_route,
         };
 
         save_invoice(env, id, &invoice);
@@ -659,6 +662,7 @@ impl SplitContract {
             0,
             None,
             0,
+            false,
         );
 
         if months > 1 {
@@ -934,6 +938,28 @@ impl SplitContract {
         }
     }
 
+    fn execute_smart_route(env: &Env, invoice: &Invoice, recipient: &Address, payout: i128) -> bool {
+        if invoice.smart_route {
+            if let Some(dex_router) = env.storage().instance().get::<_, Address>(&soroban_sdk::symbol_short!("dex_rtr")) {
+                let token = invoice.tokens.get(0).expect("no token");
+                let path: Vec<Address> = env.invoke_contract(
+                    &dex_router,
+                    &soroban_sdk::Symbol::new(env, "get_path"),
+                    (token.clone(), recipient.clone()).into_val(env)
+                );
+                if !path.is_empty() {
+                    let _: Val = env.invoke_contract(
+                        &dex_router,
+                        &soroban_sdk::Symbol::new(env, "route_transfer"),
+                        (path, payout, recipient.clone()).into_val(env)
+                    );
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Approve an invoice if it has an approver set (issue #25).
     ///
     /// Requires authentication from the approver address.
@@ -1025,7 +1051,10 @@ impl SplitContract {
             token_client.transfer(&env.current_contract_address(), tax_authority, &tax);
         }
         
-        token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+        let routed = Self::execute_smart_route(&env, &invoice, &recipient, payout);
+        if !routed {
+            token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+        }
 
         append_audit_entry(&env, invoice_id, symbol_short!("claim"), &recipient);
     }
@@ -1071,9 +1100,14 @@ impl SplitContract {
             let payout_raw = payout_raw as i128;
             if payout_raw > 0 {
                 let fee = (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
-                let payout = payout_raw - fee;
+                let tax = (payout_raw as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
+                let payout = payout_raw - fee - tax;
                 total_fee += fee;
-                token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+                total_tax += tax;
+                let routed = Self::execute_smart_route(env, invoice, &recipient, payout);
+                if !routed {
+                    token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+                }
             }
         }
 
@@ -1193,7 +1227,10 @@ impl SplitContract {
                 let payout = payout_raw - fee - tax;
                 total_fee += fee;
                 total_tax += tax;
-                token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+                let routed = Self::execute_smart_route(&env, &invoice, &recipient, payout);
+                if !routed {
+                    token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+                }
             }
         }
 
@@ -1317,7 +1354,10 @@ impl SplitContract {
                 args.push_back(recipient.into_val(env));
                 let _swapped: i128 = env.invoke_contract(out_token, &Symbol::new(env, "swap"), args);
             } else {
-                token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+                let routed = Self::execute_smart_route(env, invoice, &recipient, payout);
+                if !routed {
+                    token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+                }
             }
         }
 
@@ -1401,11 +1441,14 @@ impl SplitContract {
                                 let tax_authority = member.tax_authority.as_ref().unwrap();
                                 member_token.transfer(&env.current_contract_address(), tax_authority, &tax);
                             }
-                            member_token.transfer(
-                                &env.current_contract_address(),
-                                &recipient,
-                                &payout,
-                            );
+                            let routed = Self::execute_smart_route(env, &member, &recipient, payout);
+                            if !routed {
+                                member_token.transfer(
+                                    &env.current_contract_address(),
+                                    &recipient,
+                                    &payout,
+                                );
+                            }
                         }
                         if group_total_fee > 0 {
                             let treasury: Address = env

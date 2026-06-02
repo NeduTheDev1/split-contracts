@@ -123,6 +123,7 @@ pub struct InvoiceOptions {
     pub tax_bps: Option<u32>,
     pub tax_authority: Option<Address>,
     pub insurance_premium_bps: Option<u32>,
+    pub smart_route: Option<bool>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -220,6 +221,7 @@ pub struct Invoice {
     pub tax_authority: Option<Address>,
     pub insurance_premium_bps: u32,
     pub insurance_fund: i128,
+    pub smart_route: bool,
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
@@ -283,6 +285,7 @@ impl Invoice {
             tax_authority: None,
             insurance_premium_bps: 0,
             insurance_fund: 0,
+            smart_route: false,
         }
     }
 }
