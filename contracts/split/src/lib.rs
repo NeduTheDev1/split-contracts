@@ -66,6 +66,23 @@ fn group_key(group_id: u64) -> (Symbol, u64) {
 fn invoice_group_key(invoice_id: u64) -> (Symbol, u64) {
     (symbol_short!("invgrp"), invoice_id)
 }
+
+fn invoice_treasury_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("inv_tr"), invoice_id)
+}
+
+fn treasury_group_counter_key() -> Symbol {
+    symbol_short!("grp_tr_cnt")
+}
+
+fn reminder_key(invoice_id: u64, address: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("rem"), invoice_id, address.clone())
+}
+
+fn group_treasury_key(group_id: u64) -> (Symbol, u64) {
+    (symbol_short!("grp_tr"), group_id)
+}
+
 fn template_key(creator: &Address, name: &Symbol) -> (Symbol, Address, Symbol) {
     (symbol_short!("tmpl"), creator.clone(), name.clone())
 }
@@ -251,6 +268,26 @@ fn group_all_funded(env: &Env, group_id: u64) -> bool {
         }
     }
     true
+}
+
+fn treasury_record_for_invoice(env: &Env, invoice_id: u64) -> Option<(u64, TreasuryRecord)> {
+    if let Some(group_id) = env
+        .storage()
+        .persistent()
+        .get::<(Symbol, u64), u64>(&invoice_treasury_key(invoice_id))
+    {
+        if let Some(record) = env.storage().persistent().get(&group_treasury_key(group_id)) {
+            return Some((group_id, record));
+        }
+    }
+    None
+}
+
+fn load_treasury_record(env: &Env, group_id: u64) -> TreasuryRecord {
+    env.storage()
+        .persistent()
+        .get(&group_treasury_key(group_id))
+        .expect("treasury record not found")
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +570,8 @@ impl SplitContract {
             options.accepted_tokens,
             options.split_rules,
             options.auto_resolve_rules,
+            options.oracle_address,
+            options.cross_chain_ref,
         )
     }
 
@@ -558,6 +597,7 @@ impl SplitContract {
         release_stages: Vec<u32>,
         price_oracle: Option<Address>,
         swap_tokens: Vec<Option<Address>>,
+        oracle_address: Option<Address>,
         tax_bps: u32,
         tax_authority: Option<Address>,
         insurance_premium_bps: u32,
@@ -566,6 +606,7 @@ impl SplitContract {
         accepted_tokens: Vec<Address>,
         split_rules: Vec<SplitRule>,
         auto_resolve_rules: Vec<ResolveRule>,
+        cross_chain_ref: Option<String>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -767,11 +808,14 @@ impl SplitContract {
             tax_authority,
             insurance_premium_bps,
             insurance_fund: 0,
+            oracle_address,
+            condition_met: false,
             smart_route,
             convert_to_stream,
             accepted_tokens,
             split_rules,
             auto_resolve_rules,
+            cross_chain_ref,
         };
 
         save_invoice(env, id, &invoice);
@@ -854,6 +898,9 @@ impl SplitContract {
                 Vec::new(&env),
                 Vec::new(&env),
                 Vec::new(&env),
+                None,
+                None,
+                None,
             );
             ids.push_back(id);
         }
@@ -911,6 +958,9 @@ impl SplitContract {
             Vec::new(&env),
             Vec::new(&env),
             Vec::new(&env),
+            None,
+            None,
+            None,
         );
 
         if months > 1 {
@@ -1042,7 +1092,8 @@ impl SplitContract {
                         || !invoice.tranches.is_empty()
                         || !invoice.release_stages.is_empty()
                         || in_group
-                        || !invoice.co_signers.is_empty();
+                        || !invoice.co_signers.is_empty()
+                        || (invoice.oracle_address.is_some() && !invoice.condition_met);
                 if guarded {
                     save_invoice(&env, invoice_id, &invoice);
                 } else {
@@ -1208,7 +1259,8 @@ impl SplitContract {
                     || !invoice.tranches.is_empty()
                     || !invoice.release_stages.is_empty()
                     || in_group
-                    || !invoice.co_signers.is_empty();
+                    || !invoice.co_signers.is_empty()
+                    || (invoice.oracle_address.is_some() && !invoice.condition_met);
             if guarded {
                 save_invoice(env, invoice_id, &invoice);
             } else {
@@ -1306,7 +1358,8 @@ impl SplitContract {
                     || !invoice.tranches.is_empty()
                     || !invoice.release_stages.is_empty()
                     || in_group
-                    || !invoice.co_signers.is_empty();
+                    || !invoice.co_signers.is_empty()
+                    || (invoice.oracle_address.is_some() && !invoice.condition_met);
             if guarded {
                 save_invoice(&env, invoice_id, &invoice);
             } else {
@@ -1381,7 +1434,8 @@ impl SplitContract {
                         || !inv.tranches.is_empty()
                         || !inv.release_stages.is_empty()
                         || in_group
-                        || !inv.co_signers.is_empty();
+                        || !inv.co_signers.is_empty()
+                        || (inv.oracle_address.is_some() && !inv.condition_met);
                 if guarded {
                     save_invoice(&env, p.invoice_id, &inv);
                 } else {
@@ -1531,6 +1585,75 @@ impl SplitContract {
         invoice.approved = true;
         save_invoice(&env, invoice_id, &invoice);
         append_audit_entry(&env, invoice_id, symbol_short!("aprv"), approver);
+    }
+
+    /// Oracle confirms a condition for a gated invoice.
+    /// Requires the configured oracle address to authenticate.
+    pub fn confirm_condition(env: Env, invoice_id: u64) {
+        require_not_paused(&env);
+        let mut invoice = load_invoice(&env, invoice_id);
+        let oracle = invoice.oracle_address.as_ref().expect("no oracle set for invoice");
+        oracle.require_auth();
+        invoice.condition_met = true;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("oracle_ok"), oracle);
+    }
+
+    /// Set a payment reminder for an address on a specific invoice.
+    /// The `who` address must authenticate.
+    pub fn set_reminder(env: Env, who: Address, invoice_id: u64, remind_at: u64) {
+        require_not_paused(&env);
+        who.require_auth();
+        env.storage()
+            .persistent()
+            .set(&reminder_key(invoice_id, &who), &remind_at);
+        append_audit_entry(&env, invoice_id, symbol_short!("set_rmd"), &who);
+    }
+
+    /// Trigger a previously set reminder; must be called at or after `remind_at`.
+    pub fn trigger_reminder(env: Env, invoice_id: u64, who: Address) {
+        require_not_paused(&env);
+        let remind_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&reminder_key(invoice_id, &who))
+            .expect("reminder not set");
+        assert!(env.ledger().timestamp() >= remind_at, "reminder not due");
+        events::payment_reminder(&env, invoice_id, &who);
+        env.storage().persistent().remove(&reminder_key(invoice_id, &who));
+        append_audit_entry(&env, invoice_id, symbol_short!("trig_rmd"), &who);
+    }
+
+    /// Create a treasury group linking multiple invoice IDs to a single treasury address.
+    /// Returns the new group id.
+    pub fn group_treasury_create(env: Env, creator: Address, invoice_ids: Vec<u64>, treasury: Address) -> u64 {
+        require_not_paused(&env);
+        creator.require_auth();
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&treasury_group_counter_key())
+            .unwrap_or(0u64)
+            + 1;
+        env.storage().persistent().set(&treasury_group_counter_key(), &id);
+        let record = types::TreasuryRecord { invoice_ids: invoice_ids.clone(), treasury: treasury.clone() };
+        env.storage().persistent().set(&group_treasury_key(id), &record);
+        for iid in invoice_ids.iter() {
+            env.storage().persistent().set(&invoice_treasury_key(*iid), &id);
+            append_audit_entry(&env, *iid, symbol_short!("grp_tr"), &creator);
+        }
+        id
+    }
+
+    /// Pay toward an invoice using a memo that encodes the invoice id.
+    /// Requires payer auth and emits a payment_matched event on success.
+    pub fn pay_with_memo(env: Env, payer: Address, memo: u64, amount: i128, nonce: u64, auto_convert: bool) {
+        require_not_paused(&env);
+        payer.require_auth();
+        // Validate memo corresponds to an existing invoice.
+        let _ = load_invoice(&env, memo);
+        Self::_pay(&env, &payer, memo, amount, nonce, auto_convert);
+        events::payment_matched(&env, memo, memo, &payer);
     }
 
     /// Claim vesting cliff share after cliff timestamp has passed (issue #27).
@@ -1886,6 +2009,7 @@ impl SplitContract {
         let mut distributed: i128 = 0;
         let mut total_fee: i128 = 0;
         let mut total_tax: i128 = 0;
+        let mut payouts: Vec<i128> = Vec::new(env);
         for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
@@ -1914,42 +2038,90 @@ impl SplitContract {
             distributed += proportional;
 
             let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
-            let post_tax = proportional - tax;
             total_tax += tax;
+            let post_tax = proportional - tax;
 
             let fee = (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
-            let payout = post_tax - fee;
             total_fee += fee;
 
-            // Issue #41: if a swap token is configured for this recipient, invoke DEX swap.
-            let swap_token: Option<Address> = invoice
-                .swap_tokens
-                .get(i as u32)
-                .unwrap_or(None);
-            if let Some(ref out_token) = swap_token {
-                let from_token = invoice.tokens.get(0).expect("no token");
-                let mut args: Vec<Val> = Vec::new(env);
-                args.push_back(from_token.into_val(env));
-                args.push_back(out_token.clone().into_val(env));
-                args.push_back(payout.into_val(env));
-                args.push_back(recipient.into_val(env));
-                let _swapped: i128 = env.invoke_contract(out_token, &Symbol::new(env, "swap"), args);
-            } else if invoice.smart_route {
-                // Smart routing: query DEX router for optimal path, fall back to direct transfer.
-                let from_token = invoice.tokens.get(0).expect("no token");
-                let mut route_args: Vec<Val> = Vec::new(env);
-                route_args.push_back(from_token.into_val(env));
-                route_args.push_back(payout.into_val(env));
-                route_args.push_back(recipient.clone().into_val(env));
-                // Try DEX path-finding via invoke; on failure fall back to direct transfer.
-                // In production the router address would be stored; here we attempt invoke
-                // and catch failure by falling back.
-                token_client.transfer(&env.current_contract_address(), &recipient, &payout);
-            } else {
-                let routed = Self::execute_smart_route(env, invoice, &recipient, payout);
-                if !routed {
-                    token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+            payouts.push_back(proportional);
+        }
+
+        // If this invoice belongs to a treasury group, route the net payouts to the group's treasury address.
+        if let Some((_group_id, record)) = treasury_record_for_invoice(env, invoice_id) {
+            // Transfer taxes first.
+            if total_tax > 0 {
+                if let Some(ref auth) = invoice.tax_authority {
+                    token_client.transfer(&env.current_contract_address(), auth, &total_tax);
                 }
+            }
+
+            // Transfer platform fee to global treasury.
+            if total_fee > 0 {
+                let treasury: Address = env
+                    .storage()
+                    .instance()
+                    .get(&treasury_key())
+                    .expect("treasury not set");
+                token_client.transfer(&env.current_contract_address(), &treasury, &total_fee);
+            }
+
+            let net = distributed - total_tax - total_fee;
+            if net > 0 {
+                token_client.transfer(&env.current_contract_address(), &record.treasury, &net);
+            }
+        } else {
+            // Default behavior: transfer to each recipient (or route via DEX/router as configured).
+            for i in 0..n {
+                let recipient = invoice.recipients.get(i).unwrap();
+                let proportional = payouts.get(i as u32).unwrap();
+
+                let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
+                let post_tax = proportional - tax;
+                let fee = (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                let payout = post_tax - fee;
+
+                // Issue #41: if a swap token is configured for this recipient, invoke DEX swap.
+                let swap_token: Option<Address> = invoice
+                    .swap_tokens
+                    .get(i as u32)
+                    .unwrap_or(None);
+                if let Some(ref out_token) = swap_token {
+                    let from_token = invoice.tokens.get(0).expect("no token");
+                    let mut args: Vec<Val> = Vec::new(env);
+                    args.push_back(from_token.into_val(env));
+                    args.push_back(out_token.clone().into_val(env));
+                    args.push_back(payout.into_val(env));
+                    args.push_back(recipient.into_val(env));
+                    let _swapped: i128 = env.invoke_contract(out_token, &Symbol::new(env, "swap"), args);
+                } else if invoice.smart_route {
+                    let from_token = invoice.tokens.get(0).expect("no token");
+                    let mut route_args: Vec<Val> = Vec::new(env);
+                    route_args.push_back(from_token.into_val(env));
+                    route_args.push_back(payout.into_val(env));
+                    route_args.push_back(recipient.clone().into_val(env));
+                    token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+                } else {
+                    let routed = Self::execute_smart_route(env, invoice, &recipient, payout);
+                    if !routed {
+                        token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+                    }
+                }
+            }
+
+            if total_tax > 0 {
+                if let Some(ref auth) = invoice.tax_authority {
+                    token_client.transfer(&env.current_contract_address(), auth, &total_tax);
+                }
+            }
+
+            if total_fee > 0 {
+                let treasury: Address = env
+                    .storage()
+                    .instance()
+                    .get(&treasury_key())
+                    .expect("treasury not set");
+                token_client.transfer(&env.current_contract_address(), &treasury, &total_fee);
             }
         }
 
@@ -2166,6 +2338,8 @@ impl SplitContract {
                 Vec::new(env),
                 Vec::new(env),
                 Vec::new(env),
+                None,
+                None,
             );
             env.storage()
                 .persistent()
