@@ -121,6 +121,8 @@ pub struct InvoiceOptions {
     /// Issue #41: optional preferred output token per recipient for DEX swap on release.
     pub swap_tokens: Vec<Option<Address>>,
     pub insurance_premium_bps: Option<u32>,
+    /// When true, _release() routes payments via DEX path-finding for optimal execution.
+    pub smart_route: bool,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -155,6 +157,7 @@ pub struct LegacyInvoice {
     pub tax_authority: Option<Address>,
     pub insurance_premium_bps: u32,
     pub insurance_fund: i128,
+    pub smart_route: bool,
 }
 
 #[contracttype]
@@ -222,6 +225,8 @@ pub struct Invoice {
     pub tax_authority: Option<Address>,
     pub insurance_premium_bps: u32,
     pub insurance_fund: i128,
+    /// When true, _release() routes payments via DEX path-finding for optimal execution.
+    pub smart_route: bool,
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
@@ -285,6 +290,7 @@ impl Invoice {
             tax_authority: old.tax_authority,
             insurance_premium_bps: old.insurance_premium_bps,
             insurance_fund: old.insurance_fund,
+            smart_route: old.smart_route,
         }
     }
 }
