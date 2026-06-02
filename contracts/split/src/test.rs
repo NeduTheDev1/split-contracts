@@ -3310,3 +3310,36 @@ fn test_cross_chain_ref() {
     // Note: We can't easily assert on the emitted event here without env.events().all(),
     // but the test verifies the struct and ensures it doesn't panic.
 }
+
+#[test]
+fn test_compress_payments() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer1, &1000);
+    sa.mint(&payer2, &1000);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+
+    c.pay(&payer1, &id, &50_i128, &0_u64, &false);
+    c.pay(&payer2, &id, &100_i128, &0_u64, &false);
+    c.pay(&payer1, &id, &75_i128, &1_u64, &false);
+    c.pay(&payer2, &id, &25_i128, &1_u64, &false);
+
+    let inv_before = c.get_invoice(&id);
+    assert_eq!(inv_before.payments.len(), 4);
+
+    c.compress_payments(&id);
+
+    let inv_after = c.get_invoice(&id);
+    assert_eq!(inv_after.payments.len(), 2);
+    assert_eq!(inv_after.funded, 250);
+}

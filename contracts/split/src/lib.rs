@@ -678,6 +678,41 @@ impl SplitContract {
     /// `auto_convert` (issue #88): when true, invokes DEX swap to convert payer's
     /// source asset to invoice token before crediting payment. When false, behaves
     /// identically to current implementation.
+
+    /// Compress payments by aggregating all payments from the same payer into a single entry.
+    pub fn compress_payments(env: Env, invoice_id: u64) {
+        require_not_paused(&env);
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        let mut payer_amounts: Map<Address, i128> = Map::new(&env);
+        let mut payer_tips: Map<Address, i128> = Map::new(&env);
+
+        for p in invoice.payments.iter() {
+            let current_amt = payer_amounts.get(p.payer.clone()).unwrap_or(0);
+            payer_amounts.set(p.payer.clone(), current_amt + p.amount);
+            
+            let current_tip = payer_tips.get(p.payer.clone()).unwrap_or(0);
+            payer_tips.set(p.payer.clone(), current_tip + p.tip);
+        }
+
+        let mut new_payments: Vec<Payment> = Vec::new(&env);
+        for (payer, amount) in payer_amounts.iter() {
+            let tip = payer_tips.get(payer.clone()).unwrap_or(0);
+            new_payments.push_back(Payment { payer, amount, tip });
+        }
+
+        invoice.payments = new_payments;
+
+        // Verify total funded is unchanged (optional assertion, as asked by Acceptance Criteria)
+        let mut total_funded: i128 = 0;
+        for p in invoice.payments.iter() {
+            total_funded += p.amount;
+        }
+        assert_eq!(total_funded, invoice.funded, "total funded changed after compression");
+
+        save_invoice(&env, invoice_id, &invoice);
+    }
+
     pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, auto_convert: bool) {
         require_not_paused(&env);
         payer.require_auth();
