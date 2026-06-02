@@ -142,6 +142,11 @@ fn delegate_key(invoice_id: u64) -> (Symbol, u64) {
     (symbol_short!("delegate"), invoice_id)
 }
 
+/// Delegate-pay authorization key for a beneficiary.
+fn delegate_pay_key(beneficiary: &Address) -> (Symbol, Address) {
+    (symbol_short!("delegate_pay"), beneficiary.clone())
+}
+
 /// Analytics counters (issue #28).
 fn total_invoices_key() -> Symbol {
     symbol_short!("tot_inv")
@@ -244,6 +249,13 @@ fn append_audit_entry(env: &Env, id: u64, action: Symbol, actor: &Address) {
         .unwrap_or_else(|| Vec::new(env));
     log.push_back(entry);
     env.storage().persistent().set(&audit_log_key(id), &log);
+}
+
+fn notify_invoice(env: &Env, invoice_id: u64, event: Symbol, notification_contract: &Option<Address>) {
+    if let Some(contract) = notification_contract {
+        let args = (invoice_id, event).into_val(env);
+        let _ = env.invoke_contract(contract, &Symbol::new(env, "notify"), args);
+    }
 }
 
 pub fn get_audit_log(env: &Env, id: u64) -> Vec<AuditEntry> {
@@ -609,6 +621,8 @@ impl SplitContract {
             options.tax_authority,
             options.insurance_premium_bps.unwrap_or(0),
             options.smart_route.unwrap_or(false),
+            options.notification_contract.clone(),
+            options.overflow_behavior.clone(),
             options.convert_to_stream,
             options.accepted_tokens,
             options.forward_to,
@@ -650,6 +664,8 @@ impl SplitContract {
         tax_authority: Option<Address>,
         insurance_premium_bps: u32,
         smart_route: bool,
+        notification_contract: Option<Address>,
+        overflow_behavior: OverflowBehavior,
         convert_to_stream: bool,
         accepted_tokens: Vec<Address>,
         forward_to: Option<Address>,
@@ -868,6 +884,8 @@ impl SplitContract {
             oracle_address,
             condition_met: false,
             smart_route,
+            overflow_behavior,
+            notification_contract,
             convert_to_stream,
             accepted_tokens,
             forward_to,
@@ -1247,7 +1265,6 @@ impl SplitContract {
             invoice.amounts.iter().sum()
         };
         let remaining = total - invoice.funded;
-        assert!(amount <= remaining, "payment exceeds remaining balance");
 
         if invoice.require_kyc {
             let kyc_contract: Address = env
@@ -1312,23 +1329,54 @@ impl SplitContract {
         }
 
         let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
-        
-        let premium = (amount as u128 * invoice.insurance_premium_bps as u128 / 10_000u128) as i128;
-        let total_charge = amount + premium;
+
+        let credited_amount = match invoice.overflow_behavior {
+            OverflowBehavior::Reject => {
+                assert!(amount <= remaining, "payment exceeds remaining balance");
+                amount
+            }
+            OverflowBehavior::Refund => {
+                if amount <= remaining {
+                    amount
+                } else {
+                    remaining
+                }
+            }
+            OverflowBehavior::Donate => {
+                if amount <= remaining {
+                    amount
+                } else {
+                    remaining
+                }
+            }
+        };
+
+        let premium = (credited_amount as u128 * invoice.insurance_premium_bps as u128 / 10_000u128) as i128;
+        let total_charge = credited_amount + premium;
 
         // Issue #88: Auto-convert if requested.
-        let credited_amount = if auto_convert {
-            // In production, this would call a DEX swap contract.
-            // For now, we assume a 1:1 swap and transfer the amount directly.
-            // Mock DEX swap: payer's source asset -> invoice token.
-            // The swapped amount is what gets credited.
+        if auto_convert {
             token_client.transfer(payer, &env.current_contract_address(), &total_charge);
-            amount // In a real implementation, this would be the swapped output amount.
         } else {
             token_client.transfer(payer, &env.current_contract_address(), &total_charge);
-            amount
-        };
-        
+        }
+
+        let excess = amount - credited_amount;
+        match invoice.overflow_behavior {
+            OverflowBehavior::Refund if excess > 0 => {
+                token_client.transfer(&env.current_contract_address(), payer, &excess);
+            }
+            OverflowBehavior::Donate if excess > 0 => {
+                let treasury: Address = env
+                    .storage()
+                    .instance()
+                    .get(&treasury_key())
+                    .expect("treasury not set");
+                token_client.transfer(&env.current_contract_address(), &treasury, &excess);
+            }
+            _ => {}
+        }
+
         invoice.insurance_fund += premium;
 
         // Penalty for late payment (issue #42).
@@ -1379,6 +1427,7 @@ impl SplitContract {
 
         append_audit_entry(env, invoice_id, symbol_short!("pay"), payer);
         events::payment_received(env, invoice_id, payer, credited_amount);
+        notify_invoice(env, invoice_id, symbol_short!("pay"), &invoice.notification_contract);
 
         // Issue: mint a receipt token to the payer via the receipt factory if configured.
         if let Some(factory) = env
@@ -1389,7 +1438,7 @@ impl SplitContract {
             let mut args: Vec<Val> = Vec::new(env);
             args.push_back(invoice_id.into_val(env));
             args.push_back(payer.clone().into_val(env));
-            args.push_back(amount.into_val(env));
+            args.push_back(credited_amount.into_val(env));
             let receipt_addr: Address = env.invoke_contract(
                 &factory,
                 &Symbol::new(env, "mint_receipt"),
@@ -1503,6 +1552,68 @@ impl SplitContract {
 
         append_audit_entry(&env, invoice_id, symbol_short!("pay_tok"), &payer);
         events::payment_received(&env, invoice_id, &payer, credited_amount);
+        notify_invoice(&env, invoice_id, symbol_short!("pay"), &invoice.notification_contract);
+
+        if invoice.funded >= total {
+            let in_group = env.storage().persistent().has(&invoice_group_key(invoice_id));
+            let guarded =
+                invoice.prerequisite_id.is_some()
+                    || !invoice.tranches.is_empty()
+                    || !invoice.release_stages.is_empty()
+                    || in_group
+                    || !invoice.co_signers.is_empty();
+            if guarded {
+                save_invoice(&env, invoice_id, &invoice);
+            } else {
+                Self::_release(&env, invoice_id, &mut invoice, &payer);
+            }
+        } else {
+            save_invoice(&env, invoice_id, &invoice);
+        }
+    }
+
+    /// Pay with an alternate token by swapping via the configured DEX contract.
+    /// The resulting invoice token amount is credited to the invoice.
+    pub fn bridge_pay(
+        env: Env,
+        payer: Address,
+        invoice_id: u64,
+        source_token: Address,
+        source_amount: i128,
+    ) {
+        require_not_paused(&env);
+        payer.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(env.ledger().timestamp() <= invoice.deadline, "invoice deadline has passed");
+        assert!(source_amount > 0, "payment amount must be positive");
+
+        let invoice_token = invoice.tokens.get(0).expect("no token");
+        let src_client = token::Client::new(&env, &source_token);
+        src_client.transfer(&payer, &env.current_contract_address(), &source_amount);
+
+        let dex: Address = env
+            .storage()
+            .persistent()
+            .get(&soroban_sdk::symbol_short!("dex_ctr"))
+            .expect("dex contract not set");
+        let mut args: Vec<Val> = Vec::new(&env);
+        args.push_back(source_token.into_val(&env));
+        args.push_back(invoice_token.clone().into_val(&env));
+        args.push_back(source_amount.into_val(&env));
+        let converted: i128 = env.invoke_contract(&dex, &Symbol::new(&env, "swap"), args);
+
+        let total: i128 = invoice.amounts.iter().sum();
+        let remaining = total - invoice.funded;
+        assert!(converted <= remaining, "payment exceeds remaining balance");
+
+        invoice.payments.push_back(Payment { payer: payer.clone(), amount: converted, tip: 0 });
+        invoice.funded += converted;
+
+        append_audit_entry(&env, invoice_id, symbol_short!("bridge_pay"), &payer);
+        events::payment_received(&env, invoice_id, &payer, converted);
+        notify_invoice(&env, invoice_id, symbol_short!("pay"), &invoice.notification_contract);
 
         if invoice.funded >= total {
             let in_group = env.storage().persistent().has(&invoice_group_key(invoice_id));
@@ -2002,6 +2113,7 @@ impl SplitContract {
             }
             append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
             events::invoice_released(env, invoice_id, &invoice.recipients);
+            notify_invoice(env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
         }
 
         save_invoice(env, invoice_id, invoice);
@@ -2126,6 +2238,7 @@ impl SplitContract {
             }
             append_audit_entry(&env, invoice_id, symbol_short!("stg_rel"), &creator);
             events::invoice_released(&env, invoice_id, &invoice.recipients);
+            notify_invoice(&env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
         } else {
             append_audit_entry(&env, invoice_id, symbol_short!("stg_rel"), &creator);
         }
@@ -2480,6 +2593,7 @@ impl SplitContract {
         save_invoice(env, invoice_id, invoice);
         append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
         events::invoice_released(env, invoice_id, &invoice.recipients);
+        notify_invoice(env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
 
         // Increment total_volume and total_released counters (issue #28).
         let total_volume: i128 = env
@@ -2631,6 +2745,7 @@ impl SplitContract {
                         let actor = env.current_contract_address();
                         append_audit_entry(&env, invoice_id, symbol_short!("auto_ref"), &actor);
                         events::invoice_refunded(&env, invoice_id);
+                        notify_invoice(&env, invoice_id, symbol_short!("refund"), &invoice.notification_contract);
                         let total_refunded: i128 = env
                             .storage()
                             .persistent()
@@ -2711,6 +2826,7 @@ impl SplitContract {
         let actor = env.current_contract_address();
         append_audit_entry(&env, invoice_id, symbol_short!("refund"), &actor);
         events::invoice_refunded(&env, invoice_id);
+        notify_invoice(&env, invoice_id, symbol_short!("refund"), &invoice.notification_contract);
 
         // Increment total_refunded counter (issue #28).
         let total_refunded: i128 = env
@@ -3079,6 +3195,8 @@ impl SplitContract {
             old_invoice.tax_authority.clone(),
             old_invoice.insurance_premium_bps,
             old_invoice.smart_route,
+            old_invoice.notification_contract.clone(),
+            old_invoice.overflow_behavior.clone(),
             old_invoice.convert_to_stream,
             old_invoice.accepted_tokens.clone(),
             old_invoice.forward_to,
@@ -3743,5 +3861,79 @@ impl SplitContract {
         env.storage()
             .persistent()
             .get(&delegate_key(invoice_id))
+    }
+
+    /// Authorise an address to pay on behalf of the beneficiary.
+    /// Requires beneficiary auth.
+    pub fn authorise_delegate(env: Env, beneficiary: Address, delegate: Address) {
+        require_not_paused(&env);
+        beneficiary.require_auth();
+
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&delegate_pay_key(&beneficiary))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if !delegates.iter().any(|d| d == delegate) {
+            delegates.push_back(delegate.clone());
+            env.storage().persistent().set(&delegate_pay_key(&beneficiary), &delegates);
+        }
+    }
+
+    /// Pay toward an invoice using an authorised delegate.
+    /// The invoice records the beneficiary as the payer.
+    pub fn delegate_pay(
+        env: Env,
+        delegate: Address,
+        beneficiary: Address,
+        invoice_id: u64,
+        amount: i128,
+    ) {
+        require_not_paused(&env);
+        delegate.require_auth();
+
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&delegate_pay_key(&beneficiary))
+            .unwrap_or_else(|| Vec::new(&env));
+        assert!(delegates.iter().any(|d| d == delegate), "not authorised");
+
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(env.ledger().timestamp() <= invoice.deadline, "invoice deadline has passed");
+        assert!(amount > 0, "payment amount must be positive");
+
+        let total: i128 = invoice.amounts.iter().sum();
+        let remaining = total - invoice.funded;
+        assert!(amount <= remaining, "payment exceeds remaining balance");
+
+        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        token_client.transfer(&delegate, &env.current_contract_address(), &amount);
+
+        invoice.payments.push_back(Payment { payer: beneficiary.clone(), amount, tip: 0 });
+        invoice.funded += amount;
+
+        append_audit_entry(&env, invoice_id, symbol_short!("del_pay"), &delegate);
+        events::payment_received(&env, invoice_id, &beneficiary, amount);
+        notify_invoice(&env, invoice_id, symbol_short!("pay"), &invoice.notification_contract);
+
+        let in_group = env.storage().persistent().has(&invoice_group_key(invoice_id));
+        let guarded =
+            invoice.prerequisite_id.is_some()
+                || !invoice.tranches.is_empty()
+                || !invoice.release_stages.is_empty()
+                || in_group
+                || !invoice.co_signers.is_empty();
+        if invoice.funded >= total {
+            if guarded {
+                save_invoice(&env, invoice_id, &invoice);
+            } else {
+                Self::_release(&env, invoice_id, &mut invoice, &delegate);
+            }
+        } else {
+            save_invoice(&env, invoice_id, &invoice);
+        }
     }
 }
