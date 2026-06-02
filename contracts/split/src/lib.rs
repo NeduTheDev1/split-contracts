@@ -12,8 +12,9 @@ use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec,
 };
 use types::{
-    AuditEntry, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions, InvoiceStatus,
-    InvoiceTemplate, LegacyInvoice, Payment, PaymentProof, SubscriptionParams, Tranche,
+    AuditEntry, CompletionProof, CreateInvoiceParams, Invoice, InvoiceOptions, InvoiceStats,
+    InvoiceStatus, InvoiceTemplate, LegacyInvoice, Payment, PaymentProof, SubscriptionParams,
+    Tranche,
 };
 
 // ---------------------------------------------------------------------------
@@ -81,6 +82,11 @@ fn referral_count_key(referrer: &Address) -> (Symbol, Address) {
 /// Per-payer per-invoice nonce key (issue #21).
 fn nonce_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("nonce"), invoice_id, payer.clone())
+}
+
+/// Authorised factory addresses key (issue #145).
+fn factories_key() -> Symbol {
+    symbol_short!("factories")
 }
 
 /// Per-recipient invoice ID index key (issue #40).

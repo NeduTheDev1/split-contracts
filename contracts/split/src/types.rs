@@ -215,6 +215,17 @@ pub struct Invoice {
     pub swap_tokens: Vec<Option<Address>>,
 }
 
+/// Issue #144: Payment analytics for an invoice, callable by external contracts.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceStats {
+    pub funded: i128,
+    pub total: i128,
+    pub payment_count: u32,
+    pub unique_payers: u32,
+    pub completion_bps: u32,
+}
+
 impl Invoice {
     /// Upgrade a legacy (pre-version) invoice to the current schema.
     /// New fields are filled with their default (empty / zero) values.
