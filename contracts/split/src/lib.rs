@@ -220,6 +220,7 @@ impl SplitContract {
         treasury: Address,
         usdc_token: Address,
         platform_fee_bps: u32,
+        compliance_contract: Option<Address>,
     ) {
         assert!(
             !env.storage().instance().has(&admin_key()),
@@ -233,6 +234,9 @@ impl SplitContract {
         env.storage().instance().set(&usdc_token_key(), &usdc_token);
         env.storage().instance().set(&platform_fee_bps_key(), &platform_fee_bps);
         env.storage().persistent().set(&paused_key(), &false);
+        if let Some(contract) = compliance_contract {
+            env.storage().persistent().set(&soroban_sdk::symbol_short!("comp_ctr"), &contract);
+        }
     }
 
     /// Pause the contract. Requires admin auth.
@@ -427,6 +431,16 @@ impl SplitContract {
 
         for amt in amounts.iter() {
             assert!(amt > 0, "amounts must be positive");
+        }
+
+        if let Some(compliance_contract) = env.storage().persistent().get::<_, Address>(&soroban_sdk::symbol_short!("comp_ctr")) {
+            let creator_ok: bool = env.invoke_contract(&compliance_contract, &soroban_sdk::Symbol::new(env, "check"), (creator.clone(),).into_val(env));
+            assert!(creator_ok, "compliance check failed");
+            
+            for recipient in recipients.iter() {
+                let recipient_ok: bool = env.invoke_contract(&compliance_contract, &soroban_sdk::Symbol::new(env, "check"), (recipient.clone(),).into_val(env));
+                assert!(recipient_ok, "compliance check failed");
+            }
         }
 
         if let Some(prereq_id) = prerequisite_id {
