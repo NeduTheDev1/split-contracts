@@ -9,7 +9,8 @@ pub enum SplitRule {
     /// Pay `funded * bps / 10_000` to the recipient.
     Percentage(u32),
     /// Pay `funded * bps / 10_000` only when `funded > threshold`; else 0.
-    Tiered { threshold: i128, bps: u32 },
+    /// Encoded as (threshold, bps).
+    Tiered(i128, u32),
 }
 
 /// Issue: Action taken by an auto-resolve rule.
@@ -188,12 +189,6 @@ pub struct InvoiceOptions {
     pub convert_to_stream: bool,
     /// Issue #2: tokens accepted in pay_with_token(); base token is always accepted implicitly.
     pub accepted_tokens: Vec<Address>,
-    /// Optional creator cosigner: when set, creator-gated functions require both auths.
-    pub creator_cosigner: Option<Address>,
-    /// Per-invoice velocity limit (0 = disabled).
-    pub velocity_limit: i128,
-    /// Velocity window length in seconds.
-    pub velocity_window: u64,
     /// Optional automatic forwarding address target for leftover funds.
     pub forward_to: Option<Address>,
     /// Optional automatic forwarding to another invoice id.
@@ -206,6 +201,8 @@ pub struct InvoiceOptions {
     pub oracle_address: Option<Address>,
     /// Optional cross-chain reference carried through invoice creation.
     pub cross_chain_ref: Option<String>,
+    /// Issue #98: restrict payments to this allowlist; None = open.
+    pub allowed_payers: Option<Vec<Address>>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -245,15 +242,12 @@ pub struct LegacyInvoice {
 
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct Invoice {
-    /// Schema version (0 for legacy, 1 for current).
+pub struct InvoiceCore {
     pub version: u32,
     pub creator: Address,
     pub co_creators: Vec<Address>,
     pub recipients: Vec<Address>,
     pub amounts: Vec<i128>,
-    /// Token per recipient (parallel to `recipients`); in practice all entries
-    /// are the same token set at creation time.
     pub tokens: Vec<Address>,
     pub deadline: u64,
     pub funded: i128,
@@ -267,65 +261,258 @@ pub struct Invoice {
     pub allow_early_withdrawal: bool,
     pub bonus_pool: i128,
     pub bonus_max_payers: u32,
-    /// Issue #22: if set, `release()` will fail until this invoice is Released.
     pub prerequisite_id: Option<u64>,
-    /// Issue #23: graduated release schedule; empty means release all at once.
     pub tranches: Vec<Tranche>,
-    /// Issue #23: cumulative basis points already distributed (0–10 000).
     pub released_bps: u32,
-    /// Co-signers that must approve release before funds can be distributed.
-    /// If non-empty, `required_signatures` of them must call `sign_release()`.
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceExt {
     pub co_signers: Vec<Address>,
-    /// How many co-signer approvals are required to unlock release.
-    /// Must be ≤ `co_signers.len()`.
     pub required_signatures: u32,
-    /// Co-signers that have already approved release.
     pub signatures: Vec<Address>,
-    /// Optional approver address that must approve before release (issue #25).
     pub approver: Option<Address>,
-    /// Whether the approver has approved the invoice (issue #25).
     pub approved: bool,
-    /// Optional oracle address that must confirm a condition before release.
     pub oracle_address: Option<Address>,
-    /// Whether the oracle condition has been met.
     pub condition_met: bool,
-    /// Penalty basis points for payments after `penalty_deadline` (issue #42).
     pub penalty_bps: u32,
-    /// Soft deadline; payments after this timestamp incur a penalty (issue #42).
     pub penalty_deadline: u64,
-    /// Minimum funding threshold in basis points (issue #43); 0 means 100%.
     pub min_funding_bps: u32,
-    /// Issue #86: creator-triggered staged release schedule (basis points per stage).
     pub release_stages: Vec<u32>,
-    /// Issue #86: number of stages already released.
     pub released_stages: u32,
-    /// Optional whitelist of addresses allowed to pay this invoice (mirrors InvoiceTemplate).
     pub allowed_payers: Option<Vec<Address>>,
-    /// Issue #142: optional price oracle contract; when set, pay() queries it for the current price.
     pub price_oracle: Option<Address>,
-    /// Issue #142: base amounts recorded at creation; used to compute oracle-adjusted totals.
     pub base_amounts: Vec<i128>,
-    /// Issue #41: optional preferred output token per recipient for DEX swap on release.
-    /// Parallel to `recipients`; None means pay in the invoice token as normal.
     pub swap_tokens: Vec<Option<Address>>,
     pub tax_bps: u32,
     pub tax_authority: Option<Address>,
     pub insurance_premium_bps: u32,
     pub insurance_fund: i128,
     pub smart_route: bool,
-    /// Issue #1: when true, _release() registers funds with the stream contract.
     pub convert_to_stream: bool,
-    /// Issue #2: additional tokens accepted by pay_with_token().
     pub accepted_tokens: Vec<Address>,
-    /// Optional automatic forwarding address target for leftover funds.
     pub forward_to: Option<Address>,
-    /// Optional automatic forwarding to another invoice id.
     pub forward_invoice_id: Option<u64>,
-    /// Issue: per-recipient split rules evaluated at release time; empty = use amounts[].
     pub split_rules: Vec<SplitRule>,
-    /// Issue: pre-agreed auto-resolution rules evaluated in order when auto_resolve() is called.
     pub auto_resolve_rules: Vec<ResolveRule>,
+    pub creator_cosigner: Option<Address>,
+    pub velocity_limit: i128,
+    pub velocity_window: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceExt2 {
+    pub notification_contract: Option<Address>,
+    pub overflow_behavior: OverflowBehavior,
     pub cross_chain_ref: Option<String>,
+    pub require_kyc: bool,
+    pub auction_on_expiry: bool,
+    pub auction_end: u64,
+    pub bids: Vec<Bid>,
+    pub min_payment: i128,
+}
+
+/// Full invoice — assembled from InvoiceCore + InvoiceExt + InvoiceExt2.
+/// Never stored directly; use save_invoice / load_invoice helpers in lib.rs.
+#[derive(Clone, Debug)]
+pub struct Invoice {
+    pub version: u32,
+    pub creator: Address,
+    pub co_creators: Vec<Address>,
+    pub recipients: Vec<Address>,
+    pub amounts: Vec<i128>,
+    pub tokens: Vec<Address>,
+    pub deadline: u64,
+    pub funded: i128,
+    pub status: InvoiceStatus,
+    pub payments: Vec<Payment>,
+    pub drip_duration: Option<u64>,
+    pub release_timestamp: Option<u64>,
+    pub claimed: Vec<i128>,
+    pub frozen: bool,
+    pub completion_time: Option<u64>,
+    pub allow_early_withdrawal: bool,
+    pub bonus_pool: i128,
+    pub bonus_max_payers: u32,
+    pub prerequisite_id: Option<u64>,
+    pub tranches: Vec<Tranche>,
+    pub released_bps: u32,
+    pub co_signers: Vec<Address>,
+    pub required_signatures: u32,
+    pub signatures: Vec<Address>,
+    pub approver: Option<Address>,
+    pub approved: bool,
+    pub oracle_address: Option<Address>,
+    pub condition_met: bool,
+    pub penalty_bps: u32,
+    pub penalty_deadline: u64,
+    pub min_funding_bps: u32,
+    pub release_stages: Vec<u32>,
+    pub released_stages: u32,
+    pub allowed_payers: Option<Vec<Address>>,
+    pub price_oracle: Option<Address>,
+    pub base_amounts: Vec<i128>,
+    pub swap_tokens: Vec<Option<Address>>,
+    pub tax_bps: u32,
+    pub tax_authority: Option<Address>,
+    pub insurance_premium_bps: u32,
+    pub insurance_fund: i128,
+    pub smart_route: bool,
+    pub convert_to_stream: bool,
+    pub accepted_tokens: Vec<Address>,
+    pub forward_to: Option<Address>,
+    pub forward_invoice_id: Option<u64>,
+    pub split_rules: Vec<SplitRule>,
+    pub auto_resolve_rules: Vec<ResolveRule>,
+    pub creator_cosigner: Option<Address>,
+    pub velocity_limit: i128,
+    pub velocity_window: u64,
+    pub notification_contract: Option<Address>,
+    pub overflow_behavior: OverflowBehavior,
+    pub cross_chain_ref: Option<String>,
+    pub require_kyc: bool,
+    pub auction_on_expiry: bool,
+    pub auction_end: u64,
+    pub bids: Vec<Bid>,
+    pub min_payment: i128,
+}
+
+impl Invoice {
+    pub fn split(self) -> (InvoiceCore, InvoiceExt, InvoiceExt2) {
+        (
+            InvoiceCore {
+                version: self.version,
+                creator: self.creator,
+                co_creators: self.co_creators,
+                recipients: self.recipients,
+                amounts: self.amounts,
+                tokens: self.tokens,
+                deadline: self.deadline,
+                funded: self.funded,
+                status: self.status,
+                payments: self.payments,
+                drip_duration: self.drip_duration,
+                release_timestamp: self.release_timestamp,
+                claimed: self.claimed,
+                frozen: self.frozen,
+                completion_time: self.completion_time,
+                allow_early_withdrawal: self.allow_early_withdrawal,
+                bonus_pool: self.bonus_pool,
+                bonus_max_payers: self.bonus_max_payers,
+                prerequisite_id: self.prerequisite_id,
+                tranches: self.tranches,
+                released_bps: self.released_bps,
+            },
+            InvoiceExt {
+                co_signers: self.co_signers,
+                required_signatures: self.required_signatures,
+                signatures: self.signatures,
+                approver: self.approver,
+                approved: self.approved,
+                oracle_address: self.oracle_address,
+                condition_met: self.condition_met,
+                penalty_bps: self.penalty_bps,
+                penalty_deadline: self.penalty_deadline,
+                min_funding_bps: self.min_funding_bps,
+                release_stages: self.release_stages,
+                released_stages: self.released_stages,
+                allowed_payers: self.allowed_payers,
+                price_oracle: self.price_oracle,
+                base_amounts: self.base_amounts,
+                swap_tokens: self.swap_tokens,
+                tax_bps: self.tax_bps,
+                tax_authority: self.tax_authority,
+                insurance_premium_bps: self.insurance_premium_bps,
+                insurance_fund: self.insurance_fund,
+                smart_route: self.smart_route,
+                convert_to_stream: self.convert_to_stream,
+                accepted_tokens: self.accepted_tokens,
+                forward_to: self.forward_to,
+                forward_invoice_id: self.forward_invoice_id,
+                split_rules: self.split_rules,
+                auto_resolve_rules: self.auto_resolve_rules,
+                creator_cosigner: self.creator_cosigner,
+                velocity_limit: self.velocity_limit,
+                velocity_window: self.velocity_window,
+            },
+            InvoiceExt2 {
+                notification_contract: self.notification_contract,
+                overflow_behavior: self.overflow_behavior,
+                cross_chain_ref: self.cross_chain_ref,
+                require_kyc: self.require_kyc,
+                auction_on_expiry: self.auction_on_expiry,
+                auction_end: self.auction_end,
+                bids: self.bids,
+                min_payment: self.min_payment,
+            },
+        )
+    }
+
+    pub fn assemble(core: InvoiceCore, ext: InvoiceExt, ext2: InvoiceExt2) -> Self {
+        Invoice {
+            version: core.version,
+            creator: core.creator,
+            co_creators: core.co_creators,
+            recipients: core.recipients,
+            amounts: core.amounts,
+            tokens: core.tokens,
+            deadline: core.deadline,
+            funded: core.funded,
+            status: core.status,
+            payments: core.payments,
+            drip_duration: core.drip_duration,
+            release_timestamp: core.release_timestamp,
+            claimed: core.claimed,
+            frozen: core.frozen,
+            completion_time: core.completion_time,
+            allow_early_withdrawal: core.allow_early_withdrawal,
+            bonus_pool: core.bonus_pool,
+            bonus_max_payers: core.bonus_max_payers,
+            prerequisite_id: core.prerequisite_id,
+            tranches: core.tranches,
+            released_bps: core.released_bps,
+            co_signers: ext.co_signers,
+            required_signatures: ext.required_signatures,
+            signatures: ext.signatures,
+            approver: ext.approver,
+            approved: ext.approved,
+            oracle_address: ext.oracle_address,
+            condition_met: ext.condition_met,
+            penalty_bps: ext.penalty_bps,
+            penalty_deadline: ext.penalty_deadline,
+            min_funding_bps: ext.min_funding_bps,
+            release_stages: ext.release_stages,
+            released_stages: ext.released_stages,
+            allowed_payers: ext.allowed_payers,
+            price_oracle: ext.price_oracle,
+            base_amounts: ext.base_amounts,
+            swap_tokens: ext.swap_tokens,
+            tax_bps: ext.tax_bps,
+            tax_authority: ext.tax_authority,
+            insurance_premium_bps: ext.insurance_premium_bps,
+            insurance_fund: ext.insurance_fund,
+            smart_route: ext.smart_route,
+            convert_to_stream: ext.convert_to_stream,
+            accepted_tokens: ext.accepted_tokens,
+            forward_to: ext.forward_to,
+            forward_invoice_id: ext.forward_invoice_id,
+            split_rules: ext.split_rules,
+            auto_resolve_rules: ext.auto_resolve_rules,
+            creator_cosigner: ext.creator_cosigner,
+            velocity_limit: ext.velocity_limit,
+            velocity_window: ext.velocity_window,
+            notification_contract: ext2.notification_contract,
+            overflow_behavior: ext2.overflow_behavior,
+            cross_chain_ref: ext2.cross_chain_ref,
+            require_kyc: ext2.require_kyc,
+            auction_on_expiry: ext2.auction_on_expiry,
+            auction_end: ext2.auction_end,
+            bids: ext2.bids,
+            min_payment: ext2.min_payment,
+        }
+    }
 }
 
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
@@ -350,12 +537,6 @@ impl Invoice {
     /// Upgrade a legacy (pre-version) invoice to the current schema.
     /// New fields are filled with their default (empty / zero) values.
     pub fn from_legacy(old: LegacyInvoice, env: &Env) -> Self {
-        let num_recipients = old.recipients.len();
-        let mut vesting_cliff_claimed = Vec::new(env);
-        for _ in 0..num_recipients {
-            vesting_cliff_claimed.push_back(false);
-        }
-
         Invoice {
             version: 2,
             creator: old.creator,
@@ -413,6 +594,9 @@ impl Invoice {
             velocity_window: 0,
             forward_to: None,
             forward_invoice_id: None,
+            notification_contract: None,
+            overflow_behavior: OverflowBehavior::Reject,
+            cross_chain_ref: None,
         }
     }
 }
