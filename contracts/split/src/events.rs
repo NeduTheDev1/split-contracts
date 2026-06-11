@@ -109,3 +109,23 @@ pub fn invoice_partially_released(env: &Env, invoice_id: u64, recipients: &Vec<A
         recipients.clone(),
     );
 }
+
+/// Emitted when a payment reminder is triggered.
+/// Topics: (split, reminder, invoice_id)
+/// Data: who
+pub fn payment_reminder(env: &Env, invoice_id: u64, who: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("reminder"), invoice_id),
+        who.clone(),
+    );
+}
+
+/// Emitted when a payment is matched via memo.
+/// Topics: (split, matched, invoice_id)
+/// Data: (payer, memo)
+pub fn payment_matched(env: &Env, invoice_id: u64, memo: u64, payer: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("matched"), invoice_id),
+        (memo, payer.clone()),
+    );
+}
