@@ -1,32 +1,43 @@
+# Build output
 target/
-Cargo.lock
 *.wasm
 
-# Local environment
+# Cargo lock (library crates don't commit this)
+Cargo.lock
+
+# Environment files
 .env
 .env.local
-.env.*
-!.env.example
+.env.*.local
 
-# OS and editor files
+# OS files
 .DS_Store
 Thumbs.db
-.idea/
+
+# Editor/IDE
 .vscode/
+.idea/
 *.swp
 *.swo
+*~
 
-# Test and coverage artifacts
-coverage/
-lcov.info
-*.profraw
-*.profdata
+# Test snapshots
+**/__snapshots__/
 *.snap
-snapshots/
-test-snapshots/
-test_snapshots/
-testsnapshot/
-testsnapshots/
+**/test_snapshots/
 
-# Soroban/Stellar local artifacts
+# Stellar CLI
 .stellar/
+identity/
+
+# Logs
+*.log
+
+# Coverage reports
+lcov.info
+tarpaulin-report.html
+coverage/
+
+# Temporary files
+*.tmp
+*.bak
