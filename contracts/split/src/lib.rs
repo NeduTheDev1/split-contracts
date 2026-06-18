@@ -13,7 +13,9 @@ mod types;
 mod test;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol, Vec};
-use types::{Invoice, InvoiceStatus, Payment};
+use types::{Invoice, InvoiceCore, InvoiceExt, InvoiceOptions, InvoiceStatus, Payment};
+
+const PAYMENT_WINDOW_CAP: u32 = 50;
 
 // ---------------------------------------------------------------------------
 // Storage helpers
@@ -29,17 +31,42 @@ fn invoice_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("inv"), id)
 }
 
-fn load_invoice(env: &Env, id: u64) -> Invoice {
+fn invoice_ext_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("invext"), id)
+}
+
+fn payer_cooldown_key(id: u64, payer: Address) -> (Symbol, u64, Address) {
+    (symbol_short!("pcd"), id, payer)
+}
+
+fn payment_window_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("pwin"), id)
+}
+
+fn load_invoice(env: &Env, id: u64) -> InvoiceCore {
     env.storage()
         .persistent()
         .get(&invoice_key(id))
         .expect("invoice not found")
 }
 
-fn save_invoice(env: &Env, id: u64, invoice: &Invoice) {
+fn save_invoice(env: &Env, id: u64, invoice: &InvoiceCore) {
     env.storage()
         .persistent()
         .set(&invoice_key(id), invoice);
+}
+
+fn save_invoice_ext(env: &Env, id: u64, ext: &InvoiceExt) {
+    env.storage()
+        .persistent()
+        .set(&invoice_ext_key(id), ext);
+}
+
+fn load_invoice_ext(env: &Env, id: u64) -> InvoiceExt {
+    env.storage()
+        .persistent()
+        .get(&invoice_ext_key(id))
+        .expect("invoice extension not found")
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +97,31 @@ impl SplitContract {
         token: Address,
         deadline: u64,
     ) -> u64 {
+        Self::create_invoice_with_options(
+            env,
+            creator,
+            recipients,
+            amounts,
+            token,
+            deadline,
+            InvoiceOptions {
+                payment_cooldown_secs: None,
+                max_payments_per_window: None,
+                payment_window_secs: None,
+            },
+        )
+    }
+
+    /// Create a new invoice with optional payment rate limits.
+    pub fn create_invoice_with_options(
+        env: Env,
+        creator: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+        token: Address,
+        deadline: u64,
+        options: InvoiceOptions,
+    ) -> u64 {
         creator.require_auth();
 
         assert!(
@@ -97,7 +149,7 @@ impl SplitContract {
 
         let total: i128 = amounts.iter().sum();
 
-        let invoice = Invoice {
+        let invoice = InvoiceCore {
             creator: creator.clone(),
             recipients: recipients.clone(),
             amounts,
@@ -109,6 +161,7 @@ impl SplitContract {
         };
 
         save_invoice(&env, id, &invoice);
+        save_invoice_ext(&env, id, &InvoiceExt::from(options));
         events::invoice_created(&env, id, &creator, total);
 
         id
@@ -142,9 +195,15 @@ impl SplitContract {
         let remaining = total - invoice.funded;
         assert!(amount <= remaining, "payment exceeds remaining balance");
 
+        let now = env.ledger().timestamp();
+        let ext = load_invoice_ext(&env, invoice_id);
+        Self::enforce_payment_limits(&env, invoice_id, &payer, &ext, now);
+
         // Transfer tokens from payer to this contract.
         let token_client = token::Client::new(&env, &invoice.token);
         token_client.transfer(&payer, &env.current_contract_address(), &amount);
+
+        Self::record_payment_limits(&env, invoice_id, &payer, &ext, now);
 
         invoice.payments.push_back(Payment {
             payer: payer.clone(),
@@ -211,7 +270,12 @@ impl SplitContract {
 
     /// Retrieve an invoice by ID.
     pub fn get_invoice(env: Env, invoice_id: u64) -> Invoice {
-        load_invoice(&env, invoice_id)
+        Invoice::from(load_invoice(&env, invoice_id))
+    }
+
+    /// Retrieve extension settings for an invoice by ID.
+    pub fn get_invoice_ext(env: Env, invoice_id: u64) -> InvoiceExt {
+        load_invoice_ext(&env, invoice_id)
     }
 
     // -----------------------------------------------------------------------
@@ -219,7 +283,7 @@ impl SplitContract {
     // -----------------------------------------------------------------------
 
     /// Route funds to all recipients and mark the invoice as released.
-    fn _release(env: &Env, invoice_id: u64, invoice: &mut Invoice) {
+    fn _release(env: &Env, invoice_id: u64, invoice: &mut InvoiceCore) {
         let token_client = token::Client::new(env, &invoice.token);
 
         for (recipient, amount) in invoice.recipients.iter().zip(invoice.amounts.iter()) {
@@ -229,5 +293,90 @@ impl SplitContract {
         invoice.status = InvoiceStatus::Released;
         save_invoice(env, invoice_id, invoice);
         events::invoice_released(env, invoice_id, &invoice.recipients);
+    }
+
+    fn enforce_payment_limits(
+        env: &Env,
+        invoice_id: u64,
+        payer: &Address,
+        ext: &InvoiceExt,
+        now: u64,
+    ) {
+        if let Some(cooldown_secs) = ext.payment_cooldown_secs {
+            let last_payment: Option<u64> = env
+                .storage()
+                .persistent()
+                .get(&payer_cooldown_key(invoice_id, payer.clone()));
+
+            if let Some(last_payment_at) = last_payment {
+                assert!(
+                    last_payment_at.saturating_add(cooldown_secs) <= now,
+                    "payment cooldown active"
+                );
+            }
+        }
+
+        if let (Some(max_payments), Some(window_secs)) =
+            (ext.max_payments_per_window, ext.payment_window_secs)
+        {
+            let recent = Self::active_payment_window(env, invoice_id, now, window_secs);
+            assert!(
+                recent.len() < max_payments,
+                "payment rate limit exceeded"
+            );
+        }
+    }
+
+    fn record_payment_limits(
+        env: &Env,
+        invoice_id: u64,
+        payer: &Address,
+        ext: &InvoiceExt,
+        now: u64,
+    ) {
+        if ext.payment_cooldown_secs.is_some() {
+            env.storage()
+                .persistent()
+                .set(&payer_cooldown_key(invoice_id, payer.clone()), &now);
+        }
+
+        if let (Some(_), Some(window_secs)) =
+            (ext.max_payments_per_window, ext.payment_window_secs)
+        {
+            let mut recent = Self::active_payment_window(env, invoice_id, now, window_secs);
+            while recent.len() >= PAYMENT_WINDOW_CAP {
+                recent.pop_front();
+            }
+            recent.push_back(now);
+            env.storage()
+                .persistent()
+                .set(&payment_window_key(invoice_id), &recent);
+        }
+    }
+
+    fn active_payment_window(
+        env: &Env,
+        invoice_id: u64,
+        now: u64,
+        window_secs: u64,
+    ) -> Vec<u64> {
+        let stored: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&payment_window_key(invoice_id))
+            .unwrap_or(Vec::new(env));
+        let mut active = Vec::new(env);
+
+        for paid_at in stored.iter() {
+            if paid_at.saturating_add(window_secs) > now {
+                active.push_back(paid_at);
+            }
+        }
+
+        while active.len() > PAYMENT_WINDOW_CAP {
+            active.pop_front();
+        }
+
+        active
     }
 }

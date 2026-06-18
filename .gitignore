@@ -1,7 +1,32 @@
 target/
 Cargo.lock
 *.wasm
+
+# Local environment
 .env
 .env.local
+.env.*
+!.env.example
+
+# OS and editor files
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test and coverage artifacts
+coverage/
+lcov.info
+*.profraw
+*.profdata
+*.snap
+snapshots/
+test-snapshots/
+test_snapshots/
+testsnapshot/
+testsnapshots/
+
+# Soroban/Stellar local artifacts
+.stellar/
