@@ -205,6 +205,12 @@ pub struct InvoiceOptions {
     pub allowed_payers: Option<Vec<Address>>,
     /// Absolute minimum funded amount required before auto-release triggers.
     pub min_funding_amount: Option<i128>,
+    /// Per-payer cooldown window in seconds (issue #168).
+    pub payment_cooldown_secs: Option<u64>,
+    /// Maximum payments allowed per window (issue #168).
+    pub max_payments_per_window: Option<u32>,
+    /// Window duration in seconds for payment rate limiting (issue #168).
+    pub payment_window_secs: Option<u64>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -301,6 +307,11 @@ pub struct InvoiceExt {
     pub creator_cosigner: Option<Address>,
     pub velocity_limit: i128,
     pub velocity_window: u64,
+    pub pause_reason: Option<String>,
+    pub auto_resume_at: Option<u64>,
+    pub payment_cooldown_secs: Option<u64>,
+    pub max_payments_per_window: Option<u32>,
+    pub payment_window_secs: Option<u64>,
 }
 
 #[contracttype]
@@ -372,6 +383,11 @@ pub struct Invoice {
     pub creator_cosigner: Option<Address>,
     pub velocity_limit: i128,
     pub velocity_window: u64,
+    pub pause_reason: Option<String>,
+    pub auto_resume_at: Option<u64>,
+    pub payment_cooldown_secs: Option<u64>,
+    pub max_payments_per_window: Option<u32>,
+    pub payment_window_secs: Option<u64>,
     pub notification_contract: Option<Address>,
     pub overflow_behavior: OverflowBehavior,
     pub cross_chain_ref: Option<String>,
@@ -440,6 +456,11 @@ impl Invoice {
                 creator_cosigner: self.creator_cosigner,
                 velocity_limit: self.velocity_limit,
                 velocity_window: self.velocity_window,
+                pause_reason: self.pause_reason,
+                auto_resume_at: self.auto_resume_at,
+                payment_cooldown_secs: self.payment_cooldown_secs,
+                max_payments_per_window: self.max_payments_per_window,
+                payment_window_secs: self.payment_window_secs,
             },
             InvoiceExt2 {
                 notification_contract: self.notification_contract,
@@ -508,6 +529,11 @@ impl Invoice {
             creator_cosigner: ext.creator_cosigner,
             velocity_limit: ext.velocity_limit,
             velocity_window: ext.velocity_window,
+            pause_reason: ext.pause_reason,
+            auto_resume_at: ext.auto_resume_at,
+            payment_cooldown_secs: ext.payment_cooldown_secs,
+            max_payments_per_window: ext.max_payments_per_window,
+            payment_window_secs: ext.payment_window_secs,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
@@ -598,6 +624,11 @@ impl Invoice {
             creator_cosigner: None,
             velocity_limit: 0,
             velocity_window: 0,
+            pause_reason: None,
+            auto_resume_at: None,
+            payment_cooldown_secs: None,
+            max_payments_per_window: None,
+            payment_window_secs: None,
             forward_to: None,
             forward_invoice_id: None,
             notification_contract: None,
@@ -608,27 +639,3 @@ impl Invoice {
     }
 }
 
-impl From<InvoiceOptions> for InvoiceExt {
-    fn from(options: InvoiceOptions) -> Self {
-        Self {
-            payment_cooldown_secs: options.payment_cooldown_secs,
-            max_payments_per_window: options.max_payments_per_window,
-            payment_window_secs: options.payment_window_secs,
-        }
-    }
-}
-
-impl From<InvoiceCore> for Invoice {
-    fn from(core: InvoiceCore) -> Self {
-        Self {
-            creator: core.creator,
-            recipients: core.recipients,
-            amounts: core.amounts,
-            token: core.token,
-            deadline: core.deadline,
-            funded: core.funded,
-            status: core.status,
-            payments: core.payments,
-        }
-    }
-}
