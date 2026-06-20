@@ -214,6 +214,12 @@ pub struct InvoiceOptions {
     pub allowed_payers: Option<Vec<Address>>,
     /// Absolute minimum funded amount required before auto-release triggers.
     pub min_funding_amount: Option<i128>,
+    /// Per-payer cooldown window in seconds (issue #168).
+    pub payment_cooldown_secs: Option<u64>,
+    /// Maximum payments allowed per window (issue #168).
+    pub max_payments_per_window: Option<u32>,
+    /// Window duration in seconds for payment rate limiting (issue #168).
+    pub payment_window_secs: Option<u64>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -383,6 +389,11 @@ pub struct Invoice {
     pub creator_cosigner: Option<Address>,
     pub velocity_limit: i128,
     pub velocity_window: u64,
+    pub pause_reason: Option<String>,
+    pub auto_resume_at: Option<u64>,
+    pub payment_cooldown_secs: Option<u64>,
+    pub max_payments_per_window: Option<u32>,
+    pub payment_window_secs: Option<u64>,
     pub notification_contract: Option<Address>,
     pub overflow_behavior: OverflowBehavior,
     pub cross_chain_ref: Option<String>,
@@ -615,6 +626,11 @@ impl Invoice {
             creator_cosigner: None,
             velocity_limit: 0,
             velocity_window: 0,
+            pause_reason: None,
+            auto_resume_at: None,
+            payment_cooldown_secs: None,
+            max_payments_per_window: None,
+            payment_window_secs: None,
             forward_to: None,
             forward_invoice_id: None,
             notification_contract: None,

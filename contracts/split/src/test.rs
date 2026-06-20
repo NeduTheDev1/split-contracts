@@ -70,7 +70,72 @@ fn default_options(env: &Env) -> InvoiceOptions {
         cross_chain_ref: None,
         allowed_payers: None,
         min_funding_amount: None,
+        payment_cooldown_secs: None,
+        max_payments_per_window: None,
+        payment_window_secs: None,
     }
+}
+
+fn invoice_options(
+    env: &Env,
+    cooldown_secs: Option<u64>,
+    max_payments: Option<u32>,
+    window_secs: Option<u64>,
+) -> InvoiceOptions {
+    InvoiceOptions {
+        co_creators: Vec::new(env),
+        allow_early_withdrawal: false,
+        bonus_pool: 0,
+        bonus_max_payers: 0,
+        creator_cosigner: None,
+        velocity_limit: 0,
+        velocity_window: 0,
+        prerequisite_id: None,
+        tranches: Vec::new(env),
+        co_signers: Vec::new(env),
+        required_signatures: 0,
+        penalty_bps: None,
+        penalty_deadline: None,
+        min_funding_bps: None,
+        release_stages: Vec::new(env),
+        price_oracle: None,
+        swap_tokens: Vec::new(env),
+        tax_bps: None,
+        tax_authority: None,
+        insurance_premium_bps: None,
+        smart_route: None,
+        notification_contract: None,
+        overflow_behavior: types::OverflowBehavior::Reject,
+        convert_to_stream: false,
+        accepted_tokens: Vec::new(env),
+        forward_to: None,
+        forward_invoice_id: None,
+        split_rules: Vec::new(env),
+        auto_resolve_rules: Vec::new(env),
+        oracle_address: None,
+        cross_chain_ref: None,
+        allowed_payers: None,
+        min_funding_amount: None,
+        payment_cooldown_secs: cooldown_secs,
+        max_payments_per_window: max_payments,
+        payment_window_secs: window_secs,
+    }
+}
+
+fn single_recipient_invoice(
+    env: &Env,
+    c: &SplitContractClient,
+    token_id: &Address,
+    amount: i128,
+    options: InvoiceOptions,
+) -> u64 {
+    let creator = Address::generate(env);
+    let recipient = Address::generate(env);
+    let mut recipients = Vec::new(env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(env);
+    amounts.push_back(amount);
+    c.create_invoice(&creator, &recipients, &amounts, token_id, &9_999_u64, &options)
 }
 
 /// Create a basic single-recipient invoice with default optional params.
@@ -4196,12 +4261,12 @@ fn test_cooldown_blocks_same_payer_within_window() {
         &c,
         &token_id,
         500,
-        invoice_options(Some(60), None, None),
+        invoice_options(&env, Some(60), None, None),
     );
 
-    c.pay(&payer, &id, &100_i128);
-    c.pay(&other_payer, &id, &100_i128);
-    c.pay(&payer, &id, &100_i128);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false);
+    c.pay(&other_payer, &id, &100_i128, &0_u64, &false);
+    c.pay(&payer, &id, &100_i128, &1_u64, &false);
 }
 
 #[test]
@@ -4217,13 +4282,13 @@ fn test_rate_limit_blocks_after_n_payments() {
         &c,
         &token_id,
         500,
-        invoice_options(None, Some(2), Some(60)),
+        invoice_options(&env, None, Some(2), Some(60)),
     );
 
     for _ in 0..3 {
         let payer = Address::generate(&env);
         stellar_asset.mint(&payer, &100);
-        c.pay(&payer, &id, &100_i128);
+        c.pay(&payer, &id, &100_i128, &0_u64, &false);
     }
 }
 
@@ -4239,19 +4304,19 @@ fn test_rate_limit_window_resets() {
         &c,
         &token_id,
         500,
-        invoice_options(None, Some(2), Some(60)),
+        invoice_options(&env, None, Some(2), Some(60)),
     );
 
     for _ in 0..2 {
         let payer = Address::generate(&env);
         stellar_asset.mint(&payer, &100);
-        c.pay(&payer, &id, &100_i128);
+        c.pay(&payer, &id, &100_i128, &0_u64, &false);
     }
 
     env.ledger().set_timestamp(1_061);
     let payer = Address::generate(&env);
     stellar_asset.mint(&payer, &100);
-    c.pay(&payer, &id, &100_i128);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false);
 }
 
 #[test]
@@ -4272,7 +4337,7 @@ fn test_cooldown_and_rate_limit_independent() {
         &c,
         &token_id,
         500,
-        invoice_options(Some(120), Some(1), Some(60)),
+        invoice_options(&env, Some(120), Some(1), Some(60)),
     );
 
     let ext = c.get_invoice_ext(&id);
@@ -4280,8 +4345,148 @@ fn test_cooldown_and_rate_limit_independent() {
     assert_eq!(ext.max_payments_per_window, Some(1));
     assert_eq!(ext.payment_window_secs, Some(60));
 
-    c.pay(&payer, &id, &100_i128);
-    c.pay(&other_payer, &id, &100_i128);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false);
+    c.pay(&other_payer, &id, &100_i128, &0_u64, &false);
+}
+
+// ---------------------------------------------------------------------------
+// Pause mechanism tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "invoice is frozen")]
+fn test_pause_blocks_payment_with_reason() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let reason = soroban_sdk::String::from_str(&env, "legal review pending");
+    c.pause_invoice(&creator, &id, &reason, &None);
+
+    let ext = c.get_invoice_ext(&id);
+    assert_eq!(ext.pause_reason, Some(reason));
+    assert_eq!(ext.auto_resume_at, None);
+    assert!(c.get_invoice(&id).frozen);
+
+    // This should panic with "invoice is frozen"
+    c.pay(&payer, &id, &100_i128, &0_u64, &false);
+}
+
+#[test]
+fn test_auto_resume_allows_payment_after_timestamp() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let reason = soroban_sdk::String::from_str(&env, "scheduled maintenance");
+    c.pause_invoice(&creator, &id, &reason, &Some(2_000_u64));
+
+    assert!(c.get_invoice(&id).frozen);
+
+    // Advance ledger past auto-resume timestamp.
+    env.ledger().set_timestamp(2_000);
+
+    // Payment should succeed because lazy auto-resume fires.
+    c.pay(&payer, &id, &200_i128, &0_u64, &false);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 200);
+}
+
+#[test]
+fn test_admin_force_resume_overrides_creator_pause() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Initialize with a custom admin so admin_force_resume can authenticate.
+    c.initialize(
+        &admin,
+        &0_i128,
+        &Address::generate(&env),
+        &token_id,
+        &0_u32,
+        &None,
+        &0_u32,
+        &0_u32,
+        &0_u64,
+    );
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let reason = soroban_sdk::String::from_str(&env, "compliance hold");
+    c.pause_invoice(&creator, &id, &reason, &None);
+
+    assert!(c.get_invoice(&id).frozen);
+
+    // Admin force-resumes.
+    c.admin_force_resume(&admin, &id);
+
+    let invoice = c.get_invoice(&id);
+    assert!(!invoice.frozen);
+
+    let ext = c.get_invoice_ext(&id);
+    assert_eq!(ext.pause_reason, None);
+    assert_eq!(ext.auto_resume_at, None);
+
+    // Payment now succeeds.
+    c.pay(&payer, &id, &200_i128, &0_u64, &false);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_resume_clears_stored_reason() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let reason = soroban_sdk::String::from_str(&env, "temporary hold");
+    c.pause_invoice(&creator, &id, &reason, &Some(5_000_u64));
+
+    // Verify stored on chain.
+    let ext = c.get_invoice_ext(&id);
+    assert_eq!(ext.pause_reason, Some(reason));
+    assert_eq!(ext.auto_resume_at, Some(5_000_u64));
+
+    // Creator manually resumes.
+    c.resume_invoice(&creator, &id);
+
+    // Reason and auto_resume_at must be cleared.
+    let ext = c.get_invoice_ext(&id);
+    assert_eq!(ext.pause_reason, None);
+    assert_eq!(ext.auto_resume_at, None);
+    assert!(!c.get_invoice(&id).frozen);
 }
 
 // ---------------------------------------------------------------------------

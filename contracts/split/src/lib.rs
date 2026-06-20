@@ -243,6 +243,18 @@ fn creator_stats_refunded_key(creator: &Address) -> (Symbol, Address) {
     (symbol_short!("cr_ref"), creator.clone())
 }
 
+/// Per-payer last-payment timestamp key for cooldown enforcement (issue #168).
+fn payer_cooldown_key(invoice_id: u64, payer: Address) -> (Symbol, u64, Address) {
+    (symbol_short!("pyr_cd"), invoice_id, payer)
+}
+
+/// Sliding-window payment timestamp list key for rate limiting (issue #168).
+fn payment_window_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("pay_win"), invoice_id)
+}
+
+const PAYMENT_WINDOW_CAP: u32 = 100;
+
 // ---------------------------------------------------------------------------
 // Invoice storage helpers
 // ---------------------------------------------------------------------------
@@ -712,6 +724,9 @@ impl SplitContract {
             options.cross_chain_ref,
             options.allowed_payers,
             options.min_funding_amount.unwrap_or(0),
+            options.payment_cooldown_secs,
+            options.max_payments_per_window,
+            options.payment_window_secs,
         )
     }
 
@@ -756,6 +771,9 @@ impl SplitContract {
         cross_chain_ref: Option<String>,
         allowed_payers: Option<Vec<Address>>,
         min_funding_amount: i128,
+        payment_cooldown_secs: Option<u64>,
+        max_payments_per_window: Option<u32>,
+        payment_window_secs: Option<u64>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -973,6 +991,11 @@ impl SplitContract {
             creator_cosigner,
             velocity_limit,
             velocity_window,
+            pause_reason: None,
+            auto_resume_at: None,
+            payment_cooldown_secs,
+            max_payments_per_window,
+            payment_window_secs,
             cross_chain_ref,
             require_kyc: false,
             auction_on_expiry: false,
@@ -1107,6 +1130,9 @@ impl SplitContract {
                 None,
                 None,
                 0,
+                None,
+                None,
+                None,
             );
             ids.push_back(id);
         }
@@ -1175,6 +1201,9 @@ impl SplitContract {
             None,
             None,
             0,
+            None,
+            None,
+            None,
         );
 
         if months > 1 {
@@ -1490,6 +1519,19 @@ impl SplitContract {
         );
         assert!(amount > 0, "payment amount must be positive");
 
+        // Lazy auto-resume: clear frozen if the auto-resume timestamp has passed.
+        if invoice.frozen {
+            if let Some(auto_at) = invoice.auto_resume_at {
+                if env.ledger().timestamp() >= auto_at {
+                    invoice.frozen = false;
+                    invoice.pause_reason = None;
+                    invoice.auto_resume_at = None;
+                    save_invoice(env, invoice_id, &invoice);
+                }
+            }
+        }
+        assert!(!invoice.frozen, "invoice is frozen");
+
         // Check allowed_payers allowlist.
         if let Some(ref whitelist) = invoice.allowed_payers {
             assert!(whitelist.contains(payer), "payer not allowed");
@@ -1543,6 +1585,10 @@ impl SplitContract {
         } else {
             amount
         };
+
+        // Payment rate limiting: cooldown and per-window cap (issue #168).
+        let now_ts = env.ledger().timestamp();
+        Self::enforce_payment_limits(env, invoice_id, payer, &invoice, now_ts);
 
         // Validate and increment per-payer per-invoice nonce (issue #21).
         let stored_nonce: u64 = env
@@ -1667,6 +1713,9 @@ impl SplitContract {
         append_audit_entry(env, invoice_id, symbol_short!("pay"), payer);
         events::payment_received(env, invoice_id, payer, credited_amount);
         notify_invoice(env, invoice_id, symbol_short!("pay"), &invoice.notification_contract);
+
+        // Record rate-limiter timestamps after successful payment (issue #168).
+        Self::record_payment_limits(env, invoice_id, payer, &invoice, now_ts);
 
         // Issue: mint a receipt token to the payer via the receipt factory if configured.
         if let Some(factory) = env
@@ -2092,6 +2141,89 @@ impl SplitContract {
         invoice.approved = true;
         save_invoice(&env, invoice_id, &invoice);
         append_audit_entry(&env, invoice_id, symbol_short!("aprv"), approver);
+    }
+
+    // -----------------------------------------------------------------------
+    // Invoice pause / resume (creator-controlled)
+    // -----------------------------------------------------------------------
+
+    /// Freeze an invoice with an on-chain reason string and an optional auto-resume timestamp.
+    ///
+    /// Only the creator (or a co-creator) may call this. Sets `frozen = true`,
+    /// stores `pause_reason` and `auto_resume_at`, and emits a paused event.
+    pub fn pause_invoice(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        reason: String,
+        auto_resume_at: Option<u64>,
+    ) {
+        require_not_paused(&env);
+        creator.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(
+            invoice.creator == creator
+                || invoice.co_creators.iter().any(|c| c == creator),
+            "only creator can pause invoice"
+        );
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+        assert!(!invoice.frozen, "invoice is already frozen");
+
+        invoice.frozen = true;
+        invoice.pause_reason = Some(reason.clone());
+        invoice.auto_resume_at = auto_resume_at;
+        save_invoice(&env, invoice_id, &invoice);
+
+        append_audit_entry(&env, invoice_id, symbol_short!("paused"), &creator);
+        events::invoice_paused(&env, invoice_id, &creator, &reason, &auto_resume_at);
+    }
+
+    /// Unfreeze a paused invoice. Clears the stored reason and auto-resume time.
+    ///
+    /// Only the creator (or a co-creator) may call this.
+    pub fn resume_invoice(env: Env, creator: Address, invoice_id: u64) {
+        require_not_paused(&env);
+        creator.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(
+            invoice.creator == creator
+                || invoice.co_creators.iter().any(|c| c == creator),
+            "only creator can resume invoice"
+        );
+        assert!(invoice.frozen, "invoice is not frozen");
+
+        invoice.frozen = false;
+        invoice.pause_reason = None;
+        invoice.auto_resume_at = None;
+        save_invoice(&env, invoice_id, &invoice);
+
+        append_audit_entry(&env, invoice_id, symbol_short!("resumed"), &creator);
+        events::invoice_resumed(&env, invoice_id, &creator);
+    }
+
+    /// Admin override: force-resume any paused invoice regardless of who paused it.
+    ///
+    /// Requires admin auth. Clears the frozen flag, reason, and auto-resume time,
+    /// and emits a force_resumed event with the admin address.
+    pub fn admin_force_resume(env: Env, admin: Address, invoice_id: u64) {
+        let admin_addr = require_admin(&env);
+        let _ = admin;
+
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(invoice.frozen, "invoice is not frozen");
+
+        invoice.frozen = false;
+        invoice.pause_reason = None;
+        invoice.auto_resume_at = None;
+        save_invoice(&env, invoice_id, &invoice);
+
+        append_audit_entry(&env, invoice_id, symbol_short!("frc_rsm"), &admin_addr);
+        events::invoice_force_resumed(&env, invoice_id, &admin_addr);
     }
 
     /// Oracle confirms a condition for a gated invoice.
@@ -2904,6 +3036,9 @@ impl SplitContract {
                 None,
                 None,
                 0,
+                None,
+                None,
+                None,
             );
             env.storage()
                 .persistent()
@@ -3433,6 +3568,9 @@ impl SplitContract {
             old_invoice.cross_chain_ref.clone(),
             None,
             old_invoice.min_funding_amount,
+            old_invoice.payment_cooldown_secs,
+            old_invoice.max_payments_per_window,
+            old_invoice.payment_window_secs,
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -3646,6 +3784,9 @@ impl SplitContract {
             None,
             None,
             0,
+            None,
+            None,
+            None,
         )
     }
 
@@ -4067,7 +4208,8 @@ impl SplitContract {
                 smart_route: false, convert_to_stream: false, accepted_tokens: Vec::new(&env),
                 forward_to: None, forward_invoice_id: None, split_rules: Vec::new(&env),
                 auto_resolve_rules: Vec::new(&env), creator_cosigner: None, velocity_limit: 0,
-                velocity_window: 0,
+                velocity_window: 0, pause_reason: None, auto_resume_at: None,
+                payment_cooldown_secs: None, max_payments_per_window: None, payment_window_secs: None,
             });
         let ext2: InvoiceExt2 = env.storage().persistent()
             .get(&invoice_ext2_key(invoice_id))
@@ -4206,10 +4348,10 @@ impl SplitContract {
         env: &Env,
         invoice_id: u64,
         payer: &Address,
-        ext: &InvoiceExt,
+        invoice: &Invoice,
         now: u64,
     ) {
-        if let Some(cooldown_secs) = ext.payment_cooldown_secs {
+        if let Some(cooldown_secs) = invoice.payment_cooldown_secs {
             let last_payment: Option<u64> = env
                 .storage()
                 .persistent()
@@ -4224,7 +4366,7 @@ impl SplitContract {
         }
 
         if let (Some(max_payments), Some(window_secs)) =
-            (ext.max_payments_per_window, ext.payment_window_secs)
+            (invoice.max_payments_per_window, invoice.payment_window_secs)
         {
             let recent = Self::active_payment_window(env, invoice_id, now, window_secs);
             assert!(
@@ -4238,17 +4380,17 @@ impl SplitContract {
         env: &Env,
         invoice_id: u64,
         payer: &Address,
-        ext: &InvoiceExt,
+        invoice: &Invoice,
         now: u64,
     ) {
-        if ext.payment_cooldown_secs.is_some() {
+        if invoice.payment_cooldown_secs.is_some() {
             env.storage()
                 .persistent()
                 .set(&payer_cooldown_key(invoice_id, payer.clone()), &now);
         }
 
         if let (Some(_), Some(window_secs)) =
-            (ext.max_payments_per_window, ext.payment_window_secs)
+            (invoice.max_payments_per_window, invoice.payment_window_secs)
         {
             let mut recent = Self::active_payment_window(env, invoice_id, now, window_secs);
             while recent.len() >= PAYMENT_WINDOW_CAP {
