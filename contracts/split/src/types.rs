@@ -576,6 +576,21 @@ impl Invoice {
     }
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PaymentCertificate {
+    /// The invoice this certificate covers.
+    pub invoice_id: u64,
+    /// Total amount paid out to all recipients.
+    pub total: i128,
+    /// All recipient addresses that received funds.
+    pub recipients: Vec<Address>,
+    /// Ledger timestamp at which the invoice was released.
+    pub release_timestamp: u64,
+    /// SHA-256 hash over (invoice_id || total || release_timestamp), deterministic for the same data.
+    pub cert_hash: BytesN<32>,
+}
+
 /// Issue #144: Payment analytics for an invoice, callable by external contracts.
 #[contracttype]
 #[derive(Clone, Debug)]

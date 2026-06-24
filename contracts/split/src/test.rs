@@ -4935,3 +4935,226 @@ fn test_partial_release_priority_order() {
     // funded should be decremented by the full release_amount regardless of how much was transferred
     assert_eq!(c.get_invoice(&id).funded, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #173: Payment certificate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_issue_certificate_fields_match_invoice() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Create and fully fund a 200-token invoice.
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0_u64, &false);
+
+    // Invoice must be Released before a certificate can be issued.
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+
+    let cert = c.issue_certificate(&id);
+
+    // invoice_id matches.
+    assert_eq!(cert.invoice_id, id);
+
+    // total equals the invoice amount.
+    assert_eq!(cert.total, 200_i128);
+
+    // recipients list contains the single recipient.
+    assert_eq!(cert.recipients.len(), 1);
+    assert_eq!(cert.recipients.get_unchecked(0), recipient);
+
+    // release_timestamp is non-zero (set during release).
+    assert!(cert.release_timestamp > 0);
+
+    // cert_hash is a non-zero 32-byte value.
+    let zero_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    assert_ne!(cert.cert_hash, zero_hash);
+}
+
+#[test]
+fn test_get_certificate_returns_stored_cert() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false);
+
+    let issued = c.issue_certificate(&id);
+    let retrieved = c.get_certificate(&id);
+
+    // Both calls must return identical data.
+    assert_eq!(issued.invoice_id, retrieved.invoice_id);
+    assert_eq!(issued.total, retrieved.total);
+    assert_eq!(issued.release_timestamp, retrieved.release_timestamp);
+    assert_eq!(issued.cert_hash, retrieved.cert_hash);
+    assert_eq!(issued.recipients.len(), retrieved.recipients.len());
+}
+
+#[test]
+fn test_issue_certificate_is_idempotent() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &150);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 150, &token_id, 9_999);
+    c.pay(&payer, &id, &150_i128, &0_u64, &false);
+
+    let first = c.issue_certificate(&id);
+    let second = c.issue_certificate(&id);
+
+    // Both invocations must produce the same hash (idempotent).
+    assert_eq!(first.cert_hash, second.cert_hash);
+    assert_eq!(first.total, second.total);
+    assert_eq!(first.release_timestamp, second.release_timestamp);
+}
+
+#[test]
+fn test_cert_hash_is_deterministic() {
+    // Two separate invoices with identical amounts and release times must
+    // produce different hashes (invoice_id is part of the preimage).
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &400);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &r1, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &r2, 100, &token_id, 9_999);
+
+    c.pay(&payer, &id1, &100_i128, &0_u64, &false);
+    c.pay(&payer, &id2, &100_i128, &0_u64, &false);
+
+    let cert1 = c.issue_certificate(&id1);
+    let cert2 = c.issue_certificate(&id2);
+
+    // Different invoice_ids → different hashes.
+    assert_ne!(cert1.cert_hash, cert2.cert_hash);
+
+    // Calling again yields the same hash (determinism check).
+    let cert1_again = c.issue_certificate(&id1);
+    assert_eq!(cert1.cert_hash, cert1_again.cert_hash);
+}
+
+#[test]
+fn test_certificate_multi_recipient() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &600);
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    recipients.push_back(r3.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    amounts.push_back(200_i128);
+    amounts.push_back(300_i128);
+
+    let id = c.create_invoice(
+        &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
+    );
+    c.pay(&payer, &id, &600_i128, &0_u64, &false);
+
+    let cert = c.issue_certificate(&id);
+
+    assert_eq!(cert.total, 600_i128);
+    assert_eq!(cert.recipients.len(), 3);
+    assert_eq!(cert.recipients.get_unchecked(0), r1);
+    assert_eq!(cert.recipients.get_unchecked(1), r2);
+    assert_eq!(cert.recipients.get_unchecked(2), r3);
+}
+
+#[test]
+#[should_panic(expected = "invoice is not released")]
+fn test_issue_certificate_on_pending_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    // Invoice is still Pending — must panic.
+    c.issue_certificate(&id);
+}
+
+#[test]
+#[should_panic(expected = "invoice is not released")]
+fn test_issue_certificate_on_refunded_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &50);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    c.pay(&payer, &id, &50_i128, &0_u64, &false);
+
+    // Move past deadline and refund.
+    env.ledger().set_timestamp(3_000);
+    c.refund(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+
+    // Must panic on a Refunded invoice.
+    c.issue_certificate(&id);
+}
+
+#[test]
+#[should_panic(expected = "certificate not found")]
+fn test_get_certificate_before_issue_panics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false);
+
+    // Released but issue_certificate() never called — must panic.
+    c.get_certificate(&id);
+}
