@@ -246,6 +246,11 @@ fn creator_stats_refunded_key(creator: &Address) -> (Symbol, Address) {
     (symbol_short!("cr_ref"), creator.clone())
 }
 
+/// Dashboard contract address key.
+fn dashboard_contract_key() -> Symbol {
+    symbol_short!("dash_ctr")
+}
+
 /// Per-payer last-payment timestamp key for cooldown enforcement (issue #168).
 fn payer_cooldown_key(invoice_id: u64, payer: Address) -> (Symbol, u64, Address) {
     (symbol_short!("pyr_cd"), invoice_id, payer)
@@ -443,6 +448,52 @@ fn load_treasury_record(env: &Env, group_id: u64) -> TreasuryRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard notification helpers
+// ---------------------------------------------------------------------------
+
+fn maybe_record_created(env: &Env, creator: &Address, total: i128) {
+    if let Some(dashboard) = env
+        .storage()
+        .persistent()
+        .get::<Symbol, Address>(&dashboard_contract_key())
+    {
+        let _: Val = env.invoke_contract(
+            &dashboard,
+            &Symbol::new(env, "record_created"),
+            (creator.clone(), total).into_val(env),
+        );
+    }
+}
+
+fn maybe_record_released(env: &Env, creator: &Address, total: i128) {
+    if let Some(dashboard) = env
+        .storage()
+        .persistent()
+        .get::<Symbol, Address>(&dashboard_contract_key())
+    {
+        let _: Val = env.invoke_contract(
+            &dashboard,
+            &Symbol::new(env, "record_released"),
+            (creator.clone(), total).into_val(env),
+        );
+    }
+}
+
+fn maybe_record_refunded(env: &Env, creator: &Address) {
+    if let Some(dashboard) = env
+        .storage()
+        .persistent()
+        .get::<Symbol, Address>(&dashboard_contract_key())
+    {
+        let _: Val = env.invoke_contract(
+            &dashboard,
+            &Symbol::new(env, "record_refunded"),
+            (creator.clone(),).into_val(env),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
 
@@ -550,6 +601,21 @@ impl SplitContract {
         env.storage()
             .persistent()
             .get(&receipt_token_key(invoice_id, &payer))
+    }
+
+    /// Set the dashboard contract address for aggregating creator stats.
+    /// Requires admin auth.
+    pub fn set_dashboard_contract(env: Env, admin: Address, dashboard: Address) {
+        require_admin(&env);
+        let _ = admin;
+        env.storage().persistent().set(&dashboard_contract_key(), &dashboard);
+    }
+
+    /// Return the dashboard contract address, or None if not set.
+    pub fn get_dashboard_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&dashboard_contract_key())
     }
 
     // -----------------------------------------------------------------------
@@ -1024,6 +1090,7 @@ impl SplitContract {
 
         save_invoice(env, id, &invoice);
         events::invoice_created(env, id, &creator, total, &invoice.cross_chain_ref);
+        maybe_record_created(env, &creator, total);
 
         // Index each recipient -> invoice ID (issue #40).
         for recipient in invoice.recipients.iter() {
@@ -2508,6 +2575,7 @@ impl SplitContract {
             append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
             events::invoice_released(env, invoice_id, &invoice.recipients);
             notify_invoice(env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
+            maybe_record_released(env, &invoice.creator, amount_released);
         }
 
         save_invoice(env, invoice_id, invoice);
@@ -3022,6 +3090,7 @@ impl SplitContract {
         append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
         events::invoice_released(env, invoice_id, &invoice.recipients);
         notify_invoice(env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
+        maybe_record_released(env, &invoice.creator, funded);
 
         // Increment total_volume and total_released counters (issue #28).
         let total_volume: i128 = env
@@ -3181,6 +3250,7 @@ impl SplitContract {
                         let actor = env.current_contract_address();
                         append_audit_entry(&env, invoice_id, symbol_short!("auto_ref"), &actor);
                         events::invoice_refunded(&env, invoice_id);
+                        maybe_record_refunded(&env, &invoice.creator);
                         notify_invoice(&env, invoice_id, symbol_short!("refund"), &invoice.notification_contract);
                         let total_refunded: i128 = env
                             .storage()
@@ -3263,6 +3333,7 @@ impl SplitContract {
         append_audit_entry(&env, invoice_id, symbol_short!("refund"), &actor);
         events::invoice_refunded(&env, invoice_id);
         notify_invoice(&env, invoice_id, symbol_short!("refund"), &invoice.notification_contract);
+        maybe_record_refunded(&env, &invoice.creator);
 
         // Increment total_refunded counter (issue #28).
         let total_refunded: i128 = env
@@ -3483,6 +3554,7 @@ impl SplitContract {
             }
 
             invoice.status = InvoiceStatus::Refunded;
+            maybe_record_refunded(&env, &invoice.creator);
 
             // Increment total_refunded counter (issue #28).
             let total_refunded: i128 = env
