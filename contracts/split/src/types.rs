@@ -358,6 +358,23 @@ pub struct InvoiceExt2 {
     pub priorities: Vec<u32>,
 }
 
+/// Timelocked admin action queued for future execution.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum TimelockAction {
+    SetTreasury(Address),
+    SetPlatformFee(u32),
+}
+
+/// A queued timelock action with metadata.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct QueuedAction {
+    pub action: TimelockAction,
+    pub queued_at: u64,
+    pub executed: bool,
+}
+
 /// Full invoice — assembled from InvoiceCore + InvoiceExt + InvoiceExt2.
 /// Never stored directly; use save_invoice / load_invoice helpers in lib.rs.
 #[derive(Clone, Debug)]
