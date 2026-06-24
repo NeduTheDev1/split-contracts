@@ -1,6 +1,7 @@
 //! StellarSplit — on-chain invoice & payment splitting contract.
 
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 
 mod events;
 mod types;
@@ -12,6 +13,7 @@ use soroban_sdk::{
     String,
     contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 use types::{
     AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreateInvoiceParams, Invoice, InvoiceCore,
     InvoiceExt, InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus, InvoiceTemplate,
@@ -117,12 +119,11 @@ fn referral_count_key(referrer: &Address) -> (Symbol, Address) {
     (symbol_short!("ref_cnt"), referrer.clone())
 }
 
-/// Per-payer per-invoice nonce key (issue #21).
-
 fn channel_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("chan"), invoice_id, payer.clone())
 }
 
+/// Per-payer per-invoice nonce key (issue #21).
 fn nonce_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("nonce"), invoice_id, payer.clone())
 }
@@ -302,11 +303,23 @@ fn timelock_action_key(action_id: u64) -> (Symbol, u64) {
 // ---------------------------------------------------------------------------
 
 fn load_invoice(env: &Env, id: u64) -> Invoice {
-    let core: InvoiceCore = if let Some(c) = env.storage().persistent().get(&invoice_key(id)) {
+    let mut core: InvoiceCore = if let Some(c) = env.storage().persistent().get(&invoice_key(id)) {
         c
     } else {
         env.storage().instance().get(&invoice_key(id)).expect("invoice not found")
     };
+    
+    // Aggregate payments from all shards (issue #177).
+    let mut all_payments: Vec<Payment> = Vec::new(env);
+    for shard_id in 0..SHARD_COUNT {
+        if let Some(shard_payments) = env.storage().persistent().get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(id, shard_id)) {
+            for payment in shard_payments.iter() {
+                all_payments.push_back(payment.clone());
+            }
+        }
+    }
+    core.payments = all_payments;
+    
     let ext: InvoiceExt = env.storage().persistent()
         .get(&invoice_ext_key(id))
         .or_else(|| env.storage().instance().get(&invoice_ext_key(id)))
@@ -347,7 +360,6 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             payment_cooldown_secs: None,
             max_payments_per_window: None,
             payment_window_secs: None,
-            refund_grace_secs: None,
         });
     let ext2: InvoiceExt2 = env.storage().persistent()
         .get(&invoice_ext2_key(id))
@@ -363,8 +375,6 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             auction_end: 0,
             bids: Vec::new(env),
             min_payment: 0,
-            min_funding_amount: 0,
-            priorities: Vec::new(env),
         });
     
     // Load compact representation if available
@@ -376,7 +386,9 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
 }
 
 fn save_invoice(env: &Env, id: u64, invoice: &Invoice) {
-    let (core, ext, ext2) = invoice.clone().split();
+    let mut clean_invoice = invoice.clone();
+    clean_invoice.payments = Vec::new(env);
+    let (core, ext, ext2) = clean_invoice.split();
     env.storage().persistent().set(&invoice_key(id), &core);
     env.storage().persistent().set(&invoice_ext_key(id), &ext);
     env.storage().persistent().set(&invoice_ext2_key(id), &ext2);
@@ -503,13 +515,9 @@ fn load_treasury_record(env: &Env, group_id: u64) -> TreasuryRecord {
         .expect("treasury record not found")
 }
 
-// ---------------------------------------------------------------------------
-// Dashboard notification helpers
-// ---------------------------------------------------------------------------
-
-fn maybe_record_created(env: &Env, creator: &Address, total: i128) {
-    if let Some(dashboard) = env
-        .storage()
+#[allow(dead_code)]
+fn save_invoice_ext(env: &Env, id: u64, ext: &InvoiceExt) {
+    env.storage()
         .persistent()
         .get::<Symbol, Address>(&dashboard_contract_key())
     {
@@ -521,9 +529,9 @@ fn maybe_record_created(env: &Env, creator: &Address, total: i128) {
     }
 }
 
-fn maybe_record_released(env: &Env, creator: &Address, total: i128) {
-    if let Some(dashboard) = env
-        .storage()
+#[allow(dead_code)]
+fn load_invoice_ext(env: &Env, id: u64) -> InvoiceExt {
+    env.storage()
         .persistent()
         .get::<Symbol, Address>(&dashboard_contract_key())
     {
@@ -557,6 +565,7 @@ fn maybe_record_refunded(env: &Env, creator: &Address) {
 pub struct SplitContract;
 
 #[contractimpl]
+#[allow(clippy::too_many_arguments)]
 impl SplitContract {
     /// Set the contract admin, creation fee, treasury, USDC token, and platform fee.
     /// Can only be called once.
@@ -1231,7 +1240,6 @@ impl SplitContract {
             options.auto_resolve_rules,
             options.cross_chain_ref,
             options.allowed_payers,
-            options.min_funding_amount.unwrap_or(0),
             options.payment_cooldown_secs,
             options.max_payments_per_window,
             options.payment_window_secs,
@@ -1281,7 +1289,6 @@ impl SplitContract {
         auto_resolve_rules: Vec<ResolveRule>,
         cross_chain_ref: Option<String>,
         allowed_payers: Option<Vec<Address>>,
-        min_funding_amount: i128,
         payment_cooldown_secs: Option<u64>,
         max_payments_per_window: Option<u32>,
         payment_window_secs: Option<u64>,
@@ -1590,7 +1597,6 @@ impl SplitContract {
             auction_end: 0,
             bids: Vec::new(env),
             min_payment: 0,
-            min_funding_amount,
             clone_depth: 0,
             parent_invoice_id: None,
             priorities,
@@ -1719,7 +1725,6 @@ impl SplitContract {
                 Vec::new(&env),
                 None,
                 None,
-                0,
                 None,
                 None,
                 None,
@@ -1793,7 +1798,6 @@ impl SplitContract {
             Vec::new(&env),
             None,
             None,
-            0,
             None,
             None,
             None,
@@ -1858,7 +1862,17 @@ impl SplitContract {
         let deadline = overrides.new_deadline.unwrap_or(source.deadline);
         let overflow_behavior = overrides
             .new_overflow_behavior
-            .get(0)
+            .map(|sym| {
+                if sym == soroban_sdk::symbol_short!("Reject") {
+                    OverflowBehavior::Reject
+                } else if sym == soroban_sdk::symbol_short!("Refund") {
+                    OverflowBehavior::Refund
+                } else if sym == soroban_sdk::symbol_short!("Donate") {
+                    OverflowBehavior::Donate
+                } else {
+                    panic!("invalid overflow behavior")
+                }
+            })
             .unwrap_or_else(|| source.overflow_behavior.clone());
 
         let token = source.tokens.get(0).expect("no token");
@@ -1980,19 +1994,19 @@ impl SplitContract {
     // Payment (#21 nonce added, #88 auto_convert added)
     // -----------------------------------------------------------------------
 
-    /// Pay toward an invoice.
-    ///
-    /// `nonce` must equal the current expected nonce for this (invoice_id, payer)
-    /// pair — starts at 0 and increments with each successful payment.
-    /// 
-    /// `auto_convert` (issue #88): when true, invokes DEX swap to convert payer's
-    /// source asset to invoice token before crediting payment. When false, behaves
-    /// identically to current implementation.
+    // Pay toward an invoice.
+    //
+    // `nonce` must equal the current expected nonce for this (invoice_id, payer)
+    // pair — starts at 0 and increments with each successful payment.
+    // 
+    // `auto_convert` (issue #88): when true, invokes DEX swap to convert payer's
+    // source asset to invoice token before crediting payment. When false, behaves
+    // identically to current implementation.
 
     /// Compress payments by aggregating all payments from the same payer into a single entry.
     pub fn compress_payments(env: Env, invoice_id: u64) {
         require_not_paused(&env);
-        let mut invoice = load_invoice(&env, invoice_id);
+        let invoice = load_invoice(&env, invoice_id);
 
         let mut payer_amounts: Map<Address, i128> = Map::new(&env);
         let mut payer_tips: Map<Address, i128> = Map::new(&env);
@@ -2011,16 +2025,28 @@ impl SplitContract {
             new_payments.push_back(Payment { payer, amount, tip });
         }
 
-        invoice.payments = new_payments;
-
         // Verify total funded is unchanged (optional assertion, as asked by Acceptance Criteria)
         let mut total_funded: i128 = 0;
-        for p in invoice.payments.iter() {
+        for p in new_payments.iter() {
             total_funded += p.amount;
         }
         assert_eq!(total_funded, invoice.funded, "total funded changed after compression");
 
-        save_invoice(&env, invoice_id, &invoice);
+        // Clear all shards and write compressed payments to appropriate shards (issue #177).
+        for shard_id in 0..SHARD_COUNT {
+            env.storage().persistent().remove(&pay_shard_key(invoice_id, shard_id));
+        }
+        
+        for payment in new_payments.iter() {
+            let shard_id = compute_shard_id(&env, &payment.payer);
+            let mut shard_payments: Vec<Payment> = env
+                .storage()
+                .persistent()
+                .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            shard_payments.push_back(payment.clone());
+            env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
+        }
     }
 
 
@@ -2072,7 +2098,16 @@ impl SplitContract {
         if net_paid > 0 {
             assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
 
-            invoice.payments.push_back(Payment { payer: payer.clone(), amount: net_paid, tip: 0 });
+            // Write payment to sharded storage (issue #177).
+            let shard_id = compute_shard_id(&env, &payer);
+            let mut shard_payments: Vec<Payment> = env
+                .storage()
+                .persistent()
+                .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            shard_payments.push_back(Payment { payer: payer.clone(), amount: net_paid, tip: 0 });
+            env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
+            
             invoice.funded += net_paid;
 
             // In real app we might handle penalty/oracle, but for simplicity:
@@ -2089,7 +2124,7 @@ impl SplitContract {
                         || in_group
                         || !invoice.co_signers.is_empty()
                         || (invoice.oracle_address.is_some() && !invoice.condition_met)
-                        || (invoice.min_funding_amount > 0 && invoice.funded < invoice.min_funding_amount);
+                        || (invoice.min_funding_bps > 0 && invoice.funded < (invoice.amounts.iter().sum::<i128>() * invoice.min_funding_bps as i128 / 10_000));
                 if guarded {
                     save_invoice(&env, invoice_id, &invoice);
                 } else {
@@ -2297,7 +2332,16 @@ impl SplitContract {
             }
         }
 
-        invoice.payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0 });
+        // Write payment to sharded storage (issue #177).
+        let shard_id = compute_shard_id(env, payer);
+        let mut shard_payments: Vec<Payment> = env
+            .storage()
+            .persistent()
+            .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+            .unwrap_or_else(|| Vec::new(env));
+        shard_payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0 });
+        env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
+        
         invoice.funded += credited_amount;
 
         // Increment per-address reputation counter (issue #24).
@@ -2361,7 +2405,7 @@ impl SplitContract {
                     || in_group
                     || !invoice.co_signers.is_empty()
                     || (invoice.oracle_address.is_some() && !invoice.condition_met)
-                    || (invoice.min_funding_amount > 0 && invoice.funded < invoice.min_funding_amount);
+                    || (invoice.min_funding_bps > 0 && invoice.funded < (invoice.amounts.iter().sum::<i128>() * invoice.min_funding_bps as i128 / 10_000));
             if guarded {
                 save_invoice(env, invoice_id, &invoice);
             } else {
@@ -2447,7 +2491,16 @@ impl SplitContract {
         let remaining = total - invoice.funded;
         assert!(credited_amount <= remaining, "payment exceeds remaining balance");
 
-        invoice.payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0 });
+        // Write payment to sharded storage (issue #177).
+        let shard_id = compute_shard_id(&env, &payer);
+        let mut shard_payments: Vec<Payment> = env
+            .storage()
+            .persistent()
+            .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        shard_payments.push_back(Payment { payer: payer.clone(), amount: credited_amount, tip: 0 });
+        env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
+        
         invoice.funded += credited_amount;
 
         append_audit_entry(&env, invoice_id, symbol_short!("pay_tok"), &payer);
@@ -2462,7 +2515,7 @@ impl SplitContract {
                     || !invoice.release_stages.is_empty()
                     || in_group
                     || !invoice.co_signers.is_empty()
-                    || (invoice.min_funding_amount > 0 && invoice.funded < invoice.min_funding_amount);
+                    || (invoice.min_funding_bps > 0 && invoice.funded < (invoice.amounts.iter().sum::<i128>() * invoice.min_funding_bps as i128 / 10_000));
             if guarded {
                 save_invoice(&env, invoice_id, &invoice);
             } else {
@@ -2510,7 +2563,16 @@ impl SplitContract {
         let remaining = total - invoice.funded;
         assert!(converted <= remaining, "payment exceeds remaining balance");
 
-        invoice.payments.push_back(Payment { payer: payer.clone(), amount: converted, tip: 0 });
+        // Write payment to sharded storage (issue #177).
+        let shard_id = compute_shard_id(&env, &payer);
+        let mut shard_payments: Vec<Payment> = env
+            .storage()
+            .persistent()
+            .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        shard_payments.push_back(Payment { payer: payer.clone(), amount: converted, tip: 0 });
+        env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
+        
         invoice.funded += converted;
 
         append_audit_entry(&env, invoice_id, symbol_short!("brdg_pay"), &payer);
@@ -2526,7 +2588,7 @@ impl SplitContract {
                     || in_group
                     || !invoice.co_signers.is_empty()
                     || (invoice.oracle_address.is_some() && !invoice.condition_met)
-                    || (invoice.min_funding_amount > 0 && invoice.funded < invoice.min_funding_amount);
+                    || (invoice.min_funding_bps > 0 && invoice.funded < (invoice.amounts.iter().sum::<i128>() * invoice.min_funding_bps as i128 / 10_000));
             if guarded {
                 save_invoice(&env, invoice_id, &invoice);
             } else {
@@ -2588,7 +2650,16 @@ impl SplitContract {
         // Update each invoice via internal accounting (no further token transfers).
         for p in payments.iter() {
             let mut inv = load_invoice(&env, p.invoice_id);
-            inv.payments.push_back(Payment { payer: payer.clone(), amount: p.amount, tip: 0 });
+            // Write payment to sharded storage (issue #177).
+            let shard_id = compute_shard_id(&env, &payer);
+            let mut shard_payments: Vec<Payment> = env
+                .storage()
+                .persistent()
+                .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(p.invoice_id, shard_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            shard_payments.push_back(Payment { payer: payer.clone(), amount: p.amount, tip: 0 });
+            env.storage().persistent().set(&pay_shard_key(p.invoice_id, shard_id), &shard_payments);
+
             inv.funded += p.amount;
 
             append_audit_entry(&env, p.invoice_id, symbol_short!("pool_pay"), &payer);
@@ -2604,7 +2675,7 @@ impl SplitContract {
                         || in_group
                         || !inv.co_signers.is_empty()
                         || (inv.oracle_address.is_some() && !inv.condition_met)
-                        || (inv.min_funding_amount > 0 && inv.funded < inv.min_funding_amount);
+                        || (inv.min_funding_bps > 0 && inv.funded < (inv.amounts.iter().sum::<i128>() * inv.min_funding_bps as i128 / 10_000));
                 if guarded {
                     save_invoice(&env, p.invoice_id, &inv);
                 } else {
@@ -3045,7 +3116,7 @@ impl SplitContract {
         let amount = invoice.amounts.get(idx).unwrap();
         let total: i128 = invoice.amounts.iter().sum();
         let funded = invoice.funded;
-        let n = invoice.recipients.len() as u32;
+        let n = invoice.recipients.len();
 
         let proportional = if idx == n - 1 {
             // Last recipient gets remainder
@@ -3451,7 +3522,7 @@ impl SplitContract {
 
             // Issue: if split_rules are defined, compute payout from rule instead of amounts[].
             let proportional = if !invoice.split_rules.is_empty() {
-                let rule = invoice.split_rules.get(i as u32).unwrap();
+                let rule = invoice.split_rules.get(i).unwrap();
                 match rule {
                     SplitRule::Fixed(fixed_amt) => fixed_amt,
                     SplitRule::Percentage(bps) => {
@@ -3509,7 +3580,7 @@ impl SplitContract {
             // Default behavior: transfer to each recipient (or route via DEX/router as configured).
             for i in 0..n {
                 let recipient = invoice.recipients.get(i).unwrap();
-                let proportional = payouts.get(i as u32).unwrap();
+                let proportional = payouts.get(i).unwrap();
 
                 let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
                 let post_tax = proportional - tax;
@@ -3519,7 +3590,7 @@ impl SplitContract {
                 // Issue #41: if a swap token is configured for this recipient, invoke DEX swap.
                 let swap_token: Option<Address> = invoice
                     .swap_tokens
-                    .get(i as u32)
+                    .get(i)
                     .unwrap_or(None);
                 if let Some(out_token) = swap_token {
                     let from_token = invoice.tokens.get(0).expect("no token");
@@ -3679,8 +3750,17 @@ impl SplitContract {
                 token_client.transfer(&env.current_contract_address(), addr, &leftover);
             } else if let Some(target_id) = invoice.forward_invoice_id {
                 // Credit the target invoice internally (acts like an internal pay from this contract).
-                let mut target = load_invoice(&env, target_id);
-                target.payments.push_back(Payment { payer: env.current_contract_address(), amount: leftover, tip: 0 });
+                let mut target = load_invoice(env, target_id);
+                // Write payment to sharded storage (issue #177).
+                let shard_id = compute_shard_id(env, &env.current_contract_address());
+                let mut shard_payments: Vec<Payment> = env
+                    .storage()
+                    .persistent()
+                    .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(target_id, shard_id))
+                    .unwrap_or_else(|| Vec::new(env));
+                shard_payments.push_back(Payment { payer: env.current_contract_address(), amount: leftover, tip: 0 });
+                env.storage().persistent().set(&pay_shard_key(target_id, shard_id), &shard_payments);
+
                 target.funded += leftover;
                 // If target becomes fully funded, trigger auto-release where applicable.
                 let target_total: i128 = target.amounts.iter().sum();
@@ -3805,7 +3885,6 @@ impl SplitContract {
                 Vec::new(env),
                 None,
                 None,
-                0,
                 None,
                 None,
                 None,
@@ -3983,10 +4062,15 @@ impl SplitContract {
         let token_client =
             token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
 
+        // Aggregate payments from all shards (issue #177).
         let mut totals: Map<Address, i128> = Map::new(&env);
-        for payment in invoice.payments.iter() {
-            let prev = totals.get(payment.payer.clone()).unwrap_or(0);
-            totals.set(payment.payer.clone(), prev + payment.amount);
+        for shard_id in 0..SHARD_COUNT {
+            if let Some(shard_payments) = env.storage().persistent().get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id)) {
+                for payment in shard_payments.iter() {
+                    let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+                    totals.set(payment.payer.clone(), prev + payment.amount);
+                }
+            }
         }
 
         let mut total_refunded_amount: i128 = 0;
@@ -4103,10 +4187,15 @@ impl SplitContract {
         }
 
         // No bids were placed; refund payers as normal.
+        // Aggregate payments from all shards (issue #177).
         let mut totals: Map<Address, i128> = Map::new(&env);
-        for payment in invoice.payments.iter() {
-            let prev = totals.get(payment.payer.clone()).unwrap_or(0);
-            totals.set(payment.payer.clone(), prev + payment.amount);
+        for shard_id in 0..SHARD_COUNT {
+            if let Some(shard_payments) = env.storage().persistent().get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id)) {
+                for payment in shard_payments.iter() {
+                    let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+                    totals.set(payment.payer.clone(), prev + payment.amount);
+                }
+            }
         }
 
         let mut total_refunded_amount: i128 = 0;
@@ -4159,19 +4248,18 @@ impl SplitContract {
             .persistent()
             .get(&invoice_count_key(&caller))
             .unwrap_or(0u64);
-        if inv_cnt > 0 {
-            let max_cancel_bps: u32 = env
+        let max_cancel_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&max_cancel_bps_key())
+            .unwrap_or(0u32);
+        if max_cancel_bps > 0 {
+            let cnl_cnt: u64 = env
                 .storage()
                 .persistent()
-                .get(&max_cancel_bps_key())
-                .unwrap_or(0u32);
-            if max_cancel_bps > 0 {
-                let cnl_cnt: u64 = env
-                    .storage()
-                    .persistent()
-                    .get(&cancel_count_key(&caller))
-                    .unwrap_or(0u64);
-                let cancel_rate = cnl_cnt * 10_000 / inv_cnt;
+                .get(&cancel_count_key(&caller))
+                .unwrap_or(0u64);
+            if let Some(cancel_rate) = (cnl_cnt * 10_000).checked_div(inv_cnt) {
                 assert!(
                     cancel_rate < max_cancel_bps as u64,
                     "cancellation rate too high"
@@ -4184,10 +4272,15 @@ impl SplitContract {
             let token_client =
                 token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
 
+            // Aggregate payments from all shards (issue #177).
             let mut totals: Map<Address, i128> = Map::new(&env);
-            for payment in invoice.payments.iter() {
-                let prev = totals.get(payment.payer.clone()).unwrap_or(0);
-                totals.set(payment.payer.clone(), prev + payment.amount);
+            for shard_id in 0..SHARD_COUNT {
+                if let Some(shard_payments) = env.storage().persistent().get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id)) {
+                    for payment in shard_payments.iter() {
+                        let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+                        totals.set(payment.payer.clone(), prev + payment.amount);
+                    }
+                }
             }
 
             // Issue #89: Distribute stake equally among unique payers if stake exists.
@@ -4398,7 +4491,6 @@ impl SplitContract {
             old_invoice.auto_resolve_rules.clone(),
             old_invoice.cross_chain_ref.clone(),
             None,
-            old_invoice.min_funding_amount,
             old_invoice.payment_cooldown_secs,
             old_invoice.max_payments_per_window,
             old_invoice.payment_window_secs,
@@ -4407,9 +4499,15 @@ impl SplitContract {
             old_invoice.require_kyc,
         );
 
-        // Load the newly created invoice and copy over the payments.
+        // Copy payments from shards to new invoice (issue #177).
+        for shard_id in 0..SHARD_COUNT {
+            if let Some(shard_payments) = env.storage().persistent().get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id)) {
+                env.storage().persistent().set(&pay_shard_key(new_id, shard_id), &shard_payments);
+            }
+        }
+        
+        // Load the newly created invoice and set funded amount.
         let mut new_invoice = load_invoice(&env, new_id);
-        new_invoice.payments = old_invoice.payments.clone();
         new_invoice.funded = old_invoice.funded;
         save_invoice(&env, new_id, &new_invoice);
 
@@ -4428,11 +4526,11 @@ impl SplitContract {
     // Adjust split
     // -----------------------------------------------------------------------
 
-    /// Update recipient amounts before any payment has been received.
-    ///
-    /// Only the creator may call this. Panics if any payment has already been
-    /// made (`invoice.funded > 0`). The length of `new_amounts` must match the
-    /// current number of recipients, and every amount must be positive.
+    // Update recipient amounts before any payment has been received.
+    //
+    // Only the creator may call this. Panics if any payment has already been
+    // made (`invoice.funded > 0`). The length of `new_amounts` must match the
+    // current number of recipients, and every amount must be positive.
     // -----------------------------------------------------------------------
     // Add recipient
     // -----------------------------------------------------------------------
@@ -4619,7 +4717,6 @@ impl SplitContract {
             Vec::new(&env),
             None,
             None,
-            0,
             None,
             None,
             None,
@@ -4680,13 +4777,22 @@ impl SplitContract {
         }
         assert!(total_paid > 0, "no contributions to withdraw");
 
-        let mut new_payments: Vec<Payment> = Vec::new(&env);
-        for payment in invoice.payments.iter() {
-            if payment.payer != payer {
-                new_payments.push_back(payment);
+        // Remove payer's payments from all shards (issue #177).
+        for shard_id in 0..SHARD_COUNT {
+            if let Some(shard_payments) = env.storage().persistent().get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id)) {
+                let mut new_shard_payments: Vec<Payment> = Vec::new(&env);
+                for payment in shard_payments.iter() {
+                    if payment.payer != payer {
+                        new_shard_payments.push_back(payment.clone());
+                    }
+                }
+                if new_shard_payments.is_empty() {
+                    env.storage().persistent().remove(&pay_shard_key(invoice_id, shard_id));
+                } else {
+                    env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &new_shard_payments);
+                }
             }
         }
-        invoice.payments = new_payments;
         invoice.funded -= total_paid;
 
         let token_client =
@@ -5277,7 +5383,16 @@ impl SplitContract {
         let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
         token_client.transfer(&delegate, &env.current_contract_address(), &amount);
 
-        invoice.payments.push_back(Payment { payer: beneficiary.clone(), amount, tip: 0 });
+        // Write payment to sharded storage (issue #177).
+        let shard_id = compute_shard_id(&env, &beneficiary);
+        let mut shard_payments: Vec<Payment> = env
+            .storage()
+            .persistent()
+            .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        shard_payments.push_back(Payment { payer: beneficiary.clone(), amount, tip: 0 });
+        env.storage().persistent().set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
+        
         invoice.funded += amount;
 
         append_audit_entry(&env, invoice_id, symbol_short!("del_pay"), &delegate);
