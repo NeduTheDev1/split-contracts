@@ -15,8 +15,8 @@ use soroban_sdk::{
 use types::{
     AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreateInvoiceParams, Invoice, InvoiceCore,
     InvoiceExt, InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus, InvoiceTemplate,
-    LegacyInvoice, OverflowBehavior, Payment, PaymentProof, ResolveAction, ResolveRule,
-    SplitRule, SubscriptionParams, Tranche, TreasuryRecord,
+    LegacyInvoice, OverflowBehavior, Payment, PaymentCertificate, PaymentProof, ResolveAction,
+    ResolveRule, SplitRule, SubscriptionParams, Tranche, TreasuryRecord,
 };
 
 // ---------------------------------------------------------------------------
@@ -259,6 +259,10 @@ fn payer_cooldown_key(invoice_id: u64, payer: Address) -> (Symbol, u64, Address)
 /// Sliding-window payment timestamp list key for rate limiting (issue #168).
 fn payment_window_key(invoice_id: u64) -> (Symbol, u64) {
     (symbol_short!("pay_win"), invoice_id)
+}
+
+fn cert_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("cert"), invoice_id)
 }
 
 const PAYMENT_WINDOW_CAP: u32 = 100;
@@ -4576,5 +4580,58 @@ impl SplitContract {
         }
 
         active
+    }
+
+    pub fn issue_certificate(env: Env, invoice_id: u64) -> PaymentCertificate {
+        let invoice = load_invoice(&env, invoice_id);
+        assert!(
+            invoice.status == InvoiceStatus::Released,
+            "invoice is not released"
+        );
+
+        // Return the cached certificate if one already exists.
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<_, PaymentCertificate>(&cert_key(invoice_id))
+        {
+            return existing;
+        }
+
+        let total: i128 = invoice.amounts.iter().sum();
+        let release_timestamp = invoice
+            .release_timestamp
+            .unwrap_or_else(|| env.ledger().timestamp());
+
+        // Deterministic preimage: invoice_id || total || release_timestamp
+        let mut preimage = [0u8; 32];
+        preimage[..8].copy_from_slice(&invoice_id.to_be_bytes());
+        preimage[8..24].copy_from_slice(&total.to_be_bytes());
+        preimage[24..32].copy_from_slice(&release_timestamp.to_be_bytes());
+
+        let bytes = Bytes::from_array(&env, &preimage);
+        let cert_hash: BytesN<32> = env.crypto().sha256(&bytes).into();
+
+        let cert = PaymentCertificate {
+            invoice_id,
+            total,
+            recipients: invoice.recipients.clone(),
+            release_timestamp,
+            cert_hash,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&cert_key(invoice_id), &cert);
+
+        cert
+    }
+
+    
+    pub fn get_certificate(env: Env, invoice_id: u64) -> PaymentCertificate {
+        env.storage()
+            .persistent()
+            .get::<_, PaymentCertificate>(&cert_key(invoice_id))
+            .expect("certificate not found")
     }
 }
