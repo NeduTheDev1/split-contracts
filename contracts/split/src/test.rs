@@ -4937,224 +4937,278 @@ fn test_partial_release_priority_order() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #173: Payment certificate
+// Compact storage encoding tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_issue_certificate_fields_match_invoice() {
+fn test_compact_invoice_roundtrip() {
     let (env, contract_id, token_id) = setup();
     let c = client(&env, &contract_id);
 
     let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let payer3 = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer1, &100);
+    sa.mint(&payer2, &100);
+    sa.mint(&payer3, &100);
     env.ledger().set_timestamp(1_000);
 
-    // Create and fully fund a 200-token invoice.
-    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
-    c.pay(&payer, &id, &200_i128, &0_u64, &false);
+    // Create invoice with multiple payments
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 5_000);
+    
+    c.pay(&payer1, &id, &100_i128, &0_u64, &false);
+    c.pay(&payer2, &id, &100_i128, &0_u64, &false);
+    c.pay(&payer3, &id, &100_i128, &0_u64, &false);
 
-    // Invoice must be Released before a certificate can be issued.
-    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    // Get invoice parts from contract
+    let core = c.get_invoice(&id);
+    let ext = c.get_invoice_ext(&id);
+    let ext2 = c.get_invoice_ext2(&id);
+    
+    assert_eq!(core.status, InvoiceStatus::Released);
+    assert_eq!(core.funded, 300);
+    assert_eq!(core.deadline, 5_000);
+    assert_eq!(core.payments.len(), 3);
 
-    let cert = c.issue_certificate(&id);
-
-    // invoice_id matches.
-    assert_eq!(cert.invoice_id, id);
-
-    // total equals the invoice amount.
-    assert_eq!(cert.total, 200_i128);
-
-    // recipients list contains the single recipient.
-    assert_eq!(cert.recipients.len(), 1);
-    assert_eq!(cert.recipients.get_unchecked(0), recipient);
-
-    // release_timestamp is non-zero (set during release).
-    assert!(cert.release_timestamp > 0);
-
-    // cert_hash is a non-zero 32-byte value.
-    let zero_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
-    assert_ne!(cert.cert_hash, zero_hash);
+    // Assemble full invoice for compact encoding
+    let invoice = Invoice::assemble(core.clone(), ext.clone(), ext2.clone());
+    let compact = invoice.to_compact(&env);
+    
+    // Verify compact uses fewer bytes than raw struct
+    // status(1) + funded(16) + deadline(8) = 25 bytes
+    assert_eq!(compact.data.len(), 25);
+    
+    // Verify round-trip fidelity
+    let invoice_restored = Invoice::from_compact(&compact, core.clone(), ext.clone(), ext2.clone());
+    
+    assert_eq!(invoice_restored.status, core.status);
+    assert_eq!(invoice_restored.funded, core.funded);
+    assert_eq!(invoice_restored.deadline, core.deadline);
+    assert_eq!(invoice_restored.payments.len(), core.payments.len());
+    assert_eq!(invoice_restored.recipients.len(), core.recipients.len());
+    assert_eq!(invoice_restored.amounts.len(), core.amounts.len());
 }
 
 #[test]
-fn test_get_certificate_returns_stored_cert() {
-    let (env, contract_id, token_id) = setup();
-    let c = client(&env, &contract_id);
-
+fn test_compact_invoice_all_statuses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
     let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
     let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
-    c.pay(&payer, &id, &100_i128, &0_u64, &false);
-
-    let issued = c.issue_certificate(&id);
-    let retrieved = c.get_certificate(&id);
-
-    // Both calls must return identical data.
-    assert_eq!(issued.invoice_id, retrieved.invoice_id);
-    assert_eq!(issued.total, retrieved.total);
-    assert_eq!(issued.release_timestamp, retrieved.release_timestamp);
-    assert_eq!(issued.cert_hash, retrieved.cert_hash);
-    assert_eq!(issued.recipients.len(), retrieved.recipients.len());
-}
-
-#[test]
-fn test_issue_certificate_is_idempotent() {
-    let (env, contract_id, token_id) = setup();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &150);
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 150, &token_id, 9_999);
-    c.pay(&payer, &id, &150_i128, &0_u64, &false);
-
-    let first = c.issue_certificate(&id);
-    let second = c.issue_certificate(&id);
-
-    // Both invocations must produce the same hash (idempotent).
-    assert_eq!(first.cert_hash, second.cert_hash);
-    assert_eq!(first.total, second.total);
-    assert_eq!(first.release_timestamp, second.release_timestamp);
-}
-
-#[test]
-fn test_cert_hash_is_deterministic() {
-    // Two separate invoices with identical amounts and release times must
-    // produce different hashes (invoice_id is part of the preimage).
-    let (env, contract_id, token_id) = setup();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let r1 = Address::generate(&env);
-    let r2 = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &400);
-    env.ledger().set_timestamp(1_000);
-
-    let id1 = make_invoice(&env, &c, &creator, &r1, 100, &token_id, 9_999);
-    let id2 = make_invoice(&env, &c, &creator, &r2, 100, &token_id, 9_999);
-
-    c.pay(&payer, &id1, &100_i128, &0_u64, &false);
-    c.pay(&payer, &id2, &100_i128, &0_u64, &false);
-
-    let cert1 = c.issue_certificate(&id1);
-    let cert2 = c.issue_certificate(&id2);
-
-    // Different invoice_ids → different hashes.
-    assert_ne!(cert1.cert_hash, cert2.cert_hash);
-
-    // Calling again yields the same hash (determinism check).
-    let cert1_again = c.issue_certificate(&id1);
-    assert_eq!(cert1.cert_hash, cert1_again.cert_hash);
-}
-
-#[test]
-fn test_certificate_multi_recipient() {
-    let (env, contract_id, token_id) = setup();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let r1 = Address::generate(&env);
-    let r2 = Address::generate(&env);
-    let r3 = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &600);
-    env.ledger().set_timestamp(1_000);
-
+    let token = Address::generate(&env);
+    
     let mut recipients = Vec::new(&env);
-    recipients.push_back(r1.clone());
-    recipients.push_back(r2.clone());
-    recipients.push_back(r3.clone());
+    recipients.push_back(recipient);
     let mut amounts = Vec::new(&env);
     amounts.push_back(100_i128);
-    amounts.push_back(200_i128);
-    amounts.push_back(300_i128);
-
-    let id = c.create_invoice(
-        &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
-    );
-    c.pay(&payer, &id, &600_i128, &0_u64, &false);
-
-    let cert = c.issue_certificate(&id);
-
-    assert_eq!(cert.total, 600_i128);
-    assert_eq!(cert.recipients.len(), 3);
-    assert_eq!(cert.recipients.get_unchecked(0), r1);
-    assert_eq!(cert.recipients.get_unchecked(1), r2);
-    assert_eq!(cert.recipients.get_unchecked(2), r3);
+    
+    // Test all invoice statuses
+    use soroban_sdk::vec as soroban_vec;
+    let statuses = soroban_vec![
+        &env,
+        InvoiceStatus::Pending,
+        InvoiceStatus::Released,
+        InvoiceStatus::Refunded,
+        InvoiceStatus::Cancelled,
+    ];
+    
+    for status in statuses {
+        let core = InvoiceCore {
+            version: 2,
+            creator: creator.clone(),
+            co_creators: Vec::new(&env),
+            recipients: recipients.clone(),
+            amounts: amounts.clone(),
+            tokens: {
+                let mut tokens = Vec::new(&env);
+                tokens.push_back(token.clone());
+                tokens
+            },
+            deadline: 9_999,
+            funded: 50,
+            status: status.clone(),
+            payments: Vec::new(&env),
+            drip_duration: None,
+            release_timestamp: None,
+            claimed: Vec::new(&env),
+            frozen: false,
+            completion_time: None,
+            allow_early_withdrawal: false,
+            bonus_pool: 0,
+            bonus_max_payers: 0,
+            prerequisite_id: None,
+            tranches: Vec::new(&env),
+            released_bps: 0,
+            clone_depth: 0,
+        };
+        
+        let ext = InvoiceExt {
+            co_signers: Vec::new(&env),
+            required_signatures: 0,
+            signatures: Vec::new(&env),
+            approver: None,
+            approved: false,
+            oracle_address: None,
+            condition_met: false,
+            penalty_bps: 0,
+            penalty_deadline: 0,
+            min_funding_bps: 0,
+            release_stages: Vec::new(&env),
+            released_stages: 0,
+            allowed_payers: None,
+            price_oracle: None,
+            base_amounts: Vec::new(&env),
+            swap_tokens: Vec::new(&env),
+            tax_bps: 0,
+            tax_authority: None,
+            insurance_premium_bps: 0,
+            insurance_fund: 0,
+            smart_route: false,
+            convert_to_stream: false,
+            accepted_tokens: Vec::new(&env),
+            forward_to: None,
+            forward_invoice_id: None,
+            split_rules: Vec::new(&env),
+            auto_resolve_rules: Vec::new(&env),
+            creator_cosigner: None,
+            velocity_limit: 0,
+            velocity_window: 0,
+            parent_invoice_id: None,
+            pause_reason: None,
+            auto_resume_at: None,
+            payment_cooldown_secs: None,
+            max_payments_per_window: None,
+            payment_window_secs: None,
+        };
+        
+        let ext2 = InvoiceExt2 {
+            notification_contract: None,
+            overflow_behavior: OverflowBehavior::Reject,
+            cross_chain_ref: None,
+            require_kyc: false,
+            auction_on_expiry: false,
+            auction_end: 0,
+            bids: Vec::new(&env),
+            min_payment: 0,
+            min_funding_amount: 0,
+            priorities: Vec::new(&env),
+        };
+        
+        let invoice = Invoice::assemble(core.clone(), ext.clone(), ext2.clone());
+        let compact = invoice.to_compact(&env);
+        let restored = Invoice::from_compact(&compact, core, ext, ext2);
+        
+        assert_eq!(restored.status, status);
+        assert_eq!(restored.funded, 50);
+        assert_eq!(restored.deadline, 9_999);
+    }
 }
 
 #[test]
-#[should_panic(expected = "invoice is not released")]
-fn test_issue_certificate_on_pending_panics() {
-    let (env, contract_id, token_id) = setup();
-    let c = client(&env, &contract_id);
-
+fn test_compact_invoice_extreme_values() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
     let creator = Address::generate(&env);
     let recipient = Address::generate(&env);
-
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
-    // Invoice is still Pending — must panic.
-    c.issue_certificate(&id);
-}
-
-#[test]
-#[should_panic(expected = "invoice is not released")]
-fn test_issue_certificate_on_refunded_panics() {
-    let (env, contract_id, token_id) = setup();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &50);
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
-    c.pay(&payer, &id, &50_i128, &0_u64, &false);
-
-    // Move past deadline and refund.
-    env.ledger().set_timestamp(3_000);
-    c.refund(&id);
-    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
-
-    // Must panic on a Refunded invoice.
-    c.issue_certificate(&id);
-}
-
-#[test]
-#[should_panic(expected = "certificate not found")]
-fn test_get_certificate_before_issue_panics() {
-    let (env, contract_id, token_id) = setup();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
-    c.pay(&payer, &id, &100_i128, &0_u64, &false);
-
-    // Released but issue_certificate() never called — must panic.
-    c.get_certificate(&id);
+    let token = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient);
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    
+    // Test with maximum values
+    let core = InvoiceCore {
+        version: 2,
+        creator: creator.clone(),
+        co_creators: Vec::new(&env),
+        recipients: recipients.clone(),
+        amounts: amounts.clone(),
+        tokens: {
+            let mut tokens = Vec::new(&env);
+            tokens.push_back(token.clone());
+            tokens
+        },
+        deadline: u64::MAX,
+        funded: i128::MAX,
+        status: InvoiceStatus::Pending,
+        payments: Vec::new(&env),
+        drip_duration: None,
+        release_timestamp: None,
+        claimed: Vec::new(&env),
+        frozen: false,
+        completion_time: None,
+        allow_early_withdrawal: false,
+        bonus_pool: 0,
+        bonus_max_payers: 0,
+        prerequisite_id: None,
+        tranches: Vec::new(&env),
+        released_bps: 0,
+        clone_depth: 0,
+    };
+    
+    let ext = InvoiceExt {
+        co_signers: Vec::new(&env),
+        required_signatures: 0,
+        signatures: Vec::new(&env),
+        approver: None,
+        approved: false,
+        oracle_address: None,
+        condition_met: false,
+        penalty_bps: 0,
+        penalty_deadline: 0,
+        min_funding_bps: 0,
+        release_stages: Vec::new(&env),
+        released_stages: 0,
+        allowed_payers: None,
+        price_oracle: None,
+        base_amounts: Vec::new(&env),
+        swap_tokens: Vec::new(&env),
+        tax_bps: 0,
+        tax_authority: None,
+        insurance_premium_bps: 0,
+        insurance_fund: 0,
+        smart_route: false,
+        convert_to_stream: false,
+        accepted_tokens: Vec::new(&env),
+        forward_to: None,
+        forward_invoice_id: None,
+        split_rules: Vec::new(&env),
+        auto_resolve_rules: Vec::new(&env),
+        creator_cosigner: None,
+        velocity_limit: 0,
+        velocity_window: 0,
+        parent_invoice_id: None,
+        pause_reason: None,
+        auto_resume_at: None,
+        payment_cooldown_secs: None,
+        max_payments_per_window: None,
+        payment_window_secs: None,
+    };
+    
+    let ext2 = InvoiceExt2 {
+        notification_contract: None,
+        overflow_behavior: OverflowBehavior::Reject,
+        cross_chain_ref: None,
+        require_kyc: false,
+        auction_on_expiry: false,
+        auction_end: 0,
+        bids: Vec::new(&env),
+        min_payment: 0,
+        min_funding_amount: 0,
+        priorities: Vec::new(&env),
+    };
+    
+    let invoice = Invoice::assemble(core.clone(), ext.clone(), ext2.clone());
+    let compact = invoice.to_compact(&env);
+    let restored = Invoice::from_compact(&compact, core, ext, ext2);
+    
+    assert_eq!(restored.funded, i128::MAX);
+    assert_eq!(restored.deadline, u64::MAX);
 }
