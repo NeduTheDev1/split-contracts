@@ -4524,7 +4524,7 @@ fn test_clone_copies_recipients_and_amounts() {
         new_deadline: None,
         new_amounts: None,
         new_recipients: None,
-        new_overflow_behavior: None,
+        new_overflow_behavior: Vec::new(&env),
     };
     let clone_id = c.clone_invoice(&creator, &source_id, &overrides);
 
@@ -4567,7 +4567,7 @@ fn test_clone_with_overrides_replaces_fields() {
         new_deadline: Some(19_999),
         new_amounts: Some(new_amounts.clone()),
         new_recipients: Some(new_recipients.clone()),
-        new_overflow_behavior: Some(types::OverflowBehavior::Refund),
+        new_overflow_behavior: soroban_sdk::vec![&env, types::OverflowBehavior::Refund],
     };
     let clone_id = c.clone_invoice(&creator, &source_id, &overrides);
 
@@ -4595,7 +4595,7 @@ fn test_clone_depth_limit_enforced() {
         new_deadline: None,
         new_amounts: None,
         new_recipients: None,
-        new_overflow_behavior: None,
+        new_overflow_behavior: Vec::new(&env),
     };
 
     let id0 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
@@ -4646,7 +4646,7 @@ fn test_clone_resets_payment_state() {
         new_deadline: None,
         new_amounts: None,
         new_recipients: None,
-        new_overflow_behavior: None,
+        new_overflow_behavior: Vec::new(&env),
     };
     let clone_id = c.clone_invoice(&creator, &source_id, &overrides);
 

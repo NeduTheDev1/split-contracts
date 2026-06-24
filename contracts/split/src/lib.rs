@@ -304,6 +304,11 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             velocity_limit: 0,
             velocity_window: 0,
             parent_invoice_id: None,
+            pause_reason: None,
+            auto_resume_at: None,
+            payment_cooldown_secs: None,
+            max_payments_per_window: None,
+            payment_window_secs: None,
         });
     let ext2: InvoiceExt2 = env.storage().persistent()
         .get(&invoice_ext2_key(id))
@@ -421,19 +426,6 @@ fn load_treasury_record(env: &Env, group_id: u64) -> TreasuryRecord {
         .persistent()
         .get(&group_treasury_key(group_id))
         .expect("treasury record not found")
-}
-
-fn save_invoice_ext(env: &Env, id: u64, ext: &InvoiceExt) {
-    env.storage()
-        .persistent()
-        .set(&invoice_ext_key(id), ext);
-}
-
-fn load_invoice_ext(env: &Env, id: u64) -> InvoiceExt {
-    env.storage()
-        .persistent()
-        .get(&invoice_ext_key(id))
-        .expect("invoice extension not found")
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,6 +1254,7 @@ impl SplitContract {
         let deadline = overrides.new_deadline.unwrap_or(source.deadline);
         let overflow_behavior = overrides
             .new_overflow_behavior
+            .get(0)
             .unwrap_or_else(|| source.overflow_behavior.clone());
 
         let token = source.tokens.get(0).expect("no token");
@@ -1341,6 +1334,11 @@ impl SplitContract {
             creator_cosigner: source.creator_cosigner.clone(),
             velocity_limit: source.velocity_limit,
             velocity_window: source.velocity_window,
+            pause_reason: source.pause_reason.clone(),
+            auto_resume_at: source.auto_resume_at,
+            payment_cooldown_secs: source.payment_cooldown_secs,
+            max_payments_per_window: source.max_payments_per_window,
+            payment_window_secs: source.payment_window_secs,
             notification_contract: source.notification_contract.clone(),
             overflow_behavior,
             cross_chain_ref: source.cross_chain_ref.clone(),
@@ -4208,7 +4206,7 @@ impl SplitContract {
                 smart_route: false, convert_to_stream: false, accepted_tokens: Vec::new(&env),
                 forward_to: None, forward_invoice_id: None, split_rules: Vec::new(&env),
                 auto_resolve_rules: Vec::new(&env), creator_cosigner: None, velocity_limit: 0,
-                velocity_window: 0, pause_reason: None, auto_resume_at: None,
+                velocity_window: 0, parent_invoice_id: None, pause_reason: None, auto_resume_at: None,
                 payment_cooldown_secs: None, max_payments_per_window: None, payment_window_secs: None,
             });
         let ext2: InvoiceExt2 = env.storage().persistent()
