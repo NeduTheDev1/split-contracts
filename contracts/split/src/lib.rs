@@ -357,6 +357,8 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             overflow_behavior: OverflowBehavior::Reject,
             cross_chain_ref: None,
             require_kyc: false,
+            arbiter: None,
+            disputed: false,
             auction_on_expiry: false,
             auction_end: 0,
             bids: Vec::new(env),
@@ -700,6 +702,171 @@ impl SplitContract {
     pub fn set_dex_contract(env: Env, admin: Address, contract: Address) {
         require_role(&env, &admin, AdminRole::Operator);
         env.storage().persistent().set(&soroban_sdk::symbol_short!("dex_ctr"), &contract);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #189: Admin rotation
+    // -----------------------------------------------------------------------
+
+    /// Propose a new admin. Requires current admin auth.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        require_admin(&env);
+        let _ = admin;
+        env.storage().instance().set(&pending_admin_key(), &new_admin);
+    }
+
+    /// Accept the admin role. Requires the proposed admin to authenticate.
+    pub fn accept_admin(env: Env) {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&pending_admin_key())
+            .expect("no pending admin");
+        pending.require_auth();
+        env.storage().instance().set(&admin_key(), &pending);
+        env.storage().instance().remove(&pending_admin_key());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #193: Creator volume cap
+    // -----------------------------------------------------------------------
+
+    /// Set a volume cap for a specific creator. Requires admin auth.
+    /// A cap of 0 means no limit.
+    pub fn set_creator_volume_cap(env: Env, admin: Address, creator: Address, cap: i128) {
+        require_admin(&env);
+        let _ = admin;
+        assert!(cap >= 0, "cap must be non-negative");
+        env.storage().persistent().set(&creator_volume_cap_key(&creator), &cap);
+    }
+
+    /// Return the volume cap for a creator (0 = no limit).
+    pub fn get_creator_volume_cap(env: Env, creator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&creator_volume_cap_key(&creator))
+            .unwrap_or(0)
+    }
+
+    /// Return the volume used toward the cap for a creator.
+    pub fn get_creator_volume_used(env: Env, creator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&creator_volume_used_key(&creator))
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #188: Dispute arbitration
+    // -----------------------------------------------------------------------
+
+    /// Set an arbiter address for an invoice. Requires admin auth.
+    /// Only the arbiter may raise and resolve disputes on this invoice.
+    pub fn set_arbiter(env: Env, admin: Address, invoice_id: u64, arbiter: Address) {
+        require_admin(&env);
+        let _ = admin;
+        let mut invoice = load_invoice(&env, invoice_id);
+        invoice.arbiter = Some(arbiter.clone());
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("set_arb"), &arbiter);
+    }
+
+    /// Raise a dispute on an invoice. Only the configured arbiter may call this.
+    /// When disputed, all actions (pay, release, refund, cancel) are blocked.
+    pub fn raise_dispute(env: Env, invoice_id: u64, arbiter: Address) {
+        require_not_paused(&env);
+        arbiter.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(
+            invoice.arbiter.as_ref() == Some(&arbiter),
+            "not the designated arbiter"
+        );
+        assert!(!invoice.disputed, "invoice is already disputed");
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+
+        invoice.disputed = true;
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("dispute"), &arbiter);
+    }
+
+    /// Resolve a dispute — release or refund the invoice.
+    /// Only the designated arbiter may call this.
+    pub fn resolve_dispute(env: Env, invoice_id: u64, arbiter: Address, resolution: ResolveAction) {
+        require_not_paused(&env);
+        arbiter.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(
+            invoice.arbiter.as_ref() == Some(&arbiter),
+            "not the designated arbiter"
+        );
+        assert!(invoice.disputed, "invoice is not disputed");
+
+        match resolution {
+            ResolveAction::Release => {
+                let caller = env.current_contract_address();
+                Self::_release(&env, invoice_id, &mut invoice, &caller);
+            }
+            ResolveAction::Refund => {
+                // If the invoice has no payments, mark as cancelled.
+                if invoice.funded == 0 {
+                    invoice.status = InvoiceStatus::Cancelled;
+                    save_invoice(&env, invoice_id, &invoice);
+                    append_audit_entry(&env, invoice_id, symbol_short!("resolve"), &arbiter);
+                    return;
+                }
+
+                let token_client = token::Client::new(
+                    &env,
+                    &invoice.tokens.get(0).expect("no token"),
+                );
+                let mut totals: Map<Address, i128> = Map::new(&env);
+                for payment in invoice.payments.iter() {
+                    let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+                    totals.set(payment.payer.clone(), prev + payment.amount);
+                }
+                let mut total_refunded_amount: i128 = 0;
+                for (payer, amount) in totals.iter() {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &payer,
+                        &amount,
+                    );
+                    total_refunded_amount += amount;
+                    events::payer_refunded(&env, invoice_id, &payer, amount);
+                }
+
+                if invoice.bonus_pool > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &invoice.creator,
+                        &invoice.bonus_pool,
+                    );
+                }
+
+                invoice.status = InvoiceStatus::Refunded;
+                invoice.completion_time = Some(env.ledger().timestamp());
+                save_invoice(&env, invoice_id, &invoice);
+                append_audit_entry(&env, invoice_id, symbol_short!("resolve"), &arbiter);
+                events::invoice_refunded(&env, invoice_id);
+
+                let total_refunded: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&total_refunded_key())
+                    .unwrap_or(0i128);
+                env.storage().persistent().set(
+                    &total_refunded_key(),
+                    &total_refunded
+                        .checked_add(total_refunded_amount)
+                        .expect("total_refunded overflow"),
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1070,6 +1237,7 @@ impl SplitContract {
             options.payment_window_secs,
             options.refund_grace_secs,
             options.priorities,
+            options.require_kyc,
         )
     }
 
@@ -1119,6 +1287,7 @@ impl SplitContract {
         payment_window_secs: Option<u64>,
         refund_grace_secs: Option<u64>,
         priorities: Vec<u32>,
+        require_kyc: bool,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -1289,6 +1458,43 @@ impl SplitContract {
             assert!(approved, "governance approval required");
         }
 
+        // Issue #193: check creator volume cap.
+        let volume_cap: i128 = env
+            .storage()
+            .persistent()
+            .get(&creator_volume_cap_key(&creator))
+            .unwrap_or(0);
+        if volume_cap > 0 {
+            let used: i128 = env
+                .storage()
+                .persistent()
+                .get(&creator_volume_used_key(&creator))
+                .unwrap_or(0);
+            assert!(
+                used.checked_add(total).expect("volume overflow") <= volume_cap,
+                "creator volume cap exceeded"
+            );
+            env.storage()
+                .persistent()
+                .set(&creator_volume_used_key(&creator), &(used + total));
+        }
+
+        // Issue #195: if require_kyc, verify all recipients have KYC.
+        if require_kyc {
+            let kyc_contract: Address = env
+                .storage()
+                .persistent()
+                .get(&kyc_contract_key())
+                .expect("kyc contract not set");
+            for recipient in recipients.iter() {
+                let verified: bool = env.invoke_contract(
+                    &kyc_contract,
+                    &Symbol::new(env, "is_verified"),
+                    (recipient.clone(),).into_val(env),
+                );
+                assert!(verified, "kyc required for recipient");
+            }
+        }
 
         if bonus_pool > 0 {
             let token_client = token::Client::new(env, &token);
@@ -1377,7 +1583,9 @@ impl SplitContract {
             payment_window_secs,
             refund_grace_secs,
             cross_chain_ref,
-            require_kyc: false,
+            require_kyc,
+            arbiter: None,
+            disputed: false,
             auction_on_expiry: false,
             auction_end: 0,
             bids: Vec::new(env),
@@ -1517,6 +1725,7 @@ impl SplitContract {
                 None,
                 None,
                 Vec::new(&env), // priorities
+                false, // require_kyc
             );
             ids.push_back(id);
         }
@@ -1590,6 +1799,7 @@ impl SplitContract {
             None,
             None,
             Vec::new(&env), // priorities
+            false, // require_kyc
         );
 
         if months > 1 {
@@ -1743,6 +1953,8 @@ impl SplitContract {
             bids: source.bids.clone(),
             min_payment: source.min_payment,
             min_funding_amount: source.min_funding_amount,
+            arbiter: source.arbiter.clone(),
+            disputed: false,
             priorities: source.priorities.clone(),
         };
 
@@ -1823,6 +2035,7 @@ impl SplitContract {
 
         let invoice = load_invoice(&env, invoice_id);
         assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(!invoice.disputed, "invoice is disputed");
 
         let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
         token_client.transfer(&payer, &env.current_contract_address(), &deposit);
@@ -1854,6 +2067,7 @@ impl SplitContract {
         let net_paid = deposited - balance;
 
         let mut invoice = load_invoice(&env, invoice_id);
+        assert!(!invoice.disputed, "invoice is disputed");
 
         if net_paid > 0 {
             assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
@@ -1907,6 +2121,7 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(
             env.ledger().timestamp() <= invoice.deadline,
             "invoice deadline has passed"
@@ -2181,6 +2396,7 @@ impl SplitContract {
         let mut invoice = load_invoice(&env, invoice_id);
 
         assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(env.ledger().timestamp() <= invoice.deadline, "invoice deadline has passed");
         assert!(amount > 0, "payment amount must be positive");
 
@@ -2271,6 +2487,7 @@ impl SplitContract {
 
         let mut invoice = load_invoice(&env, invoice_id);
         assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(env.ledger().timestamp() <= invoice.deadline, "invoice deadline has passed");
         assert!(source_amount > 0, "payment amount must be positive");
 
@@ -2345,6 +2562,7 @@ impl SplitContract {
         for p in payments.iter() {
             let inv = load_invoice(&env, p.invoice_id);
             assert!(inv.status == InvoiceStatus::Pending, "invoice is not pending");
+            assert!(!inv.disputed, "invoice is disputed");
             assert!(
                 env.ledger().timestamp() <= inv.deadline,
                 "invoice deadline has passed"
@@ -2416,6 +2634,7 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(!invoice.co_signers.is_empty(), "no co-signers required");
         assert!(
             invoice.co_signers.iter().any(|c| c == signer),
@@ -2567,6 +2786,7 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(!invoice.frozen, "invoice is already frozen");
 
         invoice.frozen = true;
@@ -2723,6 +2943,7 @@ impl SplitContract {
     pub fn confirm_condition(env: Env, invoice_id: u64) {
         require_not_paused(&env);
         let mut invoice = load_invoice(&env, invoice_id);
+        assert!(!invoice.disputed, "invoice is disputed");
         let oracle = invoice.oracle_address.as_ref().expect("no oracle set for invoice");
         oracle.require_auth();
         invoice.condition_met = true;
@@ -2998,6 +3219,7 @@ impl SplitContract {
 
         assert!(invoice.creator == creator, "only creator can call stage_release");
         assert!(!invoice.frozen, "invoice is frozen");
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
@@ -3121,6 +3343,7 @@ impl SplitContract {
         let mut invoice = load_invoice(&env, invoice_id);
         assert!(invoice.creator == creator, "only creator can call partial_release");
         assert!(!invoice.frozen, "invoice is frozen");
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
         assert!(amount > 0, "amount must be positive");
         assert!(amount <= invoice.funded, "amount exceeds funded balance");
@@ -3588,6 +3811,7 @@ impl SplitContract {
                 None,
                 None,
                 Vec::new(env), // priorities
+                false, // require_kyc
             );
             env.storage()
                 .persistent()
@@ -3610,6 +3834,7 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(!invoice.auto_resolve_rules.is_empty(), "no auto-resolve rules defined");
 
         let total: i128 = invoice.amounts.iter().sum();
@@ -3919,6 +4144,7 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
+        assert!(!invoice.disputed, "invoice is disputed");
         // If a creator cosigner is set, require both the creator and cosigner auths.
         if let Some(cos) = invoice.creator_cosigner.clone() {
             invoice.creator.require_auth();
@@ -4059,6 +4285,7 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
+        assert!(!invoice.disputed, "invoice is disputed");
 
         invoice.creator.require_auth();
         invoice.creator = new_creator;
@@ -4076,6 +4303,7 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice not pending"
         );
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(
             new_deadline > invoice.deadline,
             "new deadline must be after current deadline"
@@ -4176,6 +4404,7 @@ impl SplitContract {
             old_invoice.payment_window_secs,
             old_invoice.refund_grace_secs,
             old_invoice.priorities.clone(),
+            old_invoice.require_kyc,
         );
 
         // Load the newly created invoice and copy over the payments.
@@ -4227,6 +4456,7 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(invoice.creator == caller, "only creator can add recipients");
         assert!(invoice.funded == 0, "cannot add recipient after payment received");
         assert!(amount > 0, "amount must be positive");
@@ -4277,6 +4507,7 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
+        assert!(!invoice.disputed, "invoice is disputed");
         // If a creator cosigner is set, require both creator and cosigner auths.
         if let Some(cos) = invoice.creator_cosigner.clone() {
             invoice.creator.require_auth();
@@ -4394,6 +4625,7 @@ impl SplitContract {
             None,
             None,
             Vec::new(&env), // priorities
+            false, // require_kyc
         )
     }
 
@@ -4434,6 +4666,7 @@ impl SplitContract {
         let mut invoice = load_invoice(&env, invoice_id);
 
         assert!(invoice.allow_early_withdrawal, "early withdrawal not allowed");
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
@@ -4882,9 +5115,9 @@ impl SplitContract {
             .get(&invoice_ext2_key(invoice_id))
             .unwrap_or_else(|| InvoiceExt2 {
                 notification_contract: None, overflow_behavior: OverflowBehavior::Reject,
-                cross_chain_ref: None, require_kyc: false, auction_on_expiry: false,
-                auction_end: 0, bids: Vec::new(&env), min_payment: 0, min_funding_amount: 0,
-                priorities: Vec::new(&env),
+                cross_chain_ref: None, require_kyc: false, arbiter: None, disputed: false,
+                auction_on_expiry: false, auction_end: 0, bids: Vec::new(&env),
+                min_payment: 0, min_funding_amount: 0, priorities: Vec::new(&env),
             });
 
         // Copy to instance storage.
@@ -5033,6 +5266,7 @@ impl SplitContract {
 
         let mut invoice = load_invoice(&env, invoice_id);
         assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(!invoice.disputed, "invoice is disputed");
         assert!(env.ledger().timestamp() <= invoice.deadline, "invoice deadline has passed");
         assert!(amount > 0, "payment amount must be positive");
 
