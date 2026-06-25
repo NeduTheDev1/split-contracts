@@ -47,6 +47,10 @@ fn creation_fee_key() -> Symbol {
 fn platform_fee_bps_key() -> Symbol {
     symbol_short!("plat_fee")
 }
+
+fn platform_fee_waiver_list_key() -> Symbol {
+    symbol_short!("fee_waivers")
+}
 fn treasury_key() -> Symbol {
     symbol_short!("treasury")
 }
@@ -978,6 +982,136 @@ impl SplitContract {
             }
         }
         env.storage().persistent().set(&creator_whitelist_key(), &new_wl);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #215: Configurable platform fee waiver list
+    // -----------------------------------------------------------------------
+
+    /// Add an address to the platform fee waiver list. Requires admin auth.
+    /// Addresses on this list will not be charged platform fees when they are recipients.
+    pub fn add_platform_fee_waiver(env: Env, admin: Address, address: Address) {
+        require_role(&env, &admin, AdminRole::SuperAdmin);
+        let mut waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        if !waivers.iter().any(|a| a == address) {
+            waivers.push_back(address);
+        }
+        env.storage().persistent().set(&platform_fee_waiver_list_key(), &waivers);
+    }
+
+    /// Remove an address from the platform fee waiver list. Requires admin auth.
+    pub fn remove_platform_fee_waiver(env: Env, admin: Address, address: Address) {
+        require_role(&env, &admin, AdminRole::SuperAdmin);
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_waivers: Vec<Address> = Vec::new(&env);
+        for a in waivers.iter() {
+            if a != address {
+                new_waivers.push_back(a);
+            }
+        }
+        env.storage().persistent().set(&platform_fee_waiver_list_key(), &new_waivers);
+    }
+
+    /// Check if an address is on the platform fee waiver list.
+    pub fn is_platform_fee_waived(env: Env, address: Address) -> bool {
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        waivers.iter().any(|a| a == address)
+    }
+
+    /// Get a consolidated invoice snapshot for off-chain audit.
+    pub fn get_invoice_snapshot(env: Env, invoice_id: u64) -> types::InvoiceSnapshot {
+        let core: types::InvoiceCore = env
+            .storage()
+            .persistent()
+            .get(&invoice_key(invoice_id))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&invoice_key(invoice_id))
+                    .expect("invoice not found")
+            });
+        let ext: types::InvoiceExt = env
+            .storage()
+            .persistent()
+            .get(&invoice_ext_key(invoice_id))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&invoice_ext_key(invoice_id))
+                    .unwrap_or_else(|| types::InvoiceExt {
+                        co_signers: Vec::new(&env),
+                        required_signatures: 0,
+                        signatures: Vec::new(&env),
+                        approver: None,
+                        approved: false,
+                        oracle_address: None,
+                        condition_met: false,
+                        penalty_bps: 0,
+                        penalty_deadline: 0,
+                        min_funding_bps: 0,
+                        release_stages: Vec::new(&env),
+                        released_stages: 0,
+                        allowed_payers: None,
+                        price_oracle: None,
+                        base_amounts: Vec::new(&env),
+                        swap_tokens: Vec::new(&env),
+                        tax_bps: 0,
+                        tax_authority: None,
+                        insurance_premium_bps: 0,
+                        insurance_fund: 0,
+                        smart_route: false,
+                        convert_to_stream: false,
+                        accepted_tokens: Vec::new(&env),
+                        forward_to: None,
+                        forward_invoice_id: None,
+                        split_rules: Vec::new(&env),
+                        auto_resolve_rules: Vec::new(&env),
+                        creator_cosigner: None,
+                        velocity_limit: 0,
+                        velocity_window: 0,
+                        parent_invoice_id: None,
+                        pause_reason: None,
+                        auto_resume_at: None,
+                        payment_cooldown_secs: None,
+                        max_payments_per_window: None,
+                        payment_window_secs: None,
+                    })
+            });
+        let ext2: types::InvoiceExt2 = env
+            .storage()
+            .persistent()
+            .get(&invoice_ext2_key(invoice_id))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&invoice_ext2_key(invoice_id))
+                    .unwrap_or_else(|| types::InvoiceExt2 {
+                        notification_contract: None,
+                        overflow_behavior: types::OverflowBehavior::Reject,
+                        cross_chain_ref: None,
+                        require_kyc: false,
+                        arbiter: None,
+                        disputed: false,
+                        auction_on_expiry: false,
+                        auction_end: 0,
+                        bids: Vec::new(&env),
+                        min_payment: 0,
+                    })
+            });
+        let audit_log: Vec<types::AuditEntry> = get_audit_log(&env, invoice_id);
+        types::InvoiceSnapshot { core, ext, ext2, audit_log }
     }
 
     /// Return the current creation fee.
@@ -3139,7 +3273,18 @@ impl SplitContract {
             .get(&platform_fee_bps_key())
             .unwrap_or(0u32);
 
-        let fee = (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        let is_waived = waivers.iter().any(|a| a == recipient);
+
+        let fee = if is_waived {
+            0
+        } else {
+            (proportional as u128 * platform_fee_bps as u128 / 10_000u128) as i128
+        };
         let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
         let payout = proportional - fee - tax;
 
@@ -3188,6 +3333,13 @@ impl SplitContract {
         let n = invoice.recipients.len();
         let mut total_fee: i128 = 0;
         let mut total_tax: i128 = 0;
+        
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        
         for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
@@ -3198,7 +3350,12 @@ impl SplitContract {
                 / (10000u128 * total as u128);
             let payout_raw = payout_raw as i128;
             if payout_raw > 0 {
-                let fee = (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                let is_waived = waivers.iter().any(|a| a == recipient);
+                let fee = if is_waived {
+                    0
+                } else {
+                    (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128
+                };
                 let tax = (payout_raw as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
                 let payout = payout_raw - fee - tax;
                 total_fee += fee;
@@ -3321,6 +3478,13 @@ impl SplitContract {
         let n = invoice.recipients.len();
         let mut total_fee: i128 = 0;
         let mut total_tax: i128 = 0;
+        
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        
         for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
@@ -3330,7 +3494,12 @@ impl SplitContract {
                 / (10_000u128 * total as u128);
             let payout_raw = payout_raw as i128;
             if payout_raw > 0 {
-                let fee = (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                let is_waived = waivers.iter().any(|a| a == recipient);
+                let fee = if is_waived {
+                    0
+                } else {
+                    (payout_raw as u128 * platform_fee_bps as u128 / 10_000u128) as i128
+                };
                 let tax = (payout_raw as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
                 let payout = payout_raw - fee - tax;
                 total_fee += fee;
@@ -3516,8 +3685,15 @@ impl SplitContract {
         let mut total_fee: i128 = 0;
         let mut total_tax: i128 = 0;
         let mut payouts: Vec<i128> = Vec::new(env);
+        
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        
         for i in 0..n {
-            let _recipient = invoice.recipients.get(i).unwrap();
+            let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
 
             // Issue: if split_rules are defined, compute payout from rule instead of amounts[].
@@ -3547,7 +3723,12 @@ impl SplitContract {
             total_tax += tax;
             let post_tax = proportional - tax;
 
-            let fee = (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+            let is_waived = waivers.iter().any(|a| a == recipient);
+            let fee = if is_waived {
+                0
+            } else {
+                (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128
+            };
             total_fee += fee;
 
             payouts.push_back(proportional);
@@ -3584,7 +3765,13 @@ impl SplitContract {
 
                 let tax = (proportional as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
                 let post_tax = proportional - tax;
-                let fee = (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128;
+                
+                let is_waived = waivers.iter().any(|a| a == recipient);
+                let fee = if is_waived {
+                    0
+                } else {
+                    (post_tax as u128 * platform_fee_bps as u128 / 10_000u128) as i128
+                };
                 let payout = post_tax - fee;
 
                 // Issue #41: if a swap token is configured for this recipient, invoke DEX swap.
