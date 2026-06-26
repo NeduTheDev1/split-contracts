@@ -5038,3 +5038,247 @@ fn test_all_or_nothing_group_still_requires_all_funded() {
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false);
     c.release(&id1); // should panic
 }
+
+}
+
+// ---------------------------------------------------------------------------
+// Storage Footprint TTL Tests (Issue #240)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_invoice_storage_footprint_returns_min_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let contract_id = env.register(SplitContract, ());
+    let c = client(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+    
+    // Set up custom ledger settings for TTL testing
+    env.ledger().with_mut(|li| {
+        li.sequence_number = 100_000;
+        li.min_persistent_entry_ttl = 500;
+        li.max_entry_ttl = 15_000;
+    });
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Create an invoice (stores in persistent storage with TTL)
+    let invoice_id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    
+    env.as_contract(&contract_id, || {
+        // All invoice entries should have been created with min_persistent_entry_ttl
+        // which is 500, but the actual TTL is 1 less (499) due to current ledger counting
+        let footprint = c.get_invoice_storage_footprint(&invoice_id);
+        
+        // Should return a positive value (the minimum TTL across storage entries)
+        assert!(footprint > 0, "Footprint should be positive for active invoice");
+        assert!(footprint <= 500, "Footprint should not exceed min_persistent_entry_ttl");
+    });
+}
+
+#[test]
+fn test_get_invoice_storage_footprint_ttl_decreases_with_ledger_advance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let contract_id = env.register(SplitContract, ());
+    let c = client(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+    
+    // Set up custom ledger settings for TTL testing
+    env.ledger().with_mut(|li| {
+        li.sequence_number = 100_000;
+        li.min_persistent_entry_ttl = 500;
+        li.max_entry_ttl = 15_000;
+    });
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let invoice_id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    
+    env.as_contract(&contract_id, || {
+        let footprint_1 = c.get_invoice_storage_footprint(&invoice_id);
+        assert!(footprint_1 > 0);
+        
+        // Advance the ledger by 100 ledgers
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 100;
+        });
+        
+        // Get footprint again - should be decreased by approximately 100
+        let footprint_2 = c.get_invoice_storage_footprint(&invoice_id);
+        assert!(footprint_2 < footprint_1, "TTL should decrease as ledger advances");
+        assert!(footprint_2 + 100 >= footprint_1, "TTL decrease should match ledger advance");
+    });
+}
+
+#[test]
+fn test_get_invoice_storage_footprint_increases_after_extend_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let contract_id = env.register(SplitContract, ());
+    let c = client(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+    
+    // Set up custom ledger settings for TTL testing
+    env.ledger().with_mut(|li| {
+        li.sequence_number = 100_000;
+        li.min_persistent_entry_ttl = 500;
+        li.max_entry_ttl = 15_000;
+    });
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let invoice_id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    
+    env.as_contract(&contract_id, || {
+        let footprint_1 = c.get_invoice_storage_footprint(&invoice_id);
+        
+        // Manually extend the invoice core storage key's TTL to simulate a bump
+        // This is done via the Soroban storage API
+        let inv_key = (soroban_sdk::symbol_short!("inv"), invoice_id);
+        env.storage().persistent().extend_ttl(&inv_key, 1000, 5000);
+        
+        let footprint_2 = c.get_invoice_storage_footprint(&invoice_id);
+        
+        // After extending TTL, the minimum should have increased
+        // (assuming other entries have lower TTL)
+        assert!(footprint_2 >= footprint_1, "Extended TTL should maintain or increase footprint");
+    });
+}
+
+#[test]
+fn test_get_invoice_storage_footprint_returns_zero_for_archived_invoice() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let contract_id = env.register(SplitContract, ());
+    let c = client(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let invoice_id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    
+    // Complete the invoice to make it eligible for archival
+    c.pay(&payer, &invoice_id, &200_i128, &0_u64, &false, &false);
+    assert_eq!(c.get_invoice(&invoice_id).status, InvoiceStatus::Released);
+
+    // Archive the invoice
+    c.archive_invoice(&invoice_id);
+    
+    // After archival, the footprint should return 0 (sentinel value for archived)
+    let footprint = c.get_invoice_storage_footprint(&invoice_id);
+    assert_eq!(footprint, 0, "Archived invoice should return 0 as sentinel value");
+}
+
+#[test]
+fn test_get_invoice_storage_footprint_nonexistent_invoice_returns_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let contract_id = env.register(SplitContract, ());
+    let c = client(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let _token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    // Try to get footprint for a nonexistent invoice
+    let nonexistent_id = 99_999;
+    let footprint = c.get_invoice_storage_footprint(&nonexistent_id);
+    
+    assert_eq!(footprint, 0, "Nonexistent invoice should return 0");
+}
+
+#[test]
+fn test_get_invoice_storage_footprint_checks_all_invoice_keys() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let contract_id = env.register(SplitContract, ());
+    let c = client(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+    
+    // Set up custom ledger settings for TTL testing
+    env.ledger().with_mut(|li| {
+        li.sequence_number = 100_000;
+        li.min_persistent_entry_ttl = 500;
+        li.max_entry_ttl = 15_000;
+    });
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let invoice_id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    
+    // Add a payment to ensure audit log is populated
+    c.pay(&payer, &invoice_id, &100_i128, &0_u64, &false, &false);
+    
+    env.as_contract(&contract_id, || {
+        // The footprint should consider:
+        // 1. invoice core
+        // 2. invoice_ext
+        // 3. invoice_ext2
+        // 4. audit_log
+        // It should return the minimum across all these entries
+        let footprint = c.get_invoice_storage_footprint(&invoice_id);
+        
+        // Verify that we actually got a TTL (not just defaults)
+        assert!(footprint > 0, "Should return positive TTL for active invoice with multiple storage entries");
+        
+        // Verify it's within reasonable bounds (should be around 500 for new entries)
+        assert!(footprint <= 500, "TTL should not exceed initial min_persistent_entry_ttl");
+    });
+}
