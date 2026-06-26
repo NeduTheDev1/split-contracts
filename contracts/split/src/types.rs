@@ -235,6 +235,8 @@ pub struct InvoiceOptions {
     pub scheduled_release_at: Option<u64>,
     /// KYC verification requirement.
     pub require_kyc: bool,
+    /// Fallback action to execute if no auto_resolve_rules match (Release, Refund, or None).
+    pub fallback_action: Option<ResolveAction>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -342,6 +344,7 @@ pub struct InvoiceExt {
     pub penalty_tiers: Vec<PenaltyTier>,
     pub allowed_callers: Option<Vec<Address>>,
     pub refund_grace_secs: Option<u64>,
+    pub fallback_action: Option<ResolveAction>,
 }
 
 #[contracttype]
@@ -472,6 +475,7 @@ pub struct Invoice {
     pub min_funding_amount: i128,
     pub priorities: Vec<u32>,
     pub clone_depth: u32,
+    pub fallback_action: Option<ResolveAction>,
 }
 
 impl Invoice {
@@ -542,6 +546,7 @@ impl Invoice {
                 penalty_tiers: self.penalty_tiers,
                 allowed_callers: self.allowed_callers,
                 refund_grace_secs: self.refund_grace_secs,
+                fallback_action: self.fallback_action,
             },
             InvoiceExt2 {
                 notification_contract: self.notification_contract,
@@ -625,6 +630,7 @@ impl Invoice {
             penalty_tiers: ext.penalty_tiers,
             allowed_callers: ext.allowed_callers,
             refund_grace_secs: ext.refund_grace_secs,
+            fallback_action: ext.fallback_action,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
@@ -837,6 +843,22 @@ impl Invoice {
             auto_resume_at: None,
             payment_cooldown_secs: None,
             max_payments_per_window: None,
+            payment_window_secs: None,
+            scheduled_release_at: None,
+            refund_grace_secs: None,
+            penalty_tiers: Vec::new(env),
+            allowed_callers: None,
+            notification_contract: None,
+            overflow_behavior: OverflowBehavior::Reject,
+            cross_chain_ref: None,
+            priorities: Vec::new(env),
+            forward_to: None,
+            forward_invoice_id: None,
+            parent_invoice_id: None,
+            clone_depth: 0,
+            fallback_action: None,
+        }
+    }   max_payments_per_window: None,
             payment_window_secs: None,
             scheduled_release_at: None,
             refund_grace_secs: None,

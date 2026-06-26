@@ -76,6 +76,7 @@ fn default_options(env: &Env) -> InvoiceOptions {
         priorities: Vec::new(env),
         require_kyc: false,
         scheduled_release_at: None,
+        fallback_action: None,
     }
 }
 
@@ -125,6 +126,7 @@ fn invoice_options(
         priorities: Vec::new(env),
         require_kyc: false,
         scheduled_release_at: None,
+        fallback_action: None,
     }
 }
 
@@ -5037,4 +5039,227 @@ fn test_all_or_nothing_group_still_requires_all_funded() {
     // Only id1 funded — id2 is not.
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false);
     c.release(&id1); // should panic
+}
+
+
+// ---------------------------------------------------------------------------
+// Fallback action for auto_resolve tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_auto_resolve_no_rules_match_fallback_refunds() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 50% rule (Release) but only 40% funded
+    // and fallback_action = Refund
+    let mut rules = Vec::new(&env);
+    rules.push_back(types::ResolveRule {
+        min_funded_bps: 5000, // 50%
+        action: types::ResolveAction::Release,
+    });
+    let mut opts = default_options(&env);
+    opts.auto_resolve_rules = rules;
+    opts.fallback_action = Some(types::ResolveAction::Refund);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay 40 (40% of 100)
+    c.pay(&payer, &id, &40_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 60);
+
+    // Call auto_resolve; should execute fallback_action (Refund)
+    c.auto_resolve(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+    assert_eq!(tk.balance(&payer), 100);
+}
+
+#[test]
+fn test_auto_resolve_no_rules_match_fallback_releases() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 80% rule (Release) but only 50% funded
+    // and fallback_action = Release
+    let mut rules = Vec::new(&env);
+    rules.push_back(types::ResolveRule {
+        min_funded_bps: 8000, // 80%
+        action: types::ResolveAction::Release,
+    });
+    let mut opts = default_options(&env);
+    opts.auto_resolve_rules = rules;
+    opts.fallback_action = Some(types::ResolveAction::Release);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay 50 (50% of 100)
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 50);
+
+    // Call auto_resolve; should execute fallback_action (Release)
+    c.auto_resolve(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 50);
+}
+
+#[test]
+fn test_auto_resolve_no_rules_match_no_fallback_is_noop() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 80% rule (Release) but only 50% funded
+    // and NO fallback_action
+    let mut rules = Vec::new(&env);
+    rules.push_back(types::ResolveRule {
+        min_funded_bps: 8000, // 80%
+        action: types::ResolveAction::Release,
+    });
+    let mut opts = default_options(&env);
+    opts.auto_resolve_rules = rules;
+    opts.fallback_action = None;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay 50 (50% of 100)
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 50);
+    assert_eq!(tk.balance(&recipient), 0);
+
+    // Call auto_resolve; should be a no-op (no rule matches, no fallback)
+    c.auto_resolve(&id);
+
+    // Invoice should still be Pending, payments unchanged
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 50);
+    assert_eq!(tk.balance(&recipient), 0);
+
+    // Calling auto_resolve again should still be a no-op (idempotent)
+    c.auto_resolve(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+}
+
+#[test]
+fn test_auto_resolve_rule_matches_ignores_fallback() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 50% rule (Release) and 50% funded
+    // and fallback_action = Refund (but should be ignored)
+    let mut rules = Vec::new(&env);
+    rules.push_back(types::ResolveRule {
+        min_funded_bps: 5000, // 50%
+        action: types::ResolveAction::Release,
+    });
+    let mut opts = default_options(&env);
+    opts.auto_resolve_rules = rules;
+    opts.fallback_action = Some(types::ResolveAction::Refund);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay exactly 50 (50% of 100)
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+    // Call auto_resolve; should execute the rule (Release), not fallback
+    c.auto_resolve(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 50);
+}
+
+#[test]
+fn test_auto_resolve_idempotency_second_call_noop() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with fallback_action = Release
+    let mut opts = default_options(&env);
+    opts.fallback_action = Some(types::ResolveAction::Release);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay 30 (30% of 100)
+    c.pay(&payer, &id, &30_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+    // First auto_resolve call executes fallback (Release)
+    c.auto_resolve(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 30);
+
+    // Second auto_resolve call should be a no-op (invoice not Pending)
+    // and not panic about "invoice is not pending"
+    c.auto_resolve(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 30); // unchanged
 }
