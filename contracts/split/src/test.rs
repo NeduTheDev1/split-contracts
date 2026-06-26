@@ -5034,3 +5034,63 @@ fn test_all_or_nothing_group_still_requires_all_funded() {
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false);
     c.release(&id1); // should panic
 }
+
+// ---------------------------------------------------------------------------
+// Escrow migration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_migrate_escrow_transfers_balance() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let new_contract = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Initialize with admin
+    let treasury = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    // Create a pending invoice with partial funds
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(c.get_invoice(&id).funded, 100);
+
+    // Check contract token balance before migration
+    let contract_balance_before = tk.balance(&contract_id);
+    assert_eq!(contract_balance_before, 100);
+
+    // Migrate escrow
+    c.migrate_escrow(&admin, &new_contract);
+
+    // Verify new contract received the funds
+    assert_eq!(tk.balance(&new_contract), 100);
+    assert_eq!(tk.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_migrate_escrow_zero_balance() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let new_contract = Address::generate(&env);
+
+    // Initialize with admin
+    let treasury = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    // No invoices with funds - migration should succeed with zero transfer
+    c.migrate_escrow(&admin, &new_contract);
+
+    let tk = token_client(&env, &token_id);
+    assert_eq!(tk.balance(&new_contract), 0);
+}

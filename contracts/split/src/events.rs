@@ -186,3 +186,13 @@ pub fn pending_payout_claimed(env: &Env, invoice_id: u64, recipient: &Address, a
         (recipient.clone(), amount),
     );
 }
+
+/// Emitted when escrow is migrated to a new contract.
+/// Topics: (split, escrow, migrated)
+/// Data: (total, new_contract)
+pub fn escrow_migrated(env: &Env, total: i128, new_contract: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("escrow"), symbol_short!("migrated")),
+        (total, new_contract.clone()),
+    );
+}

@@ -37,6 +37,9 @@ fn admin_key() -> Symbol {
 fn admins_key() -> Symbol {
     symbol_short!("admins")
 }
+fn pending_admin_key() -> Symbol {
+    symbol_short!("pd_adm")
+}
 fn paused_key() -> Symbol {
     symbol_short!("paused")
 }
@@ -478,6 +481,16 @@ fn is_paused(env: &Env) -> bool {
 
 fn require_not_paused(env: &Env) {
     assert!(!is_paused(env), "contract is paused");
+}
+
+fn require_admin(env: &Env) -> Address {
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&admin_key())
+        .expect("admin not set");
+    admin.require_auth();
+    admin
 }
 
 fn require_role(env: &Env, admin: &Address, min_role: AdminRole) {
@@ -1344,6 +1357,61 @@ impl SplitContract {
 
         let invoice = Invoice::from_legacy(legacy, &env);
         save_invoice(&env, invoice_id, &invoice);
+    }
+
+    /// Migrate all escrowed funds to a new contract address atomically.
+    ///
+    /// Iterates all active invoice IDs, sums their funded amounts, verifies
+    /// the total matches the actual token balance held by this contract, and
+    /// transfers everything to `new_contract`. Requires admin auth.
+    /// Panics if the calculated total does not match the actual token balance.
+    pub fn migrate_escrow(env: Env, admin: Address, new_contract: Address) {
+        let admin_addr = require_admin(&env);
+        let _ = admin;
+
+        let counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&counter_key())
+            .unwrap_or(0u64);
+
+        // Group funded amounts by token
+        let mut token_totals: Map<Address, i128> = Map::new(&env);
+        for id in 1u64..=counter {
+            if env.storage().persistent().has(&invoice_key(id))
+                || env.storage().instance().has(&invoice_key(id))
+            {
+                let invoice = load_invoice(&env, id);
+                if invoice.status == InvoiceStatus::Pending && invoice.funded > 0 {
+                    let token = invoice.tokens.get(0).expect("no token");
+                    let prev = token_totals.get(token.clone()).unwrap_or(0);
+                    token_totals.set(token, prev + invoice.funded);
+                }
+            }
+        }
+
+        // Verify and transfer for each token
+        let mut grand_total: i128 = 0;
+        for (token, total) in token_totals.iter() {
+            let token_client = token::Client::new(&env, &token);
+            let actual_balance: i128 =
+                token_client.balance(&env.current_contract_address());
+            assert!(
+                total == actual_balance,
+                "escrow balance mismatch for token"
+            );
+            if total > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &new_contract,
+                    &total,
+                );
+            }
+            grand_total += total;
+        }
+
+        events::escrow_migrated(&env, grand_total, &new_contract);
+        append_audit_entry(&env, 0, symbol_short!("migrate"), &admin_addr);
     }
 
     // -----------------------------------------------------------------------
