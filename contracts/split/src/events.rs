@@ -101,6 +101,36 @@ pub fn delegate_revoked(env: &Env, invoice_id: u64) {
     );
 }
 
+/// Emitted when NFT gate is set.
+/// Topics: (split, nft_gate)
+/// Data: (contract, admin)
+pub fn nft_gate_set(env: &Env, contract: &Option<Address>, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("nft_gate")),
+        (contract.clone(), admin.clone()),
+    );
+}
+
+/// Emitted when a timelock action is queued.
+/// Topics: (split, action_q, action_id)
+/// Data: (action, admin)
+pub fn action_queued(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("action_q"), action_id),
+        (action.clone(), admin.clone()),
+    );
+}
+
+/// Emitted when a timelock action is executed.
+/// Topics: (split, action_e, action_id)
+/// Data: action
+pub fn action_executed(env: &Env, action_id: u64, action: &TimelockAction) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("action_e"), action_id),
+        action.clone(),
+    );
+}
+
 /// Emitted when an invoice is partially released.
 /// Topics: (split, part_rel, invoice_id)
 /// Data: recipients
@@ -108,6 +138,56 @@ pub fn invoice_partially_released(env: &Env, invoice_id: u64, recipients: &Vec<A
     env.events().publish(
         (symbol_short!("split"), symbol_short!("part_rel"), invoice_id),
         recipients.clone(),
+    );
+}
+
+/// Emitted when a timelock action is cancelled.
+/// Topics: (split, action_c, action_id)
+/// Data: (action, admin)
+pub fn action_cancelled(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("action_c"), action_id),
+        (action.clone(), admin.clone()),
+    );
+}
+
+/// Emitted when an invoice is admin frozen.
+/// Topics: (split, admin_frz, invoice_id)
+/// Data: (admin, reason)
+pub fn invoice_admin_frozen(env: &Env, invoice_id: u64, admin: &Address, reason: &String) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("admin_frz"), invoice_id),
+        (admin.clone(), reason.clone()),
+    );
+}
+
+/// Emitted when an invoice is admin unfrozen.
+/// Topics: (split, adm_unfrz, invoice_id)
+/// Data: admin
+pub fn invoice_admin_unfrozen(env: &Env, invoice_id: u64, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("adm_unfrz"), invoice_id),
+        admin.clone(),
+    );
+}
+
+/// Emitted when a partial refund is issued.
+/// Topics: (split, part_ref, invoice_id)
+/// Data: (creator, bps, amount)
+pub fn partial_refund_issued(env: &Env, invoice_id: u64, creator: &Address, bps: u32, amount: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("part_ref"), invoice_id),
+        (creator.clone(), bps, amount),
+    );
+}
+
+/// Emitted when invoices are batch archived.
+/// Topics: (split, bat_arch)
+/// Data: (count, ids)
+pub fn batch_archived(env: &Env, count: u64, ids: &Vec<u64>) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("bat_arch")),
+        (count, ids.clone()),
     );
 }
 
@@ -187,12 +267,58 @@ pub fn pending_payout_claimed(env: &Env, invoice_id: u64, recipient: &Address, a
     );
 }
 
-/// Emitted when escrow is migrated to a new contract.
-/// Topics: (split, escrow, migrated)
-/// Data: (total, new_contract)
-pub fn escrow_migrated(env: &Env, total: i128, new_contract: &Address) {
+pub fn nft_gate_set(env: &Env, contract: &Option<Address>, admin: &Address) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("escrow"), symbol_short!("migrated")),
-        (total, new_contract.clone()),
+        (symbol_short!("split"), symbol_short!("nft_set")),
+        (contract.clone(), admin.clone()),
+    );
+}
+
+pub fn action_queued(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("tl_queue"), action_id),
+        (action.clone(), admin.clone()),
+    );
+}
+
+pub fn action_executed(env: &Env, action_id: u64, action: &TimelockAction) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("tl_exec"), action_id),
+        action.clone(),
+    );
+}
+
+pub fn action_cancelled(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("tl_cncl"), action_id),
+        (action.clone(), admin.clone()),
+    );
+}
+
+pub fn invoice_admin_frozen(env: &Env, invoice_id: u64, admin: &Address, reason: &String) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("adm_frz"), invoice_id),
+        (admin.clone(), reason.clone()),
+    );
+}
+
+pub fn invoice_admin_unfrozen(env: &Env, invoice_id: u64, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("adm_unf"), invoice_id),
+        admin.clone(),
+    );
+}
+
+pub fn batch_archived(env: &Env, count: u32, ids: &Vec<u64>) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("bat_arc")),
+        (count, ids.clone()),
+    );
+}
+
+pub fn partial_refund_issued(env: &Env, invoice_id: u64, creator: &Address, bps: u32, amount: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("prt_ref"), invoice_id),
+        (creator.clone(), bps, amount),
     );
 }
