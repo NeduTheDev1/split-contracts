@@ -472,6 +472,16 @@ pub struct Invoice {
     pub min_funding_amount: i128,
     pub priorities: Vec<u32>,
     pub clone_depth: u32,
+    /// Issue #196: invoice creation timestamp for spam deposit age calculation.
+    pub creation_timestamp: u64,
+    /// Issue #201: minimum payment increment - reject payments below this threshold.
+    pub min_payment_increment: i128,
+    /// Minimum funding amount required before invoice can be released.
+    pub min_funding_amount: i128,
+    /// Issue: per-recipient release priorities (parallel to recipients); empty = no ordering.
+    pub priorities: Vec<u32>,
+    /// Issue #188: admin can freeze an invoice.
+    pub admin_frozen: bool,
 }
 
 impl Invoice {
@@ -819,7 +829,6 @@ impl Invoice {
             smart_route: false,
             convert_to_stream: false,
             accepted_tokens: Vec::new(env),
-            require_kyc: false,
             arbiter: None,
             disputed: false,
             admin_frozen: false,
@@ -850,6 +859,7 @@ impl Invoice {
             clone_depth: 0,
             parent_invoice_id: None,
             priorities: Vec::new(env),
+            require_kyc: false,
         }
     }
 }
