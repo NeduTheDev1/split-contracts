@@ -5367,3 +5367,199 @@ fn test_non_disputed_invoice_unaffected_by_dispute_logic() {
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
     assert_eq!(tk.balance(&payer), 100);
 }
+
+
+#[test]
+fn test_substitute_recipient_no_cosigners() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let old_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &old_recipient, 100, &token_id, 2_000);
+
+    // Pay partial amount
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    // Substitute recipient (no co-signers, creator auth alone)
+    c.substitute_recipient(&creator, &id, &old_recipient, &new_recipient);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.recipients.get(0), Some(new_recipient.clone()));
+
+    // Release to new recipient
+    c.release(&creator, &id);
+    assert_eq!(tk.balance(&new_recipient), 50);
+    assert_eq!(tk.balance(&old_recipient), 0);
+}
+
+#[test]
+#[should_panic(expected = "recipient not found")]
+fn test_substitute_recipient_not_found() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let old_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+    let not_a_recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &old_recipient, 100, &token_id, 2_000);
+
+    // Try to substitute a non-existent recipient
+    c.substitute_recipient(&creator, &id, &not_a_recipient, &new_recipient);
+}
+
+#[test]
+#[should_panic(expected = "insufficient approvals for recipient substitution")]
+fn test_substitute_recipient_with_cosigners_requires_approvals() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let cosigner1 = Address::generate(&env);
+    let cosigner2 = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let old_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(cosigner1.clone());
+    signers.push_back(cosigner2.clone());
+    opts.co_signers = signers;
+    opts.required_signatures = 2;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(old_recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000_u64, &opts);
+
+    // Pay partial amount
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    // Try to substitute without approvals (should panic)
+    c.substitute_recipient(&creator, &id, &old_recipient, &new_recipient);
+}
+
+#[test]
+fn test_substitute_recipient_with_cosigners_after_approvals() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let cosigner1 = Address::generate(&env);
+    let cosigner2 = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let old_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(cosigner1.clone());
+    signers.push_back(cosigner2.clone());
+    opts.co_signers = signers;
+    opts.required_signatures = 2;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(old_recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000_u64, &opts);
+
+    // Pay partial amount
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    // Get the required signatures (2)
+    // Get co-signers to approve the substitution
+    c.approve_substitute_recipient(&id, &cosigner1);
+    c.approve_substitute_recipient(&id, &cosigner2);
+
+    // Now substitute should succeed
+    c.substitute_recipient(&creator, &id, &old_recipient, &new_recipient);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.recipients.get(0), Some(new_recipient.clone()));
+
+    // Release to new recipient
+    c.release(&creator, &id);
+    assert_eq!(tk.balance(&new_recipient), 50);
+    assert_eq!(tk.balance(&old_recipient), 0);
+}
+
+#[test]
+#[should_panic(expected = "not a co-signer for this invoice")]
+fn test_approve_substitute_recipient_not_cosigner() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let cosigner = Address::generate(&env);
+    let not_a_cosigner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(cosigner.clone());
+    opts.co_signers = signers;
+    opts.required_signatures = 1;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000_u64, &opts);
+
+    // Non-cosigner tries to approve
+    c.approve_substitute_recipient(&id, &not_a_cosigner);
+}
+
+#[test]
+#[should_panic(expected = "co-signer has already approved substitution")]
+fn test_approve_substitute_recipient_duplicate_approval() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let cosigner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(cosigner.clone());
+    opts.co_signers = signers;
+    opts.required_signatures = 1;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000_u64, &opts);
+
+    // Approve once
+    c.approve_substitute_recipient(&id, &cosigner);
+
+    // Try to approve again (should panic)
+    c.approve_substitute_recipient(&id, &cosigner);
+}

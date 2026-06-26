@@ -365,6 +365,8 @@ pub struct InvoiceExt2 {
     pub min_payment: i128,
     pub min_funding_amount: i128,
     pub priorities: Vec<u32>,
+    /// Issue #230: co-signers who have approved the pending recipient substitution.
+    pub substitute_recipient_approvals: Vec<Address>,
 }
 
 /// Issue #211: A single escalating penalty tier (seconds_after_deadline, bps).
@@ -476,6 +478,8 @@ pub struct Invoice {
     pub priorities: Vec<u32>,
     pub clone_depth: u32,
     pub fallback_action: Option<ResolveAction>,
+    /// Issue #230: co-signers who have approved the pending recipient substitution.
+    pub substitute_recipient_approvals: Vec<Address>,
 }
 
 impl Invoice {
@@ -562,6 +566,7 @@ impl Invoice {
                 min_payment: self.min_payment,
                 min_funding_amount: self.min_funding_amount,
                 priorities: self.priorities,
+                substitute_recipient_approvals: Vec::new(self.notification_contract.env()),
             },
         )
     }
