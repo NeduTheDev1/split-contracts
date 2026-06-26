@@ -76,6 +76,7 @@ fn default_options(env: &Env) -> InvoiceOptions {
         priorities: Vec::new(env),
         require_kyc: false,
         scheduled_release_at: None,
+        external_prerequisite: None,
     }
 }
 
@@ -5484,4 +5485,154 @@ fn test_creator_self_limit_with_admin_cap() {
         make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999)
     }));
     assert!(err_result.is_err(), "Expected panic when exceeding self limit");
+}
+
+
+// ---------------------------------------------------------------------------
+// Cross-Contract Prerequisites Tests (Issue #242)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cross_contract_prerequisite_blocks_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Deploy two contract instances
+    let contract1_id = env.register(SplitContract, ());
+    let contract2_id = env.register(SplitContract, ());
+    
+    let c1 = client(&env, &contract1_id);
+    let c2 = client(&env, &contract2_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+
+    let creator1 = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+
+    let creator2 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &500);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &500);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create a prerequisite invoice on contract1
+    let prereq_id = make_invoice(&env, &c1, &creator1, &recipient1, 200, &token_id, 9_999);
+
+    // Create an invoice on contract2 with external prerequisite pointing to contract1
+    let mut opts = default_options(&env);
+    opts.external_prerequisite = Some((contract1_id.clone(), prereq_id));
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let invoice_id = c2.create_invoice(
+        &creator2, &recipients, &amounts, &token_id, &9_999_u64, &opts,
+    );
+
+    // Fund the contract2 invoice
+    c2.pay(&payer2, &invoice_id, &200_i128, &0_u64, &false, &false);
+
+    // Try to release contract2 invoice - should fail because prerequisite on contract1 is not released
+    let release_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c2.release(&invoice_id);
+    }));
+    assert!(release_result.is_err(), "Expected panic when external prerequisite not released");
+
+    // Now fund and release the prerequisite invoice on contract1
+    c1.pay(&payer1, &prereq_id, &200_i128, &0_u64, &false, &false);
+    assert_eq!(c1.get_invoice(&prereq_id).status, InvoiceStatus::Released);
+
+    // Now releasing contract2 invoice should succeed
+    c2.release(&invoice_id);
+    assert_eq!(c2.get_invoice(&invoice_id).status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_cross_contract_prerequisite_succeeds_after_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract1_id = env.register(SplitContract, ());
+    let contract2_id = env.register(SplitContract, ());
+    
+    let c1 = client(&env, &contract1_id);
+    let c2 = client(&env, &contract2_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+
+    let creator1 = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+
+    let creator2 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &500);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &500);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create and immediately release prerequisite invoice on contract1
+    let prereq_id = make_invoice(&env, &c1, &creator1, &recipient1, 200, &token_id, 9_999);
+    c1.pay(&payer1, &prereq_id, &200_i128, &0_u64, &false, &false);
+    assert_eq!(c1.get_invoice(&prereq_id).status, InvoiceStatus::Released);
+
+    // Create invoice on contract2 with external prerequisite
+    let mut opts = default_options(&env);
+    opts.external_prerequisite = Some((contract1_id.clone(), prereq_id));
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let invoice_id = c2.create_invoice(
+        &creator2, &recipients, &amounts, &token_id, &9_999_u64, &opts,
+    );
+
+    // Fund contract2 invoice
+    c2.pay(&payer2, &invoice_id, &200_i128, &0_u64, &false, &false);
+
+    // Release should succeed immediately since prerequisite is already released
+    c2.release(&invoice_id);
+    assert_eq!(c2.get_invoice(&invoice_id).status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_local_only_invoice_unaffected_by_external_prerequisite() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Create normal invoice without external prerequisite
+    let invoice_id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    // Fund and release - should work fine
+    c.pay(&payer, &invoice_id, &200_i128, &0_u64, &false, &false);
+    c.release(&invoice_id);
+    
+    assert_eq!(c.get_invoice(&invoice_id).status, InvoiceStatus::Released);
 }
