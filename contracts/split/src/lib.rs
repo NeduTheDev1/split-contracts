@@ -362,6 +362,27 @@ fn creator_volume_used_key(creator: &Address) -> (Symbol, Address) {
     (symbol_short!("cr_v_use"), creator.clone())
 }
 
+/// Issue #241: Per-creator self-imposed daily spending limit.
+fn creator_self_limit_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cr_slf_lim"), creator.clone())
+}
+
+/// Issue #241: Per-creator self-imposed daily spending used (for the current day).
+fn creator_self_used_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cr_slf_use"), creator.clone())
+}
+
+/// Issue #241: Per-creator last day timestamp when self-limit was checked/reset.
+fn creator_self_limit_day_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cr_slf_day"), creator.clone())
+}
+
+/// Issue #241: Per-creator pending raise request for self-limit.
+/// Stores the new limit amount that's waiting to be executed after timelock.
+fn creator_self_limit_raise_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cr_slf_rse"), creator.clone())
+}
+
 fn fee_tiers_key() -> Symbol {
     symbol_short!("fee_trs")
 }
@@ -993,6 +1014,133 @@ impl SplitContract {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #241: Creator self-imposed spending limit
+    // -----------------------------------------------------------------------
+
+    /// Set or lower a self-imposed daily spending limit for the caller (creator).
+    /// Requires the creator's own auth. Can only lower the limit immediately.
+    /// To raise the limit, use request_raise_self_limit() + timelock.
+    ///
+    /// A limit of 0 means no self-imposed limit (unrestricted).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `creator` - The creator address (must authenticate)
+    /// * `new_limit` - The new daily spending limit (must be >= 0)
+    pub fn set_self_limit(env: Env, creator: Address, new_limit: i128) {
+        creator.require_auth();
+        assert!(new_limit >= 0, "self limit must be non-negative");
+
+        let current_limit: i128 = env
+            .storage()
+            .persistent()
+            .get(&creator_self_limit_key(&creator))
+            .unwrap_or(0);
+
+        // Allow immediate lowering or setting from 0
+        if current_limit > 0 {
+            assert!(
+                new_limit <= current_limit,
+                "cannot raise limit directly; use request_raise_self_limit()"
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&creator_self_limit_key(&creator), &new_limit);
+
+        // Reset the daily usage counter when changing the limit
+        env.storage()
+            .persistent()
+            .set(&creator_self_used_key(&creator), &0i128);
+
+        append_audit_entry(&env, 0, symbol_short!("slf_lim"), &creator);
+    }
+
+    /// Request to raise the creator's self-imposed daily spending limit.
+    /// This queues a timelocked action. Once the timelock expires,
+    /// execute_action() must be called to apply the new limit.
+    ///
+    /// Requires the creator's own auth.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `creator` - The creator address (must authenticate)
+    /// * `new_limit` - The desired new limit (must be > current limit)
+    ///
+    /// # Returns
+    /// The action_id of the queued raise request.
+    pub fn request_raise_self_limit(env: Env, creator: Address, new_limit: i128) -> u64 {
+        creator.require_auth();
+        assert!(new_limit >= 0, "new limit must be non-negative");
+
+        let current_limit: i128 = env
+            .storage()
+            .persistent()
+            .get(&creator_self_limit_key(&creator))
+            .unwrap_or(0);
+
+        assert!(
+            new_limit > current_limit,
+            "new limit must be higher than current limit"
+        );
+
+        // Queue the timelock action using the existing timelock mechanism
+        let action = TimelockAction::RaiseCreatorSelfLimit(creator.clone(), new_limit);
+        
+        // Get and increment the action counter
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&timelock_action_counter_key())
+            .unwrap_or(0u64);
+        counter = counter.checked_add(1).expect("action counter overflow");
+
+        let now = env.ledger().timestamp();
+        let queued = QueuedAction {
+            action,
+            queued_at: now,
+            executed: false,
+        };
+
+        env.storage().persistent().set(&timelock_action_key(counter), &queued);
+        env.storage().persistent().set(&timelock_action_counter_key(), &counter);
+
+        append_audit_entry(&env, 0, symbol_short!("req_rse"), &creator);
+
+        counter
+    }
+
+    /// Get the current self-imposed daily spending limit for a creator (0 = no limit).
+    pub fn get_self_limit(env: Env, creator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&creator_self_limit_key(&creator))
+            .unwrap_or(0)
+    }
+
+    /// Get the amount of the daily spending limit used so far for a creator.
+    pub fn get_self_limit_used(env: Env, creator: Address) -> i128 {
+        let today_start = (env.ledger().timestamp() / 86_400) * 86_400;
+
+        let last_day: u64 = env
+            .storage()
+            .persistent()
+            .get(&creator_self_limit_day_key(&creator))
+            .unwrap_or(0);
+
+        // If we're in a new day, reset the counter
+        if last_day != today_start {
+            return 0;
+        }
+
+        env.storage()
+            .persistent()
+            .get(&creator_self_used_key(&creator))
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
     // Issue #188: Dispute arbitration
     // -----------------------------------------------------------------------
 
@@ -1467,6 +1615,17 @@ impl SplitContract {
             TimelockAction::SetPlatformFee(new_fee) => {
                 assert!(*new_fee <= 10_000, "platform_fee_bps must be ≤ 10000");
                 env.storage().instance().set(&platform_fee_bps_key(), new_fee);
+            }
+            TimelockAction::RaiseCreatorSelfLimit(creator, new_limit) => {
+                // Issue #241: Apply the raise to the self-limit
+                env.storage()
+                    .persistent()
+                    .set(&creator_self_limit_key(creator), new_limit);
+                
+                // Reset daily usage when limit is raised
+                env.storage()
+                    .persistent()
+                    .set(&creator_self_used_key(creator), &0i128);
             }
         }
 

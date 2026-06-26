@@ -378,6 +378,8 @@ pub struct PenaltyTier {
 pub enum TimelockAction {
     SetTreasury(Address),
     SetPlatformFee(u32),
+    /// Issue #241: Creator self-imposed limit raise request.
+    RaiseCreatorSelfLimit(Address, i128),
 }
 
 /// A queued timelock action with metadata.
