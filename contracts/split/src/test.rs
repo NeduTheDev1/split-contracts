@@ -5263,3 +5263,107 @@ fn test_auto_resolve_idempotency_second_call_noop() {
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
     assert_eq!(tk.balance(&recipient), 30); // unchanged
 }
+
+#[test]
+#[should_panic(expected = "invoice under dispute")]
+fn test_refund_blocked_when_disputed() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    
+    // Set arbiter so disputes can be raised
+    let admin = Address::generate(&env);
+    c.set_arbiter(&admin, &id, &arbiter);
+    
+    // Pay 100
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Raise dispute
+    c.raise_dispute(&id, &arbiter);
+    assert!(c.get_invoice(&id).disputed);
+
+    // Move time far past deadline
+    env.ledger().set_timestamp(10_000);
+
+    // Attempt refund should panic with "invoice under dispute"
+    // even though deadline has long since passed
+    c.refund(&id);
+}
+
+#[test]
+fn test_refund_allowed_after_dispute_resolved() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    
+    // Set arbiter
+    let admin = Address::generate(&env);
+    c.set_arbiter(&admin, &id, &arbiter);
+    
+    // Pay 100
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Raise dispute
+    c.raise_dispute(&id, &arbiter);
+    assert!(c.get_invoice(&id).disputed);
+
+    // Resolve the dispute with Refund
+    c.resolve_dispute(&id, &arbiter, types::ResolveAction::Refund);
+    
+    // Verify invoice is now Refunded and balance restored
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+    assert!(!c.get_invoice(&id).disputed);
+    assert_eq!(tk.balance(&payer), 100);
+}
+
+#[test]
+fn test_non_disputed_invoice_unaffected_by_dispute_logic() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice without setting an arbiter
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    
+    // Pay 100
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Verify invoice is not disputed
+    assert!(!c.get_invoice(&id).disputed);
+
+    // Move time past deadline
+    env.ledger().set_timestamp(3_000);
+
+    // Refund should work normally (no dispute check impacts it)
+    c.refund(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+    assert_eq!(tk.balance(&payer), 100);
+}

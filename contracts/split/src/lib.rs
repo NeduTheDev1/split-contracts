@@ -4380,10 +4380,9 @@ impl SplitContract {
         require_not_paused(&env);
         let mut invoice = load_invoice(&env, invoice_id);
 
-        assert!(
-            invoice.status == InvoiceStatus::Pending,
-            "invoice is not pending"
-        );
+        if invoice.status != InvoiceStatus::Pending {
+            return;
+        }
         assert!(!invoice.disputed, "invoice is disputed");
 
         let total: i128 = invoice.amounts.iter().sum();
@@ -4553,6 +4552,10 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
+        
+        // Issue #229: Freeze deadline clock during active dispute.
+        // Refund is blocked entirely while disputed, regardless of deadline advancement.
+        assert!(!invoice.disputed, "invoice under dispute");
 
         // Check grace period if configured
         let refund_deadline = if let Some(grace_secs) = invoice.refund_grace_secs {
