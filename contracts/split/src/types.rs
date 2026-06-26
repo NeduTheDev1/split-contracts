@@ -235,6 +235,8 @@ pub struct InvoiceOptions {
     pub scheduled_release_at: Option<u64>,
     /// KYC verification requirement.
     pub require_kyc: bool,
+    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
+    pub external_prerequisite: Option<(Address, u64)>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -342,6 +344,8 @@ pub struct InvoiceExt {
     pub penalty_tiers: Vec<PenaltyTier>,
     pub allowed_callers: Option<Vec<Address>>,
     pub refund_grace_secs: Option<u64>,
+    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
+    pub external_prerequisite: Option<(Address, u64)>,
 }
 
 #[contracttype]

@@ -481,6 +481,7 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             penalty_tiers: Vec::new(env),
             allowed_callers: None,
             refund_grace_secs: None,
+            external_prerequisite: None,
         });
     let ext2: InvoiceExt2 = env.storage().persistent()
         .get(&invoice_ext2_key(id))
@@ -1462,6 +1463,7 @@ impl SplitContract {
                         penalty_tiers: Vec::new(&env),
                         allowed_callers: None,
                         refund_grace_secs: None,
+                        external_prerequisite: None,
                     })
             });
         let ext2: types::InvoiceExt2 = env
@@ -1838,6 +1840,7 @@ impl SplitContract {
             options.priorities,
             options.require_kyc,
             options.scheduled_release_at,
+            options.external_prerequisite,
         )
     }
 
@@ -1888,6 +1891,7 @@ impl SplitContract {
         priorities: Vec<u32>,
         require_kyc: bool,
         scheduled_release_at: Option<u64>,
+        external_prerequisite: Option<(Address, u64)>,
     ) -> u64 {
         assert!(
             recipients.len() == amounts.len(),
@@ -2193,6 +2197,7 @@ impl SplitContract {
             allowed_callers: None,
             admin_frozen: false,
             min_funding_amount: 0,
+            external_prerequisite,
         };
 
         save_invoice(env, id, &invoice);
@@ -2325,6 +2330,7 @@ impl SplitContract {
                 Vec::new(&env), // priorities
                 false, // require_kyc
                 None, // scheduled_release_at
+                None, // external_prerequisite
             );
             ids.push_back(id);
         }
@@ -2399,6 +2405,7 @@ impl SplitContract {
             Vec::new(&env), // priorities
             false, // require_kyc
             None, // scheduled_release_at
+            None, // external_prerequisite
         );
 
         if months > 1 {
@@ -3430,6 +3437,19 @@ impl SplitContract {
             );
         }
 
+        // Issue #242: External prerequisite check via cross-contract call.
+        if let Some((external_contract, external_invoice_id)) = &invoice.external_prerequisite {
+            let external_core: InvoiceCore = env.invoke_contract(
+                external_contract,
+                &Symbol::new(&env, "get_invoice"),
+                (external_invoice_id,).into_val(&env),
+            );
+            assert!(
+                external_core.status == InvoiceStatus::Released,
+                "external prerequisite not released"
+            );
+        }
+
         // Group constraint: check according to group mode before allowing release.
         if let Some(group_id) = env
             .storage()
@@ -3492,6 +3512,19 @@ impl SplitContract {
         if let Some(prereq_id) = invoice.prerequisite_id {
             let prereq = load_invoice(&env, prereq_id);
             assert!(prereq.status == InvoiceStatus::Released, "prerequisite not released");
+        }
+
+        // Issue #242: External prerequisite check via cross-contract call.
+        if let Some((external_contract, external_invoice_id)) = &invoice.external_prerequisite {
+            let external_core: InvoiceCore = env.invoke_contract(
+                external_contract,
+                &Symbol::new(&env, "get_invoice"),
+                (external_invoice_id,).into_val(&env),
+            );
+            assert!(
+                external_core.status == InvoiceStatus::Released,
+                "external prerequisite not released"
+            );
         }
 
         // Co-signer approval check
@@ -4751,6 +4784,7 @@ impl SplitContract {
                 Vec::new(env), // priorities
                 false, // require_kyc
                 None, // scheduled_release_at
+                None, // external_prerequisite
             );
             env.storage()
                 .persistent()
@@ -5511,6 +5545,7 @@ impl SplitContract {
             old_invoice.priorities.clone(),
             old_invoice.require_kyc,
             old_invoice.scheduled_release_at,
+            old_invoice.external_prerequisite.clone(),
         );
 
         // Copy payments from shards to new invoice (issue #177).
@@ -5780,6 +5815,7 @@ impl SplitContract {
             Vec::new(&env), // priorities
             false, // require_kyc
             None, // scheduled_release_at
+            None, // external_prerequisite
         )
     }
 
@@ -6279,7 +6315,7 @@ impl SplitContract {
                 velocity_window: 0, parent_invoice_id: None, pause_reason: None, auto_resume_at: None,
                 payment_cooldown_secs: None, max_payments_per_window: None, payment_window_secs: None,
                 scheduled_release_at: None, refund_grace_secs: None,
-                penalty_tiers: Vec::new(&env), allowed_callers: None,
+                penalty_tiers: Vec::new(&env), allowed_callers: None, external_prerequisite: None,
             });
         let ext2: InvoiceExt2 = env.storage().persistent()
             .get(&invoice_ext2_key(invoice_id))
@@ -6333,7 +6369,7 @@ impl SplitContract {
                         velocity_window: 0, parent_invoice_id: None, pause_reason: None, auto_resume_at: None,
                         payment_cooldown_secs: None, max_payments_per_window: None, payment_window_secs: None,
                         scheduled_release_at: None, refund_grace_secs: None,
-                        penalty_tiers: Vec::new(&env), allowed_callers: None,
+                        penalty_tiers: Vec::new(&env), allowed_callers: None, external_prerequisite: None,
                     });
                 let ext2: InvoiceExt2 = env.storage().persistent()
                     .get(&invoice_ext2_key(id))
