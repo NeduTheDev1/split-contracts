@@ -242,3 +242,13 @@ pub fn partial_refund_issued(env: &Env, invoice_id: u64, creator: &Address, bps:
         (creator.clone(), bps, amount),
     );
 }
+
+/// Emitted when a refund encounters insufficient balance and partial refunds are distributed.
+/// Topics: (split, ref_short, invoice_id)
+/// Data: shortfall_amount
+pub fn refund_shortfall(env: &Env, invoice_id: u64, shortfall_amount: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("ref_short"), invoice_id),
+        shortfall_amount,
+    );
+}
