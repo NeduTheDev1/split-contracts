@@ -229,6 +229,9 @@ pub struct InvoiceOptions {
     pub priorities: Vec<u32>,
     /// Issue #199: grace period in seconds after deadline before refund is allowed.
     pub refund_grace_secs: Option<u64>,
+    /// Issue #201: minimum payment increment - reject payments below this threshold.
+    /// Independent of min_payment accumulator. None/0 disables.
+    pub min_payment_increment: Option<i128>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -332,6 +335,10 @@ pub struct InvoiceExt {
     pub payment_cooldown_secs: Option<u64>,
     pub max_payments_per_window: Option<u32>,
     pub payment_window_secs: Option<u64>,
+    /// Issue #199: grace period in seconds after deadline before refund is allowed.
+    pub refund_grace_secs: Option<u64>,
+    /// Issue #188: admin can freeze an invoice.
+    pub admin_frozen: bool,
 }
 
 #[contracttype]
@@ -349,6 +356,14 @@ pub struct InvoiceExt2 {
     pub auction_end: u64,
     pub bids: Vec<Bid>,
     pub min_payment: i128,
+    /// Issue #196: invoice creation timestamp for spam deposit age calculation.
+    pub creation_timestamp: u64,
+    /// Issue #201: minimum payment increment - reject payments below this threshold.
+    pub min_payment_increment: i128,
+    /// Minimum funding amount required before invoice can be released.
+    pub min_funding_amount: i128,
+    /// Issue: per-recipient release priorities (parallel to recipients); empty = no ordering.
+    pub priorities: Vec<u32>,
 }
 
 /// Timelocked admin action queued for future execution.
@@ -442,6 +457,16 @@ pub struct Invoice {
     pub bids: Vec<Bid>,
     pub min_payment: i128,
     pub clone_depth: u32,
+    /// Issue #196: invoice creation timestamp for spam deposit age calculation.
+    pub creation_timestamp: u64,
+    /// Issue #201: minimum payment increment - reject payments below this threshold.
+    pub min_payment_increment: i128,
+    /// Minimum funding amount required before invoice can be released.
+    pub min_funding_amount: i128,
+    /// Issue: per-recipient release priorities (parallel to recipients); empty = no ordering.
+    pub priorities: Vec<u32>,
+    /// Issue #188: admin can freeze an invoice.
+    pub admin_frozen: bool,
 }
 
 impl Invoice {
@@ -508,6 +533,8 @@ impl Invoice {
                 payment_cooldown_secs: self.payment_cooldown_secs,
                 max_payments_per_window: self.max_payments_per_window,
                 payment_window_secs: self.payment_window_secs,
+                refund_grace_secs: self.refund_grace_secs,
+                admin_frozen: self.admin_frozen,
             },
             InvoiceExt2 {
                 notification_contract: self.notification_contract,
@@ -520,6 +547,10 @@ impl Invoice {
                 auction_end: self.auction_end,
                 bids: self.bids,
                 min_payment: self.min_payment,
+                creation_timestamp: self.creation_timestamp,
+                min_payment_increment: self.min_payment_increment,
+                min_funding_amount: self.min_funding_amount,
+                priorities: self.priorities,
             },
         )
     }
@@ -584,6 +615,8 @@ impl Invoice {
             payment_cooldown_secs: ext.payment_cooldown_secs,
             max_payments_per_window: ext.max_payments_per_window,
             payment_window_secs: ext.payment_window_secs,
+            refund_grace_secs: ext.refund_grace_secs,
+            admin_frozen: ext.admin_frozen,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
@@ -594,6 +627,10 @@ impl Invoice {
             auction_end: ext2.auction_end,
             bids: ext2.bids,
             min_payment: ext2.min_payment,
+            creation_timestamp: ext2.creation_timestamp,
+            min_payment_increment: ext2.min_payment_increment,
+            min_funding_amount: ext2.min_funding_amount,
+            priorities: ext2.priorities,
         }
     }
 }
@@ -752,13 +789,15 @@ impl Invoice {
             smart_route: false,
             convert_to_stream: false,
             accepted_tokens: Vec::new(env),
-            require_kyc: false,
             arbiter: None,
             disputed: false,
             auction_on_expiry: false,
             auction_end: 0,
             bids: Vec::new(env),
             min_payment: 0,
+            creation_timestamp: 0,
+            min_payment_increment: 0,
+            min_funding_amount: 0,
             split_rules: Vec::new(env),
             auto_resolve_rules: Vec::new(env),
             creator_cosigner: None,
@@ -770,6 +809,7 @@ impl Invoice {
             max_payments_per_window: None,
             payment_window_secs: None,
             refund_grace_secs: None,
+            admin_frozen: false,
             forward_to: None,
             forward_invoice_id: None,
             notification_contract: None,
@@ -778,6 +818,7 @@ impl Invoice {
             clone_depth: 0,
             parent_invoice_id: None,
             priorities: Vec::new(env),
+            require_kyc: false,
         }
     }
 }
