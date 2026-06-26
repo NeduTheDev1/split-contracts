@@ -5747,6 +5747,49 @@ impl SplitContract {
         recomputed_hash == proof.proof_hash
     }
 
+    /// Issue #231: Batch verify multiple payment proofs in a single call.
+    /// Reduces the number of contract calls needed for off-chain reconciliation.
+    /// Returns a Vec of booleans in the same order as the input proofs.
+    /// A single invalid proof does not prevent verification of others.
+    /// Capped at 20 proofs per call.
+    pub fn verify_payment_proofs_batch(env: Env, proofs: Vec<PaymentProof>) -> Vec<bool> {
+        assert!(proofs.len() <= 20, "batch limit exceeded");
+
+        let mut results = Vec::new(&env);
+
+        for proof in proofs.iter() {
+            // Return false if invoice doesn't exist
+            let invoice = if env.storage().persistent().has(&invoice_key(proof.invoice_id)) 
+                || env.storage().instance().has(&invoice_key(proof.invoice_id)) {
+                load_invoice(&env, proof.invoice_id)
+            } else {
+                results.push_back(false);
+                continue;
+            };
+
+            // Recompute the current total for the payer
+            let current_total: i128 = invoice
+                .payments
+                .iter()
+                .filter(|p| p.payer == proof.payer)
+                .map(|p| p.amount + p.tip)
+                .sum();
+
+            // Recompute the hash using the current total
+            let mut preimage = [0u8; 24];
+            preimage[..8].copy_from_slice(&proof.invoice_id.to_be_bytes());
+            preimage[8..24].copy_from_slice(&current_total.to_be_bytes());
+
+            let bytes = Bytes::from_array(&env, &preimage);
+            let recomputed_hash: BytesN<32> = env.crypto().sha256(&bytes).into();
+
+            // Compare with the proof's hash and add result
+            results.push_back(recomputed_hash == proof.proof_hash);
+        }
+
+        results
+    }
+
     /// Return all invoice IDs that include `recipient` as a recipient (issue #40).
     pub fn get_recipient_invoice_ids(env: Env, recipient: Address) -> Vec<u64> {
         env.storage()
