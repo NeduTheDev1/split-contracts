@@ -6462,4 +6462,74 @@ impl SplitContract {
             .get::<_, PaymentCertificate>(&cert_key(invoice_id))
             .expect("certificate not found")
     }
+
+    /// Returns the minimum remaining TTL (in ledgers) across an invoice's storage entries.
+    ///
+    /// This function inspects the TTL of the following storage keys for a given invoice:
+    /// - invoice core (persistent storage)
+    /// - invoice_ext (persistent storage)
+    /// - invoice_ext2 (persistent storage)
+    /// - audit_log (persistent storage)
+    ///
+    /// Returns the smallest TTL found across these entries, which represents the
+    /// remaining "rent budget" for the invoice.
+    ///
+    /// For archived invoices (stored in instance storage instead of persistent),
+    /// returns 0 as a sentinel value indicating the invoice is archived.
+    ///
+    /// This is a pure view function requiring no authentication.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `invoice_id` - The ID of the invoice to check
+    ///
+    /// # Returns
+    /// The minimum TTL in ledgers across the invoice's entries, or 0 if archived.
+    pub fn get_invoice_storage_footprint(env: Env, invoice_id: u64) -> u32 {
+        let storage = env.storage();
+        
+        // List of storage keys to check for this invoice
+        let keys_to_check = [
+            invoice_key(invoice_id),
+            invoice_ext_key(invoice_id),
+            invoice_ext2_key(invoice_id),
+            audit_log_key(invoice_id),
+        ];
+        
+        let mut min_ttl: Option<u32> = None;
+        let mut found_any = false;
+        
+        // Check each persistent storage key
+        for key in &keys_to_check {
+            if storage.persistent().has(key) {
+                found_any = true;
+                if let Some(ttl) = storage.persistent().get_ttl(key) {
+                    match min_ttl {
+                        None => min_ttl = Some(ttl),
+                        Some(current_min) => {
+                            if ttl < current_min {
+                                min_ttl = Some(ttl);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // If we didn't find any persistent entries, check instance storage
+        // (indicates the invoice is archived)
+        if !found_any {
+            for key in &keys_to_check {
+                if storage.instance().has(key) {
+                    // Invoice is archived (in instance storage)
+                    return 0;
+                }
+            }
+            // Invoice not found at all - also return 0
+            return 0;
+        }
+        
+        // Return the minimum TTL found, or 0 if none were found
+        min_ttl.unwrap_or(0)
+    }
 }
