@@ -77,6 +77,7 @@ fn default_options(env: &Env) -> InvoiceOptions {
         require_kyc: false,
         scheduled_release_at: None,
         fallback_action: None,
+        external_prerequisite: None,
     }
 }
 
@@ -5048,6 +5049,12 @@ fn test_all_or_nothing_group_still_requires_all_funded() {
 
 #[test]
 fn test_auto_resolve_no_rules_match_fallback_refunds() {
+// ---------------------------------------------------------------------------
+// Escrow migration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_migrate_escrow_transfers_balance() {
     let (env, contract_id, token_id) = setup();
     let c = client(&env, &contract_id);
     let tk = token_client(&env, &token_id);
@@ -5137,6 +5144,137 @@ fn test_auto_resolve_no_rules_match_no_fallback_is_noop() {
     let (env, contract_id, token_id) = setup();
     let c = client(&env, &contract_id);
     let tk = token_client(&env, &token_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let new_contract = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Initialize with admin
+    let treasury = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    // Create a pending invoice with partial funds
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(c.get_invoice(&id).funded, 100);
+
+    // Check contract token balance before migration
+    let contract_balance_before = tk.balance(&contract_id);
+    assert_eq!(contract_balance_before, 100);
+
+    // Migrate escrow
+    c.migrate_escrow(&admin, &new_contract);
+
+    // Verify new contract received the funds
+    assert_eq!(tk.balance(&new_contract), 100);
+    assert_eq!(tk.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_migrate_escrow_zero_balance() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let new_contract = Address::generate(&env);
+
+    // Initialize with admin
+    let treasury = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    // No invoices with funds - migration should succeed with zero transfer
+    c.migrate_escrow(&admin, &new_contract);
+
+    let tk = token_client(&env, &token_id);
+    assert_eq!(tk.balance(&new_contract), 0);
+}
+
+
+// ---------------------------------------------------------------------------
+// Creator Self-Imposed Spending Limit Tests (Issue #241)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_creator_self_limit_immediate_lower() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Creator sets self limit to 500
+    c.set_self_limit(&creator, &500_i128);
+    assert_eq!(c.get_self_limit(&creator), 500);
+
+    // Creator immediately lowers it to 200
+    c.set_self_limit(&creator, &200_i128);
+    assert_eq!(c.get_self_limit(&creator), 200);
+}
+
+#[test]
+#[should_panic(expected = "cannot raise limit directly")]
+fn test_creator_self_limit_immediate_raise_blocked() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Creator sets self limit to 200
+    c.set_self_limit(&creator, &200_i128);
+    assert_eq!(c.get_self_limit(&creator), 200);
+
+    // Creator attempts to immediately raise it (should panic)
+    c.set_self_limit(&creator, &500_i128);
+}
+
+#[test]
+fn test_creator_self_limit_raise_via_timelock() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    // Initialize with a timelock delay of 7 days
+    let timelock_secs = 7 * 24 * 60 * 60u64; // 7 days in seconds
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    c.set_timelock_secs(&admin, timelock_secs);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Creator sets self limit to 200
+    c.set_self_limit(&creator, &200_i128);
+    assert_eq!(c.get_self_limit(&creator), 200);
+
+    // Creator requests to raise limit to 500
+    let action_id = c.request_raise_self_limit(&creator, &500_i128);
+
+    // Attempt to use the raised limit immediately (should still be 200)
+    assert_eq!(c.get_self_limit(&creator), 200);
+
+    // Advance time past timelock
+    env.ledger().set_timestamp(1_000 + timelock_secs + 1);
+
+    // Execute the action
+    c.execute_action(&action_id);
+
+    // Now the limit should be raised to 500
+    assert_eq!(c.get_self_limit(&creator), 500);
+}
+
+#[test]
+fn test_creator_self_limit_enforced_in_create_invoice() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
 
     let creator = Address::generate(&env);
     let payer = Address::generate(&env);
@@ -5229,6 +5367,255 @@ fn test_auto_resolve_idempotency_second_call_noop() {
     let (env, contract_id, token_id) = setup();
     let c = client(&env, &contract_id);
     let tk = token_client(&env, &token_id);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000_i128);
+    env.ledger().set_timestamp(1_000);
+
+    // Creator sets self limit to 300
+    c.set_self_limit(&creator, &300_i128);
+
+    // Create invoice for 200 - should succeed
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    assert_eq!(c.get_invoice(&id1).status, InvoiceStatus::Pending);
+
+    // Try to create another invoice for 200 - should fail (total would be 400 > 300)
+    let err_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999)
+    }));
+    assert!(err_result.is_err(), "Expected panic when self limit exceeded");
+}
+
+#[test]
+fn test_creator_self_limit_daily_reset() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&creator, &1_000_i128);
+    env.ledger().set_timestamp(1_000);
+
+    // Creator sets self limit to 500
+    c.set_self_limit(&creator, &500_i128);
+
+    // Create invoice for 300
+    let _id1 = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+    assert_eq!(c.get_self_limit_used(&creator), 300);
+
+    // Try to create another invoice for 300 on the same day (would exceed 500)
+    let err_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999)
+    }));
+    assert!(err_result.is_err(), "Expected panic when exceeding daily self limit");
+
+    // Advance to next day (add 86400 seconds)
+    env.ledger().set_timestamp(1_000 + 86_400 + 1);
+
+    // Now creating invoice for 300 should succeed (daily reset)
+    let _id2 = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+    assert_eq!(c.get_self_limit_used(&creator), 300); // Reset for new day
+}
+
+#[test]
+fn test_creator_self_limit_zero_means_unlimited() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&creator, &10_000_i128);
+    env.ledger().set_timestamp(1_000);
+
+    // Creator sets self limit to 0 (no limit)
+    c.set_self_limit(&creator, &0_i128);
+
+    // Create multiple large invoices - should all succeed
+    let _id1 = make_invoice(&env, &c, &creator, &recipient, 5_000, &token_id, 9_999);
+    let _id2 = make_invoice(&env, &c, &creator, &recipient, 3_000, &token_id, 9_999);
+    let _id3 = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 9_999);
+
+    // No panic should occur
+}
+
+#[test]
+#[should_panic(expected = "only creator can")]
+fn test_creator_self_limit_requires_creator_auth() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let other_addr = Address::generate(&env);
+
+    // Try to set limit for creator with different address's auth (should panic)
+    let _old_auth = env.mock_all_auths_allow_address(other_addr.clone());
+    c.set_self_limit(&creator, &500_i128);
+}
+
+#[test]
+fn test_creator_self_limit_with_admin_cap() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    StellarAssetClient::new(&env, &token_id).mint(&creator, &1_000_i128);
+    env.ledger().set_timestamp(1_000);
+
+    // Set admin cap to 600
+    c.set_creator_volume_cap(&admin, &creator, &600_i128);
+
+    // Set creator self limit to 400
+    c.set_self_limit(&creator, &400_i128);
+
+    // Create invoice for 300 - should succeed
+    let _id1 = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+
+    // Try to create invoice for 200 - should fail
+    // (would exceed self limit of 400, even though admin cap is 600)
+    let err_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999)
+    }));
+    assert!(err_result.is_err(), "Expected panic when exceeding self limit");
+}
+
+
+// ---------------------------------------------------------------------------
+// Cross-Contract Prerequisites Tests (Issue #242)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cross_contract_prerequisite_blocks_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Deploy two contract instances
+    let contract1_id = env.register(SplitContract, ());
+    let contract2_id = env.register(SplitContract, ());
+    
+    let c1 = client(&env, &contract1_id);
+    let c2 = client(&env, &contract2_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+
+    let creator1 = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+
+    let creator2 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &500);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &500);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create a prerequisite invoice on contract1
+    let prereq_id = make_invoice(&env, &c1, &creator1, &recipient1, 200, &token_id, 9_999);
+
+    // Create an invoice on contract2 with external prerequisite pointing to contract1
+    let mut opts = default_options(&env);
+    opts.external_prerequisite = Some((contract1_id.clone(), prereq_id));
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let invoice_id = c2.create_invoice(
+        &creator2, &recipients, &amounts, &token_id, &9_999_u64, &opts,
+    );
+
+    // Fund the contract2 invoice
+    c2.pay(&payer2, &invoice_id, &200_i128, &0_u64, &false, &false);
+
+    // Try to release contract2 invoice - should fail because prerequisite on contract1 is not released
+    let release_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c2.release(&invoice_id);
+    }));
+    assert!(release_result.is_err(), "Expected panic when external prerequisite not released");
+
+    // Now fund and release the prerequisite invoice on contract1
+    c1.pay(&payer1, &prereq_id, &200_i128, &0_u64, &false, &false);
+    assert_eq!(c1.get_invoice(&prereq_id).status, InvoiceStatus::Released);
+
+    // Now releasing contract2 invoice should succeed
+    c2.release(&invoice_id);
+    assert_eq!(c2.get_invoice(&invoice_id).status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_cross_contract_prerequisite_succeeds_after_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract1_id = env.register(SplitContract, ());
+    let contract2_id = env.register(SplitContract, ());
+    
+    let c1 = client(&env, &contract1_id);
+    let c2 = client(&env, &contract2_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+
+    let creator1 = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+
+    let creator2 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &500);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &500);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create and immediately release prerequisite invoice on contract1
+    let prereq_id = make_invoice(&env, &c1, &creator1, &recipient1, 200, &token_id, 9_999);
+    c1.pay(&payer1, &prereq_id, &200_i128, &0_u64, &false, &false);
+    assert_eq!(c1.get_invoice(&prereq_id).status, InvoiceStatus::Released);
+
+    // Create invoice on contract2 with external prerequisite
+    let mut opts = default_options(&env);
+    opts.external_prerequisite = Some((contract1_id.clone(), prereq_id));
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let invoice_id = c2.create_invoice(
+        &creator2, &recipients, &amounts, &token_id, &9_999_u64, &opts,
+    );
+
+    // Fund contract2 invoice
+    c2.pay(&payer2, &invoice_id, &200_i128, &0_u64, &false, &false);
+
+    // Release should succeed immediately since prerequisite is already released
+    c2.release(&invoice_id);
+    assert_eq!(c2.get_invoice(&invoice_id).status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_local_only_invoice_unaffected_by_external_prerequisite() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
 
     let creator = Address::generate(&env);
     let payer = Address::generate(&env);
@@ -5262,4 +5649,75 @@ fn test_auto_resolve_idempotency_second_call_noop() {
     c.auto_resolve(&id);
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
     assert_eq!(tk.balance(&recipient), 30); // unchanged
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Create normal invoice without external prerequisite
+    let invoice_id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    // Fund and release - should work fine
+    c.pay(&payer, &invoice_id, &200_i128, &0_u64, &false, &false);
+    c.release(&invoice_id);
+    
+    assert_eq!(c.get_invoice(&invoice_id).status, InvoiceStatus::Released);
+}
+
+
+#[test]
+fn test_refund_with_insufficient_balance() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let payer3 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Mint tokens to payers
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &1000);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &1000);
+    StellarAssetClient::new(&env, &token_id).mint(&payer3, &1000);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice for 500 total
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+
+    // Three payers contribute different amounts: 100, 200, 300
+    c.pay(&payer1, &id, &100_i128, &0_u64, &false, &false);
+    c.pay(&payer2, &id, &200_i128, &0_u64, &false, &false);
+    c.pay(&payer3, &id, &300_i128, &0_u64, &false, &false);
+
+    // Verify balances after payment
+    assert_eq!(tk.balance(&payer1), 900); // 1000 - 100
+    assert_eq!(tk.balance(&payer2), 800); // 1000 - 200
+    assert_eq!(tk.balance(&payer3), 700); // 1000 - 300
+
+    // Move past deadline to allow refund
+    env.ledger().set_timestamp(3_000);
+
+    // Manually reduce contract balance to simulate shortage
+    // The contract should have 600 tokens, but we'll simulate it only having 400 available
+    // (i.e., 200 tokens are locked elsewhere)
+    let contract_addr = env.current_contract_address();
+    
+    // Transfer 200 tokens out of the contract to simulate the shortage
+    // This simulates what happens with streaming/DEX-swap interactions
+    tk.transfer(&contract_addr, &recipient, &200_i128);
+
+    // Now refund with insufficient balance (400 available vs 600 owed)
+    c.refund(&id);
+
+    // Verify invoice is refunded
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+
+    // Verify payers are refunded in ascending order of contribution
+    // payer1 (100 contributed) should get full refund
+    // payer2 (200 contributed) should get full refund
+    // payer3 (300 contributed) should get partial refund (100 remaining)
+    assert_eq!(tk.balance(&payer1), 1000); // Full refund: 900 + 100
+    assert_eq!(tk.balance(&payer2), 1000); // Full refund: 800 + 200
+    assert_eq!(tk.balance(&payer3), 800);  // Partial refund: 700 + 100
 }
