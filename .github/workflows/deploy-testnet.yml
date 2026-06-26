@@ -28,7 +28,7 @@ jobs:
         run: cargo build --target wasm32-unknown-unknown --release --workspace
 
       - name: Install stellar-cli
-        run: cargo install --locked stellar-cli --features opt
+        run: cargo install --locked stellar-cli
 
       - name: Configure testnet identity
         run: |
