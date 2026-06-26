@@ -267,59 +267,53 @@ pub fn pending_payout_claimed(env: &Env, invoice_id: u64, recipient: &Address, a
     );
 }
 
-pub fn nft_gate_set(env: &Env, contract: &Option<Address>, admin: &Address) {
+/// Emitted when an emergency withdrawal is executed.
+/// Topics: (split, emrg_wd)
+/// Data: (token, destination, amount)
+pub fn emergency_withdrawal_executed(env: &Env, token: &Address, destination: &Address, amount: i128) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("nft_set")),
-        (contract.clone(), admin.clone()),
+        (symbol_short!("split"), symbol_short!("emrg_wd")),
+        (token.clone(), destination.clone(), amount),
     );
 }
 
-pub fn action_queued(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
+/// Replayed invoice_created event tagged with "replay" so indexers can distinguish it.
+/// Topics: (split, created, invoice_id, replay)
+/// Data: (creator, total, cross_chain_ref)
+pub fn replay_invoice_created(env: &Env, invoice_id: u64, creator: &Address, total: i128, cross_chain_ref: &Option<soroban_sdk::String>) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("tl_queue"), action_id),
-        (action.clone(), admin.clone()),
+        (symbol_short!("split"), symbol_short!("created"), invoice_id, symbol_short!("replay")),
+        (creator.clone(), total, cross_chain_ref.clone()),
     );
 }
 
-pub fn action_executed(env: &Env, action_id: u64, action: &TimelockAction) {
+/// Replayed payment_received event tagged with "replay".
+/// Topics: (split, paid, invoice_id, replay)
+/// Data: (payer, amount)
+pub fn replay_payment_received(env: &Env, invoice_id: u64, payer: &Address, amount: i128) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("tl_exec"), action_id),
-        action.clone(),
+        (symbol_short!("split"), symbol_short!("paid"), invoice_id, symbol_short!("replay")),
+        (payer.clone(), amount),
     );
 }
 
-pub fn action_cancelled(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
+/// Replayed invoice_released event tagged with "replay".
+/// Topics: (split, released, invoice_id, replay)
+/// Data: recipients
+pub fn replay_invoice_released(env: &Env, invoice_id: u64, recipients: &Vec<Address>) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("tl_cncl"), action_id),
-        (action.clone(), admin.clone()),
+        (symbol_short!("split"), symbol_short!("released"), invoice_id, symbol_short!("replay")),
+        recipients.clone(),
     );
 }
 
-pub fn invoice_admin_frozen(env: &Env, invoice_id: u64, admin: &Address, reason: &String) {
+/// Replayed invoice_refunded event tagged with "replay".
+/// Topics: (split, refunded, invoice_id, replay)
+/// Data: ()
+pub fn replay_invoice_refunded(env: &Env, invoice_id: u64) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("adm_frz"), invoice_id),
-        (admin.clone(), reason.clone()),
-    );
-}
-
-pub fn invoice_admin_unfrozen(env: &Env, invoice_id: u64, admin: &Address) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("adm_unf"), invoice_id),
-        admin.clone(),
-    );
-}
-
-pub fn batch_archived(env: &Env, count: u32, ids: &Vec<u64>) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("bat_arc")),
-        (count, ids.clone()),
-    );
-}
-
-pub fn partial_refund_issued(env: &Env, invoice_id: u64, creator: &Address, bps: u32, amount: i128) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("prt_ref"), invoice_id),
-        (creator.clone(), bps, amount),
+        (symbol_short!("split"), symbol_short!("refunded"), invoice_id, symbol_short!("replay")),
+        (),
     );
 }
 

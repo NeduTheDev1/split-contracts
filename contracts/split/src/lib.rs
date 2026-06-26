@@ -24,8 +24,6 @@ use types::{
     TimelockAction, Tranche, TreasuryRecord,
 };
 
-const SHARD_COUNT: u64 = 8;
-
 // ---------------------------------------------------------------------------
 // Storage key helpers
 // ---------------------------------------------------------------------------
@@ -500,8 +498,10 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             min_payment: 0,
             min_funding_amount: 0,
             priorities: Vec::new(env),
+            creation_timestamp: 0,
+            min_payment_increment: 0,
         });
-    
+
     // Load compact representation if available
     if let Some(compact) = env.storage().persistent().get::<_, CompactInvoice>(&invoice_compact_key(id)) {
         Invoice::from_compact(&compact, core, ext, ext2)
@@ -564,16 +564,6 @@ fn require_not_paused(env: &Env) {
     assert!(!is_paused(env), "contract is paused");
 }
 
-fn require_admin(env: &Env) -> Address {
-    let admin: Address = env
-        .storage()
-        .instance()
-        .get(&admin_key())
-        .expect("admin not set");
-    admin.require_auth();
-    admin
-}
-
 fn require_role(env: &Env, admin: &Address, min_role: AdminRole) {
     admin.require_auth();
     let admins: Map<Address, AdminRole> = env
@@ -593,20 +583,6 @@ fn require_role(env: &Env, admin: &Address, min_role: AdminRole) {
             );
         }
     }
-}
-
-fn require_admin(env: &Env) -> Address {
-    let caller = env.current_contract_address();
-    let admins: Map<Address, AdminRole> = env
-        .storage()
-        .instance()
-        .get(&admins_key())
-        .expect("admins not set");
-    assert!(
-        admins.contains_key(caller.clone()),
-        "caller is not an admin"
-    );
-    caller
 }
 
 fn require_fn_not_paused(env: &Env, name: &Symbol) {
@@ -1488,6 +1464,8 @@ impl SplitContract {
                         min_payment: 0,
                         min_funding_amount: 0,
                         priorities: Vec::new(&env),
+                        creation_timestamp: 0,
+                        min_payment_increment: 0,
                     })
             });
         let audit_log: Vec<types::AuditEntry> = get_audit_log(&env, invoice_id);
@@ -1623,11 +1601,26 @@ impl SplitContract {
                 env.storage()
                     .persistent()
                     .set(&creator_self_limit_key(creator), new_limit);
-                
+
                 // Reset daily usage when limit is raised
                 env.storage()
                     .persistent()
                     .set(&creator_self_used_key(creator), &0i128);
+            }
+            TimelockAction::EmergencyWithdraw(token, destination) => {
+                // Issue #233: Enforce a minimum 7-day delay independently of
+                // the contract's configured timelock_secs.
+                const EMERGENCY_MIN_DELAY: u64 = 7 * 24 * 60 * 60;
+                assert!(
+                    now >= queued.queued_at.saturating_add(EMERGENCY_MIN_DELAY),
+                    "emergency withdrawal requires a 7-day delay"
+                );
+                assert!(is_paused(&env), "contract must still be paused for emergency withdrawal");
+                let token_client = token::Client::new(&env, token);
+                let amount = token_client.balance(&env.current_contract_address());
+                assert!(amount > 0, "no balance to withdraw");
+                token_client.transfer(&env.current_contract_address(), destination, &amount);
+                events::emergency_withdrawal_executed(&env, token, destination, amount);
             }
         }
 
@@ -2197,6 +2190,8 @@ impl SplitContract {
             allowed_callers: None,
             admin_frozen: false,
             min_funding_amount: 0,
+            creation_timestamp: env.ledger().timestamp(),
+            min_payment_increment: 0,
             external_prerequisite,
         };
 
@@ -2577,8 +2572,8 @@ impl SplitContract {
             creation_timestamp: env.ledger().timestamp(),
             min_payment_increment: source.min_payment_increment,
             min_funding_amount: source.min_funding_amount,
-            admin_frozen: source.admin_frozen,
             require_kyc: source.require_kyc,
+            external_prerequisite: source.external_prerequisite.clone(),
         };
 
         save_invoice(&env, id, &new_invoice);
@@ -6448,6 +6443,7 @@ impl SplitContract {
                         admin_frozen: false,
                         auction_on_expiry: false, auction_end: 0, bids: Vec::new(&env),
                         min_payment: 0, min_funding_amount: 0, priorities: Vec::new(&env),
+                        creation_timestamp: 0, min_payment_increment: 0,
                     });
 
                 env.storage().instance().set(&invoice_key(id), &core);
@@ -6749,6 +6745,70 @@ impl SplitContract {
     ///
     /// # Returns
     /// The minimum TTL in ledgers across the invoice's entries, or 0 if archived.
+    /// Replay all historical events for an invoice so an indexer can resync
+    /// from a single call. Replayed events carry a `replay` topic marker to
+    /// distinguish them from live events and prevent double-counting.
+    ///
+    /// Emits:
+    ///   - one `invoice_created` (replay) event
+    ///   - one `payment_received` (replay) event per entry in `invoice.payments`, in order
+    ///   - one terminal status event (`invoice_released` or `invoice_refunded`, replay)
+    ///     if the invoice is no longer Pending
+    ///
+    /// Pure read + emit — no state mutation, callable by anyone.
+    pub fn replay_invoice_events(env: Env, invoice_id: u64) {
+        let invoice = load_invoice(&env, invoice_id);
+
+        let total: i128 = invoice.amounts.iter().sum();
+        events::replay_invoice_created(&env, invoice_id, &invoice.creator, total, &invoice.cross_chain_ref);
+
+        for payment in invoice.payments.iter() {
+            events::replay_payment_received(&env, invoice_id, &payment.payer, payment.amount);
+        }
+
+        match invoice.status {
+            InvoiceStatus::Released => {
+                events::replay_invoice_released(&env, invoice_id, &invoice.recipients);
+            }
+            InvoiceStatus::Refunded => {
+                events::replay_invoice_refunded(&env, invoice_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Queue an emergency withdrawal of all custodied funds for `token` to
+    /// `destination`. Requires:
+    ///   - the contract to already be paused
+    ///   - SuperAdmin auth
+    ///
+    /// Execution via `execute_action` is gated by a mandatory 7-day minimum
+    /// delay regardless of the configured `timelock_secs`.
+    ///
+    /// Returns the `action_id` of the queued action.
+    pub fn request_emergency_withdraw(env: Env, admin: Address, token: Address, destination: Address) -> u64 {
+        require_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(is_paused(&env), "contract must be paused before requesting emergency withdrawal");
+
+        let action = TimelockAction::EmergencyWithdraw(token, destination);
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&timelock_action_counter_key())
+            .unwrap_or(0u64);
+        counter = counter.checked_add(1).expect("action counter overflow");
+        let now = env.ledger().timestamp();
+        let queued = QueuedAction {
+            action: action.clone(),
+            queued_at: now,
+            executed: false,
+        };
+        env.storage().persistent().set(&timelock_action_key(counter), &queued);
+        env.storage().persistent().set(&timelock_action_counter_key(), &counter);
+        events::action_queued(&env, counter, &action, &admin);
+        counter
+    }
+
     pub fn get_invoice_storage_footprint(env: Env, invoice_id: u64) -> u32 {
         let storage = env.storage();
         
