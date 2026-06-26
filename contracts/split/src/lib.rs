@@ -4974,21 +4974,90 @@ impl SplitContract {
             }
         }
 
-        let mut total_refunded_amount: i128 = 0;
-        for (payer, amount) in totals.iter() {
-            if amount > 0 {
-                token_client.transfer(&env.current_contract_address(), &payer, &amount);
-                total_refunded_amount += amount;
-                events::payer_refunded(&env, invoice_id, &payer, amount);
-            }
+        // Calculate total amount owed to payers and donate recipients
+        let mut total_owed_to_payers: i128 = 0;
+        for (_payer, amount) in totals.iter() {
+            total_owed_to_payers += amount;
         }
 
-        // Issue #204: send all donate-on-failure contributions to the creator.
         let mut total_donated: i128 = 0;
         for (_payer, amount) in donate_totals.iter() {
             total_donated += amount;
         }
         let creator_receives = invoice.bonus_pool + total_donated;
+
+        // Check available balance
+        let available_balance = token_client.balance(&env.current_contract_address());
+        let mut balance_for_refunds = available_balance.saturating_sub(creator_receives);
+        
+        let mut total_refunded_amount: i128 = 0;
+        let shortfall = if total_owed_to_payers > balance_for_refunds {
+            total_owed_to_payers - balance_for_refunds
+        } else {
+            0
+        };
+
+        // Issue #243: Fair partial refund handling
+        if shortfall > 0 {
+            // Build vector of (payer, amount) and sort by amount ascending
+            let mut payers_vec: Vec<(Address, i128)> = Vec::new(&env);
+            for (payer, amount) in totals.iter() {
+                if amount > 0 {
+                    payers_vec.push_back((payer, amount));
+                }
+            }
+
+            // Sort by amount ascending (smallest contributors first)
+            // Simple bubble sort since we're dealing with payments data
+            let len = payers_vec.len();
+            for i in 0..len {
+                for j in 0..(len - 1 - i) {
+                    let (_, amt_j) = payers_vec.get(j);
+                    let (_, amt_j_plus_1) = payers_vec.get(j + 1);
+                    if amt_j > amt_j_plus_1 {
+                        // Swap
+                        let temp_j = payers_vec.get(j);
+                        let temp_j_plus_1 = payers_vec.get(j + 1);
+                        payers_vec.set(j, temp_j_plus_1);
+                        payers_vec.set(j + 1, temp_j);
+                    }
+                }
+            }
+
+            // Refund in ascending order of contribution
+            for (payer, amount) in payers_vec.iter() {
+                if balance_for_refunds <= 0 {
+                    break;
+                }
+                
+                let refund_amount = if amount <= balance_for_refunds {
+                    amount
+                } else {
+                    balance_for_refunds
+                };
+
+                if refund_amount > 0 {
+                    token_client.transfer(&env.current_contract_address(), &payer, &refund_amount);
+                    total_refunded_amount += refund_amount;
+                    balance_for_refunds -= refund_amount;
+                    events::payer_refunded(&env, invoice_id, &payer, refund_amount);
+                }
+            }
+
+            // Emit shortfall event
+            events::refund_shortfall(&env, invoice_id, shortfall);
+        } else {
+            // Issue #243: Full refund path (unchanged from before)
+            for (payer, amount) in totals.iter() {
+                if amount > 0 {
+                    token_client.transfer(&env.current_contract_address(), &payer, &amount);
+                    total_refunded_amount += amount;
+                    events::payer_refunded(&env, invoice_id, &payer, amount);
+                }
+            }
+        }
+
+        // Issue #204: send all donate-on-failure contributions to the creator.
         if creator_receives > 0 {
             token_client.transfer(
                 &env.current_contract_address(),

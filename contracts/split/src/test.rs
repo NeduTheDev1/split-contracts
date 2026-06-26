@@ -5452,3 +5452,63 @@ fn test_local_only_invoice_unaffected_by_external_prerequisite() {
     
     assert_eq!(c.get_invoice(&invoice_id).status, InvoiceStatus::Released);
 }
+
+
+#[test]
+fn test_refund_with_insufficient_balance() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let payer3 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Mint tokens to payers
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &1000);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &1000);
+    StellarAssetClient::new(&env, &token_id).mint(&payer3, &1000);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice for 500 total
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+
+    // Three payers contribute different amounts: 100, 200, 300
+    c.pay(&payer1, &id, &100_i128, &0_u64, &false, &false);
+    c.pay(&payer2, &id, &200_i128, &0_u64, &false, &false);
+    c.pay(&payer3, &id, &300_i128, &0_u64, &false, &false);
+
+    // Verify balances after payment
+    assert_eq!(tk.balance(&payer1), 900); // 1000 - 100
+    assert_eq!(tk.balance(&payer2), 800); // 1000 - 200
+    assert_eq!(tk.balance(&payer3), 700); // 1000 - 300
+
+    // Move past deadline to allow refund
+    env.ledger().set_timestamp(3_000);
+
+    // Manually reduce contract balance to simulate shortage
+    // The contract should have 600 tokens, but we'll simulate it only having 400 available
+    // (i.e., 200 tokens are locked elsewhere)
+    let contract_addr = env.current_contract_address();
+    
+    // Transfer 200 tokens out of the contract to simulate the shortage
+    // This simulates what happens with streaming/DEX-swap interactions
+    tk.transfer(&contract_addr, &recipient, &200_i128);
+
+    // Now refund with insufficient balance (400 available vs 600 owed)
+    c.refund(&id);
+
+    // Verify invoice is refunded
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+
+    // Verify payers are refunded in ascending order of contribution
+    // payer1 (100 contributed) should get full refund
+    // payer2 (200 contributed) should get full refund
+    // payer3 (300 contributed) should get partial refund (100 remaining)
+    assert_eq!(tk.balance(&payer1), 1000); // Full refund: 900 + 100
+    assert_eq!(tk.balance(&payer2), 1000); // Full refund: 800 + 200
+    assert_eq!(tk.balance(&payer3), 800);  // Partial refund: 700 + 100
+}
