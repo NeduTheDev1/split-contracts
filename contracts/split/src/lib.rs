@@ -7,6 +7,8 @@ const SHARD_COUNT: u64 = 8;
 
 mod events;
 mod types;
+/// Issue #278: centralised storage key registry.
+mod storage_keys;
 pub mod factory;
 
 #[cfg(test)]
@@ -456,6 +458,14 @@ fn pending_admin_key() -> Symbol {
 
 fn admin_proposal_time_key() -> Symbol {
     symbol_short!("adm_prop")
+}
+
+/// Issue #279: current contract storage schema version.
+const CONTRACT_VERSION: u32 = 2;
+
+/// Issue #279: contract version storage key — instance storage.
+fn contract_version_key() -> Symbol {
+    symbol_short!("ct_ver")
 }
 
 fn maybe_record_created(env: &Env, creator: &Address, total: i128) {
@@ -7578,5 +7588,259 @@ impl SplitContract {
         
         // Return the minimum TTL found, or 0 if none were found
         min_ttl.unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #277: pay on behalf — third party pays, beneficiary gets credit
+    // -----------------------------------------------------------------------
+
+    /// Pay toward an invoice on behalf of a `beneficiary`.
+    ///
+    /// The actual token transfer comes from the caller (`payer`), but the
+    /// payment is recorded against `beneficiary` in the invoice's payment
+    /// history. The `authorization` is an Ed25519 signature produced by
+    /// `beneficiary` over the message `sha256(invoice_id || amount || nonce)`
+    /// using `beneficiary_pubkey`.  After a successful payment the
+    /// `beneficiary`'s nonce is incremented to prevent replay.
+    pub fn pay_on_behalf(
+        env: Env,
+        payer: Address,
+        invoice_id: u64,
+        amount: i128,
+        beneficiary: Address,
+        beneficiary_pubkey: BytesN<32>,
+        authorization: BytesN<64>,
+    ) {
+        require_non_reentrant(&env);
+        require_fn_not_paused(&env, &symbol_short!("pay"));
+        // The actual sender authorises the token transfer.
+        payer.require_auth();
+
+        // Fetch the current beneficiary nonce (replay protection).
+        let nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&nonce_key(invoice_id, &beneficiary))
+            .unwrap_or(0u64);
+
+        // Build the signed message: sha256(invoice_id_be || amount_be || nonce_be).
+        let mut msg_bytes = Bytes::new(&env);
+        for b in invoice_id.to_be_bytes().iter() { msg_bytes.push_back(*b); }
+        for b in amount.to_be_bytes().iter()     { msg_bytes.push_back(*b); }
+        for b in nonce.to_be_bytes().iter()      { msg_bytes.push_back(*b); }
+        let msg_hash: BytesN<32> = env.crypto().sha256(&msg_bytes);
+        let msg_hash_bytes: Bytes = msg_hash.into();
+
+        // Verify the beneficiary's Ed25519 signature.
+        env.crypto().ed25519_verify(&beneficiary_pubkey, &msg_hash_bytes, &authorization);
+
+        // Route payment through _pay with `payer` as the fund source but
+        // `beneficiary` recorded as the payer in payment history.
+        // We temporarily set `payer` in _pay as `beneficiary` so the shard
+        // write, nonce increment, and event all reference the beneficiary.
+        // The token transfer uses `payer` via the `via` mechanism, but since
+        // _pay pulls tokens from its `payer` argument we pass `beneficiary`
+        // as payer and rely on the fact that the token.transfer call in _pay
+        // uses the payer argument. Therefore we call _pay with beneficiary as
+        // the credited address, but we must first do the token transfer from
+        // the actual payer outside _pay.
+        //
+        // Implementation: transfer tokens from `payer` to the contract, then
+        // invoke _pay_credited which credits `beneficiary` without a second
+        // token.transfer.
+        Self::_pay_on_behalf_inner(&env, &payer, &beneficiary, invoice_id, amount, nonce);
+
+        clear_reentrant(&env);
+    }
+
+    /// Internal helper that executes the on-behalf payment after signature
+    /// verification.  Transfers tokens from `actual_payer`, credits
+    /// `beneficiary`, increments beneficiary's nonce, and emits events.
+    fn _pay_on_behalf_inner(
+        env: &Env,
+        actual_payer: &Address,
+        beneficiary: &Address,
+        invoice_id: u64,
+        amount: i128,
+        nonce: u64,
+    ) {
+        let mut invoice = load_invoice(env, invoice_id);
+
+        assert!(invoice.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(!invoice.disputed, "invoice is disputed");
+        assert!(env.ledger().timestamp() <= invoice.deadline, "invoice deadline has passed");
+        assert!(amount > 0, "payment amount must be positive");
+        assert!(!invoice.frozen, "invoice is frozen");
+        assert!(!invoice.admin_frozen, "invoice frozen by admin");
+
+        // Allowed-payers check uses beneficiary as the credited address.
+        if let Some(ref whitelist) = invoice.allowed_payers {
+            assert!(whitelist.contains(beneficiary), "beneficiary not in allowed payers");
+        }
+
+        let total: i128 = invoice.amounts.iter().sum();
+        let remaining = total - invoice.funded;
+
+        let credited_amount = match invoice.overflow_behavior {
+            OverflowBehavior::Reject => {
+                assert!(amount <= remaining, "payment exceeds remaining balance");
+                amount
+            }
+            OverflowBehavior::Refund | OverflowBehavior::Donate => {
+                if amount <= remaining { amount } else { remaining }
+            }
+        };
+
+        let excess = amount - credited_amount;
+        let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
+
+        // Transfer the full amount from the actual payer.
+        token_client.transfer(actual_payer, &env.current_contract_address(), &amount);
+
+        // Return any overflow to the actual payer / treasury.
+        if excess > 0 {
+            match invoice.overflow_behavior {
+                OverflowBehavior::Refund => {
+                    token_client.transfer(&env.current_contract_address(), actual_payer, &excess);
+                }
+                OverflowBehavior::Donate => {
+                    let treasury: Address = env
+                        .storage()
+                        .instance()
+                        .get(&treasury_key())
+                        .expect("treasury not set");
+                    token_client.transfer(&env.current_contract_address(), &treasury, &excess);
+                }
+                OverflowBehavior::Reject => {}
+            }
+        }
+
+        // Increment beneficiary nonce (replay protection).
+        env.storage()
+            .persistent()
+            .set(&nonce_key(invoice_id, beneficiary), &(nonce + 1));
+
+        // Record payment credited to beneficiary.
+        let shard_id = compute_shard_id(env, beneficiary);
+        let mut shard_payments: Vec<Payment> = env
+            .storage()
+            .persistent()
+            .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+            .unwrap_or_else(|| Vec::new(env));
+        shard_payments.push_back(Payment {
+            payer: beneficiary.clone(),
+            amount: credited_amount,
+            tip: 0,
+            attestation_hash: None,
+            donate_on_failure: false,
+        });
+        env.storage()
+            .persistent()
+            .set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
+
+        invoice.funded += credited_amount;
+
+        append_audit_entry(env, invoice_id, symbol_short!("del_pay"), actual_payer);
+
+        // Emit the delegated payment event (issue #277).
+        events::delegated_payment_received(env, invoice_id, actual_payer, beneficiary, credited_amount);
+
+        notify_invoice(env, invoice_id, symbol_short!("del_pay"), &invoice.notification_contract);
+
+        if invoice.funded >= total {
+            let in_group = env.storage().persistent().has(&invoice_group_key(invoice_id));
+            let guarded = invoice.prerequisite_id.is_some()
+                || !invoice.tranches.is_empty()
+                || !invoice.release_stages.is_empty()
+                || in_group
+                || !invoice.co_signers.is_empty()
+                || (invoice.oracle_address.is_some() && !invoice.condition_met);
+            if guarded {
+                save_invoice(env, invoice_id, &invoice);
+            } else {
+                Self::_release(env, invoice_id, &mut invoice, actual_payer);
+            }
+        } else {
+            save_invoice(env, invoice_id, &invoice);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #279: contract version migration
+    // -----------------------------------------------------------------------
+
+    /// Returns the current contract schema version.
+    pub fn get_contract_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&contract_version_key())
+            .unwrap_or(1u32)
+    }
+
+    /// Admin-only: migrate storage schema from `from_version` to the current
+    /// `CONTRACT_VERSION`.  Idempotent — calling it twice has no effect.
+    ///
+    /// v1 → v2: sets `contract_version_key` to 2 (all new fields already
+    /// have defaults written by `load_invoice`/`Invoice::assemble`).
+    pub fn migrate(env: Env, admin: Address, from_version: u32) {
+        require_role(&env, &admin, AdminRole::SuperAdmin);
+        admin.require_auth();
+
+        let stored: u32 = env
+            .storage()
+            .instance()
+            .get(&contract_version_key())
+            .unwrap_or(1u32);
+
+        // Idempotent: nothing to do if already at target.
+        if stored >= CONTRACT_VERSION {
+            return;
+        }
+
+        assert!(from_version == stored, "from_version mismatch");
+
+        // v1 → v2: no structural storage changes needed beyond bumping the
+        // version; new fields are already defaulted by load_invoice.
+        if from_version == 1 {
+            env.storage()
+                .instance()
+                .set(&contract_version_key(), &CONTRACT_VERSION);
+        }
+
+        events::contract_migrated(
+            &env,
+            from_version,
+            CONTRACT_VERSION,
+            env.ledger().sequence(),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #280: invoice lineage query
+    // -----------------------------------------------------------------------
+
+    /// Returns the chain of parent invoice IDs from `invoice_id` back to the
+    /// original (no parent).  The returned `Vec` starts with the immediate
+    /// parent and ends with the root.
+    ///
+    /// Panics with `"circular lineage detected"` if more than 10 hops are
+    /// traversed (guards against corrupt data).
+    pub fn get_lineage(env: Env, invoice_id: u64) -> Vec<u64> {
+        let mut chain: Vec<u64> = Vec::new(&env);
+        let mut current_id = invoice_id;
+        let mut hops = 0u32;
+        loop {
+            assert!(hops < 10, "circular lineage detected");
+            let invoice = load_invoice(&env, current_id);
+            match invoice.parent_invoice_id {
+                None => break,
+                Some(parent_id) => {
+                    chain.push_back(parent_id);
+                    current_id = parent_id;
+                    hops += 1;
+                }
+            }
+        }
+        chain
     }
 }
