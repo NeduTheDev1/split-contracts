@@ -3939,7 +3939,7 @@ fn test_bridge_pay_credits_invoice_after_swap() {
     env.ledger().set_timestamp(1_000);
     let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
 
-    c.bridge_pay(&payer, &id, &alt_token_id, &300_i128);
+    c.bridge_pay(&payer, &id, &alt_token_id, &300_i128, &0_u64);
 
     let invoice = c.get_invoice(&id);
     assert_eq!(invoice.funded, 300);
@@ -4076,9 +4076,9 @@ fn test_pool_pay_three_invoices_funded_correctly() {
     let id3 = make_invoice(&env, &c, &creator, &r3, 300, &token_id, 9_999);
 
     let mut payments = Vec::new(&env);
-    payments.push_back(types::InvoicePayment { invoice_id: id1, amount: 100 });
-    payments.push_back(types::InvoicePayment { invoice_id: id2, amount: 200 });
-    payments.push_back(types::InvoicePayment { invoice_id: id3, amount: 300 });
+    payments.push_back(types::InvoicePayment { invoice_id: id1, amount: 100, nonce: 0 });
+    payments.push_back(types::InvoicePayment { invoice_id: id2, amount: 200, nonce: 0 });
+    payments.push_back(types::InvoicePayment { invoice_id: id3, amount: 300, nonce: 0 });
 
     // Payer balance before: 1000; total payment: 600 → balance after: 400.
     c.pool_pay(&payer, &payments);
@@ -4114,8 +4114,8 @@ fn test_pool_pay_invalid_invoice_reverts_all() {
     let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
 
     let mut payments = Vec::new(&env);
-    payments.push_back(types::InvoicePayment { invoice_id: id1, amount: 50 }); // id1 no longer Pending
-    payments.push_back(types::InvoicePayment { invoice_id: id2, amount: 50 });
+    payments.push_back(types::InvoicePayment { invoice_id: id1, amount: 50, nonce: 0 }); // id1 no longer Pending
+    payments.push_back(types::InvoicePayment { invoice_id: id2, amount: 50, nonce: 0 });
 
     c.pool_pay(&payer, &payments); // should panic
 }

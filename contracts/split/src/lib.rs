@@ -3257,6 +3257,7 @@ impl SplitContract {
         invoice_id: u64,
         source_token: Address,
         source_amount: i128,
+        nonce: u64,
     ) {
         require_fn_not_paused(&env, &symbol_short!("brg_pay"));
         payer.require_auth();
@@ -3266,6 +3267,17 @@ impl SplitContract {
         assert!(!invoice.disputed, "invoice is disputed");
         assert!(env.ledger().timestamp() <= invoice.deadline, "invoice deadline has passed");
         assert!(source_amount > 0, "payment amount must be positive");
+
+        // Validate and increment per-payer nonce.
+        let stored_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&nonce_key(invoice_id, &payer))
+            .unwrap_or(0u64);
+        assert!(nonce == stored_nonce, "invalid nonce");
+        env.storage()
+            .persistent()
+            .set(&nonce_key(invoice_id, &payer), &(stored_nonce + 1));
 
         let invoice_token = invoice.tokens.get(0).expect("no token");
         let src_client = token::Client::new(&env, &source_token);
@@ -3363,6 +3375,13 @@ impl SplitContract {
                 inv.tokens.get(0).expect("no token") == shared_token,
                 "all invoices must use the same token"
             );
+            // Validate per-payer per-invoice nonce.
+            let stored_nonce: u64 = env
+                .storage()
+                .persistent()
+                .get(&nonce_key(p.invoice_id, &payer))
+                .unwrap_or(0u64);
+            assert!(p.nonce == stored_nonce, "invalid nonce");
             total += p.amount;
         }
 
@@ -3384,6 +3403,16 @@ impl SplitContract {
             env.storage().persistent().set(&pay_shard_key(p.invoice_id, shard_id), &shard_payments);
 
             inv.funded += p.amount;
+
+            // Increment nonce after successful payment.
+            let prev_nonce: u64 = env
+                .storage()
+                .persistent()
+                .get(&nonce_key(p.invoice_id, &payer))
+                .unwrap_or(0u64);
+            env.storage()
+                .persistent()
+                .set(&nonce_key(p.invoice_id, &payer), &(prev_nonce + 1));
 
             append_audit_entry(&env, p.invoice_id, symbol_short!("pool_pay"), &payer);
             events::payment_received(&env, p.invoice_id, &payer, p.amount);

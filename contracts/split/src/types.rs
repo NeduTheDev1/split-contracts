@@ -53,6 +53,7 @@ pub struct ResolveRule {
 pub struct InvoicePayment {
     pub invoice_id: u64,
     pub amount: i128,
+    pub nonce: u64,
 }
 
 #[contracttype]
@@ -883,26 +884,6 @@ impl Invoice {
             parent_invoice_id: None,
             clone_depth: 0,
             fallback_action: None,
-        }
-    }   max_payments_per_window: None,
-            payment_window_secs: None,
-            scheduled_release_at: None,
-            refund_grace_secs: None,
-            penalty_tiers: Vec::<PenaltyTier>::new(env),
-            allowed_callers: None,
-            notification_contract: None,
-            overflow_behavior: OverflowBehavior::Reject,
-            cross_chain_ref: None,
-            priorities: Vec::new(env),
-            forward_to: None,
-            forward_invoice_id: None,
-            parent_invoice_id: None,
-            clone_depth: 0,
-            fallback_action: None,
-            require_kyc: false,
-            creation_timestamp: 0,
-            min_payment_increment: 0,
-            external_prerequisite: None,
         }
     }
 }
