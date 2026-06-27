@@ -53,7 +53,6 @@ pub struct ResolveRule {
 pub struct InvoicePayment {
     pub invoice_id: u64,
     pub amount: i128,
-    pub nonce: u64,
 }
 
 #[contracttype]
@@ -104,10 +103,6 @@ pub struct SubscriptionParams {
     pub recipients: Vec<Address>,
     pub amounts: Vec<i128>,
     pub tokens: Vec<Address>,
-    pub interval_secs: u64,
-    pub next_invoice_at: u64,
-    pub active: bool,
-    pub last_invoice_id: Option<u64>,
 }
 
 #[contracttype]
@@ -146,8 +141,6 @@ pub struct InvoiceTemplate {
     /// Optional whitelist of addresses allowed to pay this invoice.
     /// When None, any address may pay.
     pub allowed_payers: Option<Vec<Address>>,
-    /// Merkle root for caller allowlist (replaces stored address list).
-    pub allowed_callers_root: Option<BytesN<32>>,
 }
 
 #[contracttype]
@@ -242,12 +235,8 @@ pub struct InvoiceOptions {
     pub scheduled_release_at: Option<u64>,
     /// KYC verification requirement.
     pub require_kyc: bool,
-    /// Fallback action to execute if no auto_resolve_rules match (Release, Refund, or None).
-    pub fallback_action: Option<ResolveAction>,
-    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
-    pub external_prerequisite: Option<(Address, u64)>,
-    /// Merkle root for caller allowlist (replaces stored address list).
-    pub allowed_callers_root: Option<BytesN<32>>,
+    /// Issue #274: invoice target in USD cents; used with price_oracle for dynamic funding.
+    pub target_usd_cents: Option<u64>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -353,11 +342,8 @@ pub struct InvoiceExt {
     pub payment_window_secs: Option<u64>,
     pub scheduled_release_at: Option<u64>,
     pub penalty_tiers: Vec<PenaltyTier>,
-    pub allowed_callers_root: Option<BytesN<32>>,
+    pub allowed_callers: Option<Vec<Address>>,
     pub refund_grace_secs: Option<u64>,
-    pub fallback_action: Option<ResolveAction>,
-    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
-    pub external_prerequisite: Option<(Address, u64)>,
 }
 
 #[contracttype]
@@ -378,10 +364,8 @@ pub struct InvoiceExt2 {
     pub min_payment: i128,
     pub min_funding_amount: i128,
     pub priorities: Vec<u32>,
-    pub creation_timestamp: u64,
-    pub min_payment_increment: i128,
-    /// Issue #230: co-signers who have approved the pending recipient substitution.
-    pub substitute_recipient_approvals: Vec<Address>,
+    /// Issue #274: invoice target in USD cents for oracle-based dynamic funding.
+    pub target_usd_cents: Option<u64>,
 }
 
 /// Issue #211: A single escalating penalty tier (seconds_after_deadline, bps).
@@ -398,10 +382,6 @@ pub struct PenaltyTier {
 pub enum TimelockAction {
     SetTreasury(Address),
     SetPlatformFee(u32),
-    /// Issue #241: Creator self-imposed limit raise request.
-    RaiseCreatorSelfLimit(Address, i128),
-    /// Issue #233: Emergency withdrawal of all custodied funds for a given token.
-    EmergencyWithdraw(Address, Address),
 }
 
 /// A queued timelock action with metadata.
@@ -480,8 +460,8 @@ pub struct Invoice {
     pub refund_grace_secs: Option<u64>,
     /// Issue #211: escalating penalty tiers.
     pub penalty_tiers: Vec<PenaltyTier>,
-    /// Issue #208: Merkle root for caller allowlist (replaces stored address list).
-    pub allowed_callers_root: Option<BytesN<32>>,
+    /// Issue #208: restrict payments to specific calling contracts; None = open.
+    pub allowed_callers: Option<Vec<Address>>,
     pub notification_contract: Option<Address>,
     pub overflow_behavior: OverflowBehavior,
     pub cross_chain_ref: Option<String>,
@@ -496,15 +476,8 @@ pub struct Invoice {
     pub min_funding_amount: i128,
     pub priorities: Vec<u32>,
     pub clone_depth: u32,
-    pub fallback_action: Option<ResolveAction>,
-    /// Issue #230: co-signers who have approved the pending recipient substitution.
-    pub substitute_recipient_approvals: Vec<Address>,
-    /// Issue #196: invoice creation timestamp for spam deposit age calculation.
-    pub creation_timestamp: u64,
-    /// Issue #201: minimum payment increment - reject payments below this threshold.
-    pub min_payment_increment: i128,
-    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
-    pub external_prerequisite: Option<(Address, u64)>,
+    /// Issue #274: invoice target in USD cents for oracle-based dynamic funding.
+    pub target_usd_cents: Option<u64>,
 }
 
 impl Invoice {
@@ -573,10 +546,8 @@ impl Invoice {
                 payment_window_secs: self.payment_window_secs,
                 scheduled_release_at: self.scheduled_release_at,
                 penalty_tiers: self.penalty_tiers,
-                allowed_callers_root: self.allowed_callers_root,
+                allowed_callers: self.allowed_callers,
                 refund_grace_secs: self.refund_grace_secs,
-                external_prerequisite: self.external_prerequisite,
-                fallback_action: self.fallback_action,
             },
             InvoiceExt2 {
                 notification_contract: self.notification_contract,
@@ -592,9 +563,7 @@ impl Invoice {
                 min_payment: self.min_payment,
                 min_funding_amount: self.min_funding_amount,
                 priorities: self.priorities,
-                creation_timestamp: self.creation_timestamp,
-                min_payment_increment: self.min_payment_increment,
-                substitute_recipient_approvals: Vec::new(self.notification_contract.env()),
+                target_usd_cents: self.target_usd_cents,
             },
         )
     }
@@ -661,10 +630,8 @@ impl Invoice {
             payment_window_secs: ext.payment_window_secs,
             scheduled_release_at: ext.scheduled_release_at,
             penalty_tiers: ext.penalty_tiers,
-            allowed_callers_root: ext.allowed_callers_root,
+            allowed_callers: ext.allowed_callers,
             refund_grace_secs: ext.refund_grace_secs,
-            external_prerequisite: ext.external_prerequisite,
-            fallback_action: ext.fallback_action,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
@@ -678,8 +645,7 @@ impl Invoice {
             min_payment: ext2.min_payment,
             min_funding_amount: ext2.min_funding_amount,
             priorities: ext2.priorities,
-            creation_timestamp: ext2.creation_timestamp,
-            min_payment_increment: ext2.min_payment_increment,
+            target_usd_cents: ext2.target_usd_cents,
         }
     }
 }
@@ -861,122 +827,38 @@ impl Invoice {
             smart_route: false,
             convert_to_stream: false,
             accepted_tokens: Vec::new(env),
-            arbiter: None,
-            disputed: false,
-            admin_frozen: false,
-            auction_on_expiry: false,
-            auction_end: 0,
-            bids: Vec::new(env),
-            min_payment: 0,
-            min_funding_amount: 0,
-            split_rules: Vec::new(env),
-            auto_resolve_rules: Vec::new(env),
-            creator_cosigner: None,
-            velocity_limit: 0,
-            velocity_window: 0,
-            pause_reason: None,
-            auto_resume_at: None,
-            payment_cooldown_secs: None,
-            max_payments_per_window: None,
-            payment_window_secs: None,
-            scheduled_release_at: None,
-            refund_grace_secs: None,
-            penalty_tiers: Vec::new(env),
-            allowed_callers_root: None,
-            notification_contract: None,
-            overflow_behavior: OverflowBehavior::Reject,
-            cross_chain_ref: None,
-            priorities: Vec::new(env),
-            forward_to: None,
-            forward_invoice_id: None,
-            parent_invoice_id: None,
-            clone_depth: 0,
-            fallback_action: None,
-        }
-    }
-
-    /// Create a default invoice from just an environment (used for legacy migration).
-    pub fn from_legacy_defaults(env: &Env) -> Self {
-        Invoice {
-            version: 1,
-            creator: panic!("must be overridden"),
-            co_creators: Vec::new(env),
-            recipients: Vec::new(env),
-            base_amounts: Vec::new(env),
-            amounts: Vec::new(env),
-            tokens: Vec::new(env),
-            deadline: 0,
-            funded: 0,
-            status: InvoiceStatus::Pending,
-            payments: Vec::new(env),
-            drip_duration: None,
-            release_timestamp: None,
-            claimed: Vec::new(env),
-            frozen: false,
-            completion_time: None,
-            allow_early_withdrawal: false,
-            bonus_pool: 0,
-            bonus_max_payers: 0,
-            prerequisite_id: None,
-            tranches: Vec::new(env),
-            released_bps: 0,
-            co_signers: Vec::new(env),
-            required_signatures: 0,
-            signatures: Vec::new(env),
-            approver: None,
-            approved: false,
-            oracle_address: None,
-            condition_met: false,
-            penalty_bps: 0,
-            penalty_deadline: 0,
-            min_funding_bps: 0,
-            release_stages: Vec::new(env),
-            released_stages: 0,
-            allowed_payers: None,
-            price_oracle: None,
-            swap_tokens: Vec::new(env),
-            tax_bps: 0,
-            tax_authority: None,
-            insurance_premium_bps: 0,
-            insurance_fund: 0,
-            smart_route: false,
-            convert_to_stream: false,
-            accepted_tokens: Vec::new(env),
-            arbiter: None,
-            disputed: false,
-            admin_frozen: false,
-            auction_on_expiry: false,
-            auction_end: 0,
-            bids: Vec::new(env),
-            min_payment: 0,
-            min_funding_amount: 0,
-            split_rules: Vec::new(env),
-            auto_resolve_rules: Vec::new(env),
-            creator_cosigner: None,
-            velocity_limit: 0,
-            velocity_window: 0,
-            pause_reason: None,
-            auto_resume_at: None,
-            payment_cooldown_secs: None,
-            max_payments_per_window: None,
-            payment_window_secs: None,
-            scheduled_release_at: None,
-            refund_grace_secs: None,
-            penalty_tiers: Vec::new(env),
-            allowed_callers_root: None,
-            notification_contract: None,
-            overflow_behavior: OverflowBehavior::Reject,
-            cross_chain_ref: None,
-            priorities: Vec::new(env),
-            forward_to: None,
-            forward_invoice_id: None,
-            parent_invoice_id: None,
-            clone_depth: 0,
-            fallback_action: None,
             require_kyc: false,
-            creation_timestamp: 0,
-            min_payment_increment: 0,
-            external_prerequisite: None,
+            arbiter: None,
+            disputed: false,
+            admin_frozen: false,
+            auction_on_expiry: false,
+            auction_end: 0,
+            bids: Vec::new(env),
+            min_payment: 0,
+            min_funding_amount: 0,
+            split_rules: Vec::new(env),
+            auto_resolve_rules: Vec::new(env),
+            creator_cosigner: None,
+            velocity_limit: 0,
+            velocity_window: 0,
+            pause_reason: None,
+            auto_resume_at: None,
+            payment_cooldown_secs: None,
+            max_payments_per_window: None,
+            payment_window_secs: None,
+            scheduled_release_at: None,
+            refund_grace_secs: None,
+            penalty_tiers: Vec::<PenaltyTier>::new(env),
+            allowed_callers: None,
+            forward_to: None,
+            forward_invoice_id: None,
+            notification_contract: None,
+            overflow_behavior: OverflowBehavior::Reject,
+            cross_chain_ref: None,
+            clone_depth: 0,
+            parent_invoice_id: None,
+            priorities: Vec::new(env),
+            target_usd_cents: None,
         }
     }
 }
