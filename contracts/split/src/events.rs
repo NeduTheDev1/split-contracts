@@ -1,4 +1,4 @@
-use soroban_sdk::{symbol_short, Address, Bytes, Env, Vec};
+use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol, Vec};
 
 /// Emitted when a new invoice is created.
 pub fn invoice_created(env: &Env, invoice_id: u64, creator: &Address, total: i128, metadata: &Option<Bytes>) {
@@ -43,5 +43,16 @@ pub fn recipient_added(env: &Env, invoice_id: u64, recipient: &Address, amount: 
     env.events().publish(
         (symbol_short!("add_rec"), invoice_id),
         (recipient.clone(), amount),
+    );
+}
+
+/// Emitted at the start of every public entry point for real-time contract health observability.
+///
+/// Topic: `(symbol_short!("monitor"), function_name)`
+/// Data:  `(invoice_id, actor_address, ledger_timestamp)`
+pub fn monitor_event(env: &Env, function: Symbol, invoice_id: u64, actor: &Address, timestamp: u64) {
+    env.events().publish(
+        (symbol_short!("monitor"), function),
+        (invoice_id, actor.clone(), timestamp),
     );
 }

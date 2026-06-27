@@ -2330,3 +2330,127 @@ fn test_min_funding_bps_allows_release_above_threshold() {
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
     assert_eq!(tk.balance(&recipient), 900);
 }
+
+// ---------------------------------------------------------------------------
+// Monitoring hooks tests (issue #180)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_monitor_event_on_create_invoice() {
+    use soroban_sdk::testutils::Events;
+
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+
+    // At least one monitor event must have been emitted for "create_invoice".
+    let found = env.events().all().iter().any(|(_, topics, _)| {
+        topics.get(0) == Some(soroban_sdk::Val::from(symbol_short!("monitor")))
+            && topics.get(1)
+                == Some(soroban_sdk::Val::from(Symbol::new(&env, "create_invoice")))
+    });
+    assert!(found, "monitor event for create_invoice not found");
+}
+
+#[test]
+fn test_monitor_event_on_pay() {
+    use soroban_sdk::testutils::Events;
+
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &200);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0_u64);
+
+    let found = env.events().all().iter().any(|(_, topics, _)| {
+        topics.get(0) == Some(soroban_sdk::Val::from(symbol_short!("monitor")))
+            && topics.get(1) == Some(soroban_sdk::Val::from(Symbol::new(&env, "pay")))
+    });
+    assert!(found, "monitor event for pay not found");
+}
+
+#[test]
+fn test_monitor_event_on_release() {
+    use soroban_sdk::testutils::Events;
+
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    // Use a co-signer to prevent auto-release so we can call release() explicitly.
+    let co_signer = Address::generate(&env);
+    let mut co_signers = soroban_sdk::Vec::new(&env);
+    co_signers.push_back(co_signer.clone());
+
+    let mut recipients = soroban_sdk::Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = soroban_sdk::Vec::new(&env);
+    amounts.push_back(100_i128);
+
+    let opts = InvoiceOptions {
+        co_creators: soroban_sdk::Vec::new(&env),
+        allow_early_withdrawal: false,
+        bonus_pool: 0,
+        bonus_max_payers: 0,
+        prerequisite_id: None,
+        tranches: soroban_sdk::Vec::new(&env),
+        co_signers,
+        required_signatures: 1,
+        penalty_bps: None,
+        penalty_deadline: None,
+        min_funding_bps: None,
+    };
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    c.pay(&payer, &id, &100_i128, &0_u64);
+    c.sign_release(&id, &co_signer);
+    c.release(&id);
+
+    let found = env.events().all().iter().any(|(_, topics, _)| {
+        topics.get(0) == Some(soroban_sdk::Val::from(symbol_short!("monitor")))
+            && topics.get(1) == Some(soroban_sdk::Val::from(Symbol::new(&env, "release")))
+    });
+    assert!(found, "monitor event for release not found");
+}
+
+#[test]
+fn test_monitor_event_on_refund() {
+    use soroban_sdk::testutils::Events;
+
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 2_000);
+    c.pay(&payer, &id, &100_i128, &0_u64);
+
+    // Advance past deadline so refund is allowed.
+    env.ledger().set_timestamp(3_000);
+    c.refund(&id);
+
+    let found = env.events().all().iter().any(|(_, topics, _)| {
+        topics.get(0) == Some(soroban_sdk::Val::from(symbol_short!("monitor")))
+            && topics.get(1) == Some(soroban_sdk::Val::from(Symbol::new(&env, "refund")))
+    });
+    assert!(found, "monitor event for refund not found");
+}

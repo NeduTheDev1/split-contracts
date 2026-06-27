@@ -325,6 +325,13 @@ impl SplitContract {
     ) -> u64 {
         require_not_paused(&env);
         creator.require_auth();
+        events::monitor_event(
+            &env,
+            Symbol::new(&env, "create_invoice"),
+            0,
+            &creator,
+            env.ledger().timestamp(),
+        );
         Self::_create_invoice_inner(
             &env,
             creator,
@@ -621,6 +628,13 @@ impl SplitContract {
     pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, auto_convert: bool) {
         require_not_paused(&env);
         payer.require_auth();
+        events::monitor_event(
+            &env,
+            Symbol::new(&env, "pay"),
+            invoice_id,
+            &payer,
+            env.ledger().timestamp(),
+        );
         Self::_pay(&env, &payer, invoice_id, amount, nonce, auto_convert);
     }
 
@@ -785,6 +799,13 @@ impl SplitContract {
         require_not_paused(&env);
         let caller = env.current_contract_address();
         let mut invoice = load_invoice(&env, invoice_id);
+        events::monitor_event(
+            &env,
+            Symbol::new(&env, "release"),
+            invoice_id,
+            &caller,
+            env.ledger().timestamp(),
+        );
 
         assert!(!invoice.frozen, "invoice is frozen");
         assert!(
@@ -1113,6 +1134,13 @@ impl SplitContract {
     pub fn refund(env: Env, invoice_id: u64) {
         require_not_paused(&env);
         let mut invoice = load_invoice(&env, invoice_id);
+        events::monitor_event(
+            &env,
+            Symbol::new(&env, "refund"),
+            invoice_id,
+            &env.current_contract_address(),
+            env.ledger().timestamp(),
+        );
 
         assert!(
             invoice.status == InvoiceStatus::Pending,
