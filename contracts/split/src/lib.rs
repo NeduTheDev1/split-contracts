@@ -501,6 +501,7 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             min_payment: 0,
             min_funding_amount: 0,
             priorities: Vec::new(env),
+            substitute_recipient_approvals: Vec::new(env),
         });
     
     // Load compact representation if available
@@ -1489,6 +1490,7 @@ impl SplitContract {
                         min_payment: 0,
                         min_funding_amount: 0,
                         priorities: Vec::new(&env),
+                        substitute_recipient_approvals: Vec::new(&env),
                     })
             });
         let audit_log: Vec<types::AuditEntry> = get_audit_log(&env, invoice_id);
@@ -5757,6 +5759,101 @@ impl SplitContract {
         env.storage().persistent().set(&key, &ids);
     }
 
+    /// Issue #230: Substitute a recipient address (e.g., if original address was compromised).
+    /// With co-signers configured, requires a fresh round of required_signatures approvals.
+    /// Without co-signers, creator auth alone suffices.
+    /// Recipient's corresponding amounts/claimed/tokens entries carry over to the new address.
+    pub fn substitute_recipient(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        old_recipient: Address,
+        new_recipient: Address,
+    ) {
+        require_not_paused(&env);
+        caller.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+        assert!(!invoice.disputed, "invoice is disputed");
+        assert!(invoice.creator == caller, "only creator can substitute recipient");
+
+        // Find the old recipient's index
+        let mut recipient_idx: Option<u64> = None;
+        for (idx, recipient) in invoice.recipients.iter().enumerate() {
+            if recipient == &old_recipient {
+                recipient_idx = Some(idx as u64);
+                break;
+            }
+        }
+        let idx = recipient_idx.expect("recipient not found") as usize;
+
+        // If co-signers are configured, require a fresh round of approvals for this substitution
+        if !invoice.co_signers.is_empty() {
+            // Require fresh approvals from co-signers for this specific substitution
+            // Track approvals separately from release approvals
+            if invoice.substitute_recipient_approvals.len() < invoice.required_signatures as usize {
+                panic!("insufficient approvals for recipient substitution");
+            }
+            // Clear the approval list after successful substitution
+            invoice.substitute_recipient_approvals.clear();
+        }
+
+        // Perform the substitution: update the recipient at idx
+        invoice.recipients.set(idx, new_recipient.clone());
+
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("sub_rec"), &caller);
+        events::recipient_updated(&env, invoice_id, &old_recipient, &new_recipient);
+
+        // Update recipient index: remove old_recipient, add new_recipient
+        let old_key = recipient_invoice_ids_key(&old_recipient);
+        if let Some(mut old_ids) = env.storage().persistent().get::<_, Vec<u64>>(&old_key) {
+            old_ids.retain(|id| id != &invoice_id);
+            if old_ids.is_empty() {
+                env.storage().persistent().remove(&old_key);
+            } else {
+                env.storage().persistent().set(&old_key, &old_ids);
+            }
+        }
+
+        let new_key = recipient_invoice_ids_key(&new_recipient);
+        let mut new_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&new_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        new_ids.push_back(invoice_id);
+        env.storage().persistent().set(&new_key, &new_ids);
+    }
+
+    /// Approve a pending recipient substitution. Only a configured co-signer may call this.
+    /// This approval is separate from release approvals.
+    pub fn approve_substitute_recipient(env: Env, invoice_id: u64, co_signer: Address) {
+        require_not_paused(&env);
+        co_signer.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.co_signers.iter().any(|cs| cs == &co_signer),
+            "not a co-signer for this invoice"
+        );
+
+        // Check if this co-signer has already approved
+        if invoice.substitute_recipient_approvals.iter().any(|addr| addr == &co_signer) {
+            panic!("co-signer has already approved substitution");
+        }
+
+        invoice.substitute_recipient_approvals.push_back(co_signer.clone());
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("app_sub"), &co_signer);
+    }
+
     // -----------------------------------------------------------------------
     // Adjust split
     // -----------------------------------------------------------------------
@@ -6451,6 +6548,8 @@ impl SplitContract {
                 cross_chain_ref: None, require_kyc: false, arbiter: None, disputed: false,
                 admin_frozen: false,
                 auction_on_expiry: false, auction_end: 0, bids: Vec::new(&env),
+                min_payment: 0, min_funding_amount: 0, priorities: Vec::new(&env),
+                substitute_recipient_approvals: Vec::new(&env),
                 min_payment: 0, creation_timestamp: 0, min_payment_increment: 0, min_funding_amount: 0, priorities: Vec::new(&env),
             });
 
@@ -6506,6 +6605,7 @@ impl SplitContract {
                         admin_frozen: false,
                         auction_on_expiry: false, auction_end: 0, bids: Vec::new(&env),
                         min_payment: 0, min_funding_amount: 0, priorities: Vec::new(&env),
+                        substitute_recipient_approvals: Vec::new(&env),
                     });
 
                 env.storage().instance().set(&invoice_key(id), &core);

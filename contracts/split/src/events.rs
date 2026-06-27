@@ -323,6 +323,14 @@ pub fn partial_refund_issued(env: &Env, invoice_id: u64, creator: &Address, bps:
     );
 }
 
+
+/// Emitted when a recipient is substituted (Issue #230).
+/// Topics: (split, sub_rec, invoice_id)
+/// Data: (old_recipient, new_recipient)
+pub fn recipient_updated(env: &Env, invoice_id: u64, old_recipient: &Address, new_recipient: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("sub_rec"), invoice_id),
+        (old_recipient.clone(), new_recipient.clone()),
 /// Emitted when a refund encounters insufficient balance and partial refunds are distributed.
 /// Topics: (split, ref_short, invoice_id)
 /// Data: shortfall_amount

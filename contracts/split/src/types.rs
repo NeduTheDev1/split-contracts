@@ -369,6 +369,8 @@ pub struct InvoiceExt2 {
     pub min_payment: i128,
     pub min_funding_amount: i128,
     pub priorities: Vec<u32>,
+    /// Issue #230: co-signers who have approved the pending recipient substitution.
+    pub substitute_recipient_approvals: Vec<Address>,
 }
 
 /// Issue #211: A single escalating penalty tier (seconds_after_deadline, bps).
@@ -482,6 +484,8 @@ pub struct Invoice {
     pub priorities: Vec<u32>,
     pub clone_depth: u32,
     pub fallback_action: Option<ResolveAction>,
+    /// Issue #230: co-signers who have approved the pending recipient substitution.
+    pub substitute_recipient_approvals: Vec<Address>,
     /// Issue #196: invoice creation timestamp for spam deposit age calculation.
     pub creation_timestamp: u64,
     /// Issue #201: minimum payment increment - reject payments below this threshold.
@@ -578,6 +582,7 @@ impl Invoice {
                 min_payment: self.min_payment,
                 min_funding_amount: self.min_funding_amount,
                 priorities: self.priorities,
+                substitute_recipient_approvals: Vec::new(self.notification_contract.env()),
             },
         )
     }
@@ -879,14 +884,15 @@ impl Invoice {
             refund_grace_secs: None,
             penalty_tiers: Vec::<PenaltyTier>::new(env),
             allowed_callers: None,
-            forward_to: None,
-            forward_invoice_id: None,
             notification_contract: None,
             overflow_behavior: OverflowBehavior::Reject,
             cross_chain_ref: None,
-            clone_depth: 0,
-            parent_invoice_id: None,
             priorities: Vec::new(env),
+            forward_to: None,
+            forward_invoice_id: None,
+            parent_invoice_id: None,
+            clone_depth: 0,
+            fallback_action: None,
             require_kyc: false,
         }
     }
