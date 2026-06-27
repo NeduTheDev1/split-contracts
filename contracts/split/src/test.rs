@@ -127,6 +127,7 @@ fn invoice_options(
         priorities: Vec::new(env),
         require_kyc: false,
         scheduled_release_at: None,
+        external_prerequisite: None,
         fallback_action: None,
     }
 }
@@ -6117,6 +6118,130 @@ fn test_refund_with_insufficient_balance() {
     assert_eq!(tk.balance(&payer3), 800);  // Partial refund: 700 + 100
 }
 
+// ---------------------------------------------------------------------------
+// Issue #232 — Invoice payment event replay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_replay_invoice_events_pending() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Invoice is still Pending (100/300 funded)
+    let before = env.events().all().len();
+    c.replay_invoice_events(&id);
+    let replayed = env.events().all().len() - before;
+
+    // invoice_created (replay) + 1× payment_received (replay) = 2; no terminal event
+    assert_eq!(replayed, 2);
+}
+
+#[test]
+fn test_replay_invoice_events_released() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &500);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+    c.pay(&payer1, &id, &100_i128, &0_u64, &false, &false);
+    c.pay(&payer2, &id, &200_i128, &0_u64, &false, &false);
+    // Invoice is Released (300/300)
+
+    let before = env.events().all().len();
+    c.replay_invoice_events(&id);
+    let replayed = env.events().all().len() - before;
+
+    // invoice_created (replay) + 2× payment_received (replay) + invoice_released (replay) = 4
+    assert_eq!(replayed, 4);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #233 — Contract-wide emergency withdrawal
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "contract must be paused")]
+fn test_emergency_withdraw_blocked_when_unpaused() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let destination = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    // Contract is not paused — must panic
+    c.request_emergency_withdraw(&admin, &token_id, &destination);
+}
+
+#[test]
+#[should_panic(expected = "emergency withdrawal requires a 7-day delay")]
+fn test_emergency_withdraw_blocked_before_7_days() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let destination = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    c.pause(&admin);
+
+    let action_id = c.request_emergency_withdraw(&admin, &token_id, &destination);
+
+    // Only a few seconds have passed — must panic
+    env.ledger().set_timestamp(5_000);
+    c.execute_action(&action_id);
+}
+
+#[test]
+fn test_emergency_withdraw_succeeds_after_7_days() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let destination = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    // Seed the contract with custodied funds
+    StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
+    assert_eq!(tk.balance(&contract_id), 500);
+
+    c.pause(&admin);
+    let action_id = c.request_emergency_withdraw(&admin, &token_id, &destination);
+
+    // Advance past the mandatory 7-day delay
+    const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
+    env.ledger().set_timestamp(1_000 + SEVEN_DAYS + 1);
+    c.execute_action(&action_id);
+
+    assert_eq!(tk.balance(&destination), 500);
+    assert_eq!(tk.balance(&contract_id), 0);
 #[test]
 #[should_panic(expected = "invoice under dispute")]
 fn test_refund_blocked_when_disputed() {

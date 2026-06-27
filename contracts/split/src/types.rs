@@ -369,6 +369,8 @@ pub struct InvoiceExt2 {
     pub min_payment: i128,
     pub min_funding_amount: i128,
     pub priorities: Vec<u32>,
+    pub creation_timestamp: u64,
+    pub min_payment_increment: i128,
     /// Issue #230: co-signers who have approved the pending recipient substitution.
     pub substitute_recipient_approvals: Vec<Address>,
 }
@@ -389,6 +391,8 @@ pub enum TimelockAction {
     SetPlatformFee(u32),
     /// Issue #241: Creator self-imposed limit raise request.
     RaiseCreatorSelfLimit(Address, i128),
+    /// Issue #233: Emergency withdrawal of all custodied funds for a given token.
+    EmergencyWithdraw(Address, Address),
 }
 
 /// A queued timelock action with metadata.
@@ -490,12 +494,8 @@ pub struct Invoice {
     pub creation_timestamp: u64,
     /// Issue #201: minimum payment increment - reject payments below this threshold.
     pub min_payment_increment: i128,
-    /// Minimum funding amount required before invoice can be released.
-    pub min_funding_amount: i128,
-    /// Issue: per-recipient release priorities (parallel to recipients); empty = no ordering.
-    pub priorities: Vec<u32>,
-    /// Issue #188: admin can freeze an invoice.
-    pub admin_frozen: bool,
+    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
+    pub external_prerequisite: Option<(Address, u64)>,
 }
 
 impl Invoice {
@@ -566,6 +566,7 @@ impl Invoice {
                 penalty_tiers: self.penalty_tiers,
                 allowed_callers: self.allowed_callers,
                 refund_grace_secs: self.refund_grace_secs,
+                external_prerequisite: self.external_prerequisite,
                 fallback_action: self.fallback_action,
             },
             InvoiceExt2 {
@@ -582,6 +583,8 @@ impl Invoice {
                 min_payment: self.min_payment,
                 min_funding_amount: self.min_funding_amount,
                 priorities: self.priorities,
+                creation_timestamp: self.creation_timestamp,
+                min_payment_increment: self.min_payment_increment,
                 substitute_recipient_approvals: Vec::new(self.notification_contract.env()),
             },
         )
@@ -651,6 +654,7 @@ impl Invoice {
             penalty_tiers: ext.penalty_tiers,
             allowed_callers: ext.allowed_callers,
             refund_grace_secs: ext.refund_grace_secs,
+            external_prerequisite: ext.external_prerequisite,
             fallback_action: ext.fallback_action,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
@@ -665,6 +669,8 @@ impl Invoice {
             min_payment: ext2.min_payment,
             min_funding_amount: ext2.min_funding_amount,
             priorities: ext2.priorities,
+            creation_timestamp: ext2.creation_timestamp,
+            min_payment_increment: ext2.min_payment_increment,
         }
     }
 }
@@ -894,6 +900,9 @@ impl Invoice {
             clone_depth: 0,
             fallback_action: None,
             require_kyc: false,
+            creation_timestamp: 0,
+            min_payment_increment: 0,
+            external_prerequisite: None,
         }
     }
 }
