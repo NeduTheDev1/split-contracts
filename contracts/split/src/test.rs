@@ -6220,3 +6220,256 @@ fn test_non_disputed_invoice_unaffected_by_dispute_logic() {
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
     assert_eq!(tk.balance(&payer), 100);
 }
+
+
+#[test]
+fn test_verify_payment_proofs_batch_single_valid() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+
+    // Make a payment
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    // Get the invoice to compute the proof hash
+    let invoice = c.get_invoice(&id);
+    let total_paid: i128 = invoice
+        .payments
+        .iter()
+        .filter(|p| p.payer == payer)
+        .map(|p| p.amount + p.tip)
+        .sum();
+
+    // Compute the proof hash
+    let mut preimage = [0u8; 24];
+    preimage[..8].copy_from_slice(&id.to_be_bytes());
+    preimage[8..24].copy_from_slice(&total_paid.to_be_bytes());
+    let bytes = soroban_sdk::Bytes::from_array(&env, &preimage);
+    let proof_hash: soroban_sdk::BytesN<32> = env.crypto().sha256(&bytes).into();
+
+    // Create a proof
+    let mut proofs = Vec::new(&env);
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id,
+        payer: payer.clone(),
+        total_paid,
+        proof_hash,
+    });
+
+    // Verify batch
+    let results = c.verify_payment_proofs_batch(&proofs);
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0), Some(true));
+}
+
+#[test]
+fn test_verify_payment_proofs_batch_multiple_mixed() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &200);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &200);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+
+    // Pay on first invoice
+    c.pay(&payer1, &id1, &50_i128, &0_u64, &false, &false);
+
+    // Pay on second invoice
+    c.pay(&payer2, &id2, &75_i128, &0_u64, &false, &false);
+
+    // Get invoices
+    let invoice1 = c.get_invoice(&id1);
+    let invoice2 = c.get_invoice(&id2);
+
+    let total1: i128 = invoice1
+        .payments
+        .iter()
+        .filter(|p| p.payer == payer1)
+        .map(|p| p.amount + p.tip)
+        .sum();
+
+    let total2: i128 = invoice2
+        .payments
+        .iter()
+        .filter(|p| p.payer == payer2)
+        .map(|p| p.amount + p.tip)
+        .sum();
+
+    // Compute proof hash for invoice1 (valid)
+    let mut preimage1 = [0u8; 24];
+    preimage1[..8].copy_from_slice(&id1.to_be_bytes());
+    preimage1[8..24].copy_from_slice(&total1.to_be_bytes());
+    let bytes1 = soroban_sdk::Bytes::from_array(&env, &preimage1);
+    let hash1: soroban_sdk::BytesN<32> = env.crypto().sha256(&bytes1).into();
+
+    // Compute proof hash for invoice2 (invalid - wrong total)
+    let mut preimage2_invalid = [0u8; 24];
+    preimage2_invalid[..8].copy_from_slice(&id2.to_be_bytes());
+    preimage2_invalid[8..24].copy_from_slice(&999_i128.to_be_bytes()); // Wrong total
+    let bytes2_invalid = soroban_sdk::Bytes::from_array(&env, &preimage2_invalid);
+    let hash2_invalid: soroban_sdk::BytesN<32> = env.crypto().sha256(&bytes2_invalid).into();
+
+    // Create batch with one valid and one invalid
+    let mut proofs = Vec::new(&env);
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id1,
+        payer: payer1.clone(),
+        total_paid: total1,
+        proof_hash: hash1,
+    });
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id2,
+        payer: payer2.clone(),
+        total_paid: 999, // Wrong in proof
+        proof_hash: hash2_invalid,
+    });
+
+    // Verify batch
+    let results = c.verify_payment_proofs_batch(&proofs);
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get(0), Some(true));  // Valid
+    assert_eq!(results.get(1), Some(false)); // Invalid
+}
+
+#[test]
+#[should_panic(expected = "batch limit exceeded")]
+fn test_verify_payment_proofs_batch_exceeds_limit() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create 21 proofs (exceeds limit of 20)
+    let mut proofs = Vec::new(&env);
+    for _ in 0..21 {
+        let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+        proofs.push_back(types::PaymentProof {
+            invoice_id: id,
+            payer: payer.clone(),
+            total_paid: 0,
+            proof_hash: soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]),
+        });
+    }
+
+    // This should panic with "batch limit exceeded"
+    c.verify_payment_proofs_batch(&proofs);
+}
+
+#[test]
+fn test_verify_payment_proofs_batch_nonexistent_invoice() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let payer = Address::generate(&env);
+
+    // Create a proof for a non-existent invoice
+    let mut proofs = Vec::new(&env);
+    proofs.push_back(types::PaymentProof {
+        invoice_id: 99999, // Non-existent
+        payer: payer.clone(),
+        total_paid: 0,
+        proof_hash: soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]),
+    });
+
+    // Verify batch should return false for non-existent invoice
+    let results = c.verify_payment_proofs_batch(&proofs);
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0), Some(false));
+}
+
+#[test]
+fn test_verify_payment_proofs_batch_maintains_order() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+    let id3 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+
+    // Pay on invoices
+    c.pay(&payer, &id1, &10_i128, &0_u64, &false, &false);
+    c.pay(&payer, &id2, &20_i128, &0_u64, &false, &false);
+    c.pay(&payer, &id3, &30_i128, &0_u64, &false, &false);
+
+    // Get invoices
+    let inv1 = c.get_invoice(&id1);
+    let inv2 = c.get_invoice(&id2);
+    let inv3 = c.get_invoice(&id3);
+
+    let total1: i128 = inv1.payments.iter().filter(|p| p.payer == payer).map(|p| p.amount + p.tip).sum();
+    let total2: i128 = inv2.payments.iter().filter(|p| p.payer == payer).map(|p| p.amount + p.tip).sum();
+    let total3: i128 = inv3.payments.iter().filter(|p| p.payer == payer).map(|p| p.amount + p.tip).sum();
+
+    // Compute valid hashes
+    let hash1 = compute_proof_hash(&env, id1, total1);
+    let hash2 = compute_proof_hash(&env, id2, total2);
+    let hash3 = compute_proof_hash(&env, id3, total3);
+
+    // Create batch in specific order
+    let mut proofs = Vec::new(&env);
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id1,
+        payer: payer.clone(),
+        total_paid: total1,
+        proof_hash: hash1,
+    });
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id2,
+        payer: payer.clone(),
+        total_paid: total2,
+        proof_hash: hash2,
+    });
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id3,
+        payer: payer.clone(),
+        total_paid: total3,
+        proof_hash: hash3,
+    });
+
+    // Verify batch and check order is maintained
+    let results = c.verify_payment_proofs_batch(&proofs);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0), Some(true));  // First proof valid
+    assert_eq!(results.get(1), Some(true));  // Second proof valid
+    assert_eq!(results.get(2), Some(true));  // Third proof valid
+}
+
+// Helper function to compute proof hash
+fn compute_proof_hash(env: &soroban_sdk::Env, invoice_id: u64, total_paid: i128) -> soroban_sdk::BytesN<32> {
+    let mut preimage = [0u8; 24];
+    preimage[..8].copy_from_slice(&invoice_id.to_be_bytes());
+    preimage[8..24].copy_from_slice(&total_paid.to_be_bytes());
+    let bytes = soroban_sdk::Bytes::from_array(&env, &preimage);
+    env.crypto().sha256(&bytes).into()
+}
