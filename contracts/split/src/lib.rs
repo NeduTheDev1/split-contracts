@@ -1008,6 +1008,33 @@ impl SplitContract {
     /// * `new_limit` - The new daily spending limit (must be >= 0)
     pub fn set_self_limit(env: Env, creator: Address, new_limit: i128) {
         creator.require_auth();
+        events::monitor_event(
+            &env,
+            Symbol::new(&env, "create_invoice"),
+            0,
+            &creator,
+            env.ledger().timestamp(),
+        );
+        Self::_create_invoice_inner(
+            &env,
+            creator,
+            recipients,
+            amounts,
+            token,
+            deadline,
+            options.co_creators,
+            options.allow_early_withdrawal,
+            options.bonus_pool,
+            options.bonus_max_payers,
+            options.prerequisite_id,
+            options.tranches,
+            options.co_signers,
+            options.required_signatures,
+            options.penalty_bps.unwrap_or(0),
+            options.penalty_deadline.unwrap_or(0),
+            options.min_funding_bps.unwrap_or(0),
+        )
+    }
         assert!(new_limit >= 0, "self limit must be non-negative");
 
         let current_limit: i128 = env
@@ -1160,6 +1187,19 @@ impl SplitContract {
     /// Only the designated arbiter may call this.
     pub fn resolve_dispute(env: Env, invoice_id: u64, arbiter: Address, resolution: ResolveAction) {
         require_not_paused(&env);
+        payer.require_auth();
+        events::monitor_event(
+            &env,
+            Symbol::new(&env, "pay"),
+            invoice_id,
+            &payer,
+            env.ledger().timestamp(),
+        );
+        Self::_pay(&env, &payer, invoice_id, amount, nonce, auto_convert);
+    }
+
+    fn _pay(env: &Env, payer: &Address, invoice_id: u64, amount: i128, nonce: u64, auto_convert: bool) {
+        let mut invoice = load_invoice(env, invoice_id);
         arbiter.require_auth();
 
         let mut invoice = load_invoice(&env, invoice_id);
@@ -1302,6 +1342,22 @@ impl SplitContract {
     // Issue #4: creator whitelist
     // -----------------------------------------------------------------------
 
+    /// Release funds to recipients.
+    ///
+    /// For tranche invoices, only distributes tranches whose timestamp ≤ now.
+    /// Blocks with "prerequisite not released" until the prerequisite invoice is Released.
+    /// If an approver is set, requires the invoice to be approved first (issue #25).
+    pub fn release(env: Env, invoice_id: u64) {
+        require_not_paused(&env);
+        let caller = env.current_contract_address();
+        let mut invoice = load_invoice(&env, invoice_id);
+        events::monitor_event(
+            &env,
+            Symbol::new(&env, "release"),
+            invoice_id,
+            &caller,
+            env.ledger().timestamp(),
+        );
     /// Add an address to the creator whitelist. Requires admin auth.
     /// When the whitelist is non-empty, only listed addresses may call create_invoice().
     pub fn whitelist_creator(env: Env, admin: Address, address: Address) {
@@ -6079,6 +6135,13 @@ impl SplitContract {
         payer.require_auth();
 
         let mut invoice = load_invoice(&env, invoice_id);
+        events::monitor_event(
+            &env,
+            Symbol::new(&env, "refund"),
+            invoice_id,
+            &env.current_contract_address(),
+            env.ledger().timestamp(),
+        );
 
         assert!(invoice.allow_early_withdrawal, "early withdrawal not allowed");
         assert!(!invoice.disputed, "invoice is disputed");

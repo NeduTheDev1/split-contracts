@@ -1,3 +1,4 @@
+use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol, Vec};
 use soroban_sdk::{symbol_short, Address, Env, Vec, String};
 use crate::types::TimelockAction;
 
@@ -267,6 +268,14 @@ pub fn pending_payout_claimed(env: &Env, invoice_id: u64, recipient: &Address, a
     );
 }
 
+/// Emitted at the start of every public entry point for real-time contract health observability.
+///
+/// Topic: `(symbol_short!("monitor"), function_name)`
+/// Data:  `(invoice_id, actor_address, ledger_timestamp)`
+pub fn monitor_event(env: &Env, function: Symbol, invoice_id: u64, actor: &Address, timestamp: u64) {
+    env.events().publish(
+        (symbol_short!("monitor"), function),
+        (invoice_id, actor.clone(), timestamp),
 /// Emitted when an emergency withdrawal is executed.
 /// Topics: (split, emrg_wd)
 /// Data: (token, destination, amount)
