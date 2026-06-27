@@ -53,6 +53,7 @@ pub struct ResolveRule {
 pub struct InvoicePayment {
     pub invoice_id: u64,
     pub amount: i128,
+    pub nonce: u64,
 }
 
 #[contracttype]

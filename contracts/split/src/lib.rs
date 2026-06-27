@@ -38,9 +38,6 @@ fn admin_key() -> Symbol {
 fn admins_key() -> Symbol {
     symbol_short!("admins")
 }
-fn pending_admin_key() -> Symbol {
-    symbol_short!("pd_adm")
-}
 fn paused_key() -> Symbol {
     symbol_short!("paused")
 }
@@ -438,6 +435,10 @@ fn pending_admin_key() -> Symbol {
     symbol_short!("pend_adm")
 }
 
+fn admin_proposal_time_key() -> Symbol {
+    symbol_short!("adm_prop")
+}
+
 fn maybe_record_created(env: &Env, creator: &Address, total: i128) {
     if let Some(dashboard) = env.storage().persistent().get::<Symbol, Address>(&dashboard_contract_key()) {
         let _: Val = env.invoke_contract(
@@ -776,7 +777,14 @@ fn maybe_record_refunded(env: &Env, creator: &Address) {
     if let Some(dashboard) = env
         .storage()
         .persistent()
-        .set(&invoice_ext_key(id), ext);
+        .get::<Symbol, Address>(&dashboard_contract_key())
+    {
+        let _: Val = env.invoke_contract(
+            &dashboard,
+            &Symbol::new(env, "record_refunded"),
+            (creator.clone(),).into_val(env),
+        );
+    }
 }
 
 fn maybe_record_released(env: &Env, creator: &Address, amount: i128) {
@@ -1019,15 +1027,20 @@ impl SplitContract {
     // -----------------------------------------------------------------------
 
     /// Propose a new admin. Requires current admin auth.
+    /// Stores the proposal timestamp so that accept_admin() enforces a timelock delay.
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
         require_non_reentrant(&env);
         require_admin(&env);
         let _ = admin;
+        assert!(new_admin != env.current_contract_address(), "cannot set contract as admin");
         env.storage().instance().set(&pending_admin_key(), &new_admin);
+        env.storage().instance().set(&admin_proposal_time_key(), &env.ledger().timestamp());
         clear_reentrant(&env);
     }
 
     /// Accept the admin role. Requires the proposed admin to authenticate.
+    /// Only succeeds after the timelock duration (set via set_timelock_secs) has elapsed
+    /// since propose_admin() was called.
     pub fn accept_admin(env: Env) {
         require_non_reentrant(&env);
         let pending: Address = env
@@ -1036,8 +1049,26 @@ impl SplitContract {
             .get(&pending_admin_key())
             .expect("no pending admin");
         pending.require_auth();
+
+        let proposed_at: u64 = env
+            .storage()
+            .instance()
+            .get(&admin_proposal_time_key())
+            .expect("no admin proposal time");
+        let timelock_secs: u64 = env
+            .storage()
+            .persistent()
+            .get(&timelock_secs_key())
+            .unwrap_or(0u64);
+        let now = env.ledger().timestamp();
+        assert!(
+            now >= proposed_at.saturating_add(timelock_secs),
+            "timelock not yet elapsed"
+        );
+
         env.storage().instance().set(&admin_key(), &pending);
         env.storage().instance().remove(&pending_admin_key());
+        env.storage().instance().remove(&admin_proposal_time_key());
         clear_reentrant(&env);
     }
 
@@ -1390,6 +1421,11 @@ impl SplitContract {
     // Issue #4: creator whitelist
     // -----------------------------------------------------------------------
 
+    /// Release funds to recipients.
+    ///
+    /// For tranche invoices, only distributes tranches whose timestamp ≤ now.
+    /// Blocks with "prerequisite not released" until the prerequisite invoice is Released.
+    /// If an approver is set, requires the invoice to be approved first (issue #25).
     /// Add an address to the creator whitelist. Requires admin auth.
     /// When the whitelist is non-empty, only listed addresses may call create_invoice().
     pub fn whitelist_creator(env: Env, admin: Address, address: Address) {
@@ -3549,6 +3585,7 @@ impl SplitContract {
         invoice_id: u64,
         source_token: Address,
         source_amount: i128,
+        nonce: u64,
     ) {
         require_non_reentrant(&env);
         require_fn_not_paused(&env, &symbol_short!("brg_pay"));
@@ -3559,6 +3596,17 @@ impl SplitContract {
         assert!(!invoice.disputed, "invoice is disputed");
         assert!(env.ledger().timestamp() <= invoice.deadline, "invoice deadline has passed");
         assert!(source_amount > 0, "payment amount must be positive");
+
+        // Validate and increment per-payer nonce.
+        let stored_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&nonce_key(invoice_id, &payer))
+            .unwrap_or(0u64);
+        assert!(nonce == stored_nonce, "invalid nonce");
+        env.storage()
+            .persistent()
+            .set(&nonce_key(invoice_id, &payer), &(stored_nonce + 1));
 
         let invoice_token = invoice.tokens.get(0).expect("no token");
         let src_client = token::Client::new(&env, &source_token);
@@ -3657,6 +3705,13 @@ impl SplitContract {
                 inv.tokens.get(0).expect("no token") == shared_token,
                 "all invoices must use the same token"
             );
+            // Validate per-payer per-invoice nonce.
+            let stored_nonce: u64 = env
+                .storage()
+                .persistent()
+                .get(&nonce_key(p.invoice_id, &payer))
+                .unwrap_or(0u64);
+            assert!(p.nonce == stored_nonce, "invalid nonce");
             total += p.amount;
         }
 
@@ -3678,6 +3733,16 @@ impl SplitContract {
             env.storage().persistent().set(&pay_shard_key(p.invoice_id, shard_id), &shard_payments);
 
             inv.funded += p.amount;
+
+            // Increment nonce after successful payment.
+            let prev_nonce: u64 = env
+                .storage()
+                .persistent()
+                .get(&nonce_key(p.invoice_id, &payer))
+                .unwrap_or(0u64);
+            env.storage()
+                .persistent()
+                .set(&nonce_key(p.invoice_id, &payer), &(prev_nonce + 1));
 
             append_audit_entry(&env, p.invoice_id, symbol_short!("pool_pay"), &payer);
             events::payment_received(&env, p.invoice_id, &payer, p.amount);

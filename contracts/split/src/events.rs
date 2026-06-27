@@ -276,6 +276,9 @@ pub fn monitor_event(env: &Env, function: Symbol, invoice_id: u64, actor: &Addre
     env.events().publish(
         (symbol_short!("monitor"), function),
         (invoice_id, actor.clone(), timestamp),
+    );
+}
+
 /// Emitted when an emergency withdrawal is executed.
 /// Topics: (split, emrg_wd)
 /// Data: (token, destination, amount)
@@ -334,6 +337,9 @@ pub fn recipient_updated(env: &Env, invoice_id: u64, old_recipient: &Address, ne
     env.events().publish(
         (symbol_short!("split"), symbol_short!("sub_rec"), invoice_id),
         (old_recipient.clone(), new_recipient.clone()),
+    );
+}
+
 /// Emitted when a refund encounters insufficient balance and partial refunds are distributed.
 /// Topics: (split, ref_short, invoice_id)
 /// Data: shortfall_amount
