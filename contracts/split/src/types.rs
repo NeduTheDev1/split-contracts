@@ -237,6 +237,8 @@ pub struct InvoiceOptions {
     pub require_kyc: bool,
     /// Fallback action to execute if no auto_resolve_rules match (Release, Refund, or None).
     pub fallback_action: Option<ResolveAction>,
+    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
+    pub external_prerequisite: Option<(Address, u64)>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -345,6 +347,8 @@ pub struct InvoiceExt {
     pub allowed_callers: Option<Vec<Address>>,
     pub refund_grace_secs: Option<u64>,
     pub fallback_action: Option<ResolveAction>,
+    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
+    pub external_prerequisite: Option<(Address, u64)>,
 }
 
 #[contracttype]
@@ -381,6 +385,8 @@ pub struct PenaltyTier {
 pub enum TimelockAction {
     SetTreasury(Address),
     SetPlatformFee(u32),
+    /// Issue #241: Creator self-imposed limit raise request.
+    RaiseCreatorSelfLimit(Address, i128),
 }
 
 /// A queued timelock action with metadata.
@@ -476,6 +482,16 @@ pub struct Invoice {
     pub priorities: Vec<u32>,
     pub clone_depth: u32,
     pub fallback_action: Option<ResolveAction>,
+    /// Issue #196: invoice creation timestamp for spam deposit age calculation.
+    pub creation_timestamp: u64,
+    /// Issue #201: minimum payment increment - reject payments below this threshold.
+    pub min_payment_increment: i128,
+    /// Minimum funding amount required before invoice can be released.
+    pub min_funding_amount: i128,
+    /// Issue: per-recipient release priorities (parallel to recipients); empty = no ordering.
+    pub priorities: Vec<u32>,
+    /// Issue #188: admin can freeze an invoice.
+    pub admin_frozen: bool,
 }
 
 impl Invoice {
@@ -825,7 +841,6 @@ impl Invoice {
             smart_route: false,
             convert_to_stream: false,
             accepted_tokens: Vec::new(env),
-            require_kyc: false,
             arbiter: None,
             disputed: false,
             admin_frozen: false,
@@ -857,6 +872,22 @@ impl Invoice {
             parent_invoice_id: None,
             clone_depth: 0,
             fallback_action: None,
+        }
+    }   max_payments_per_window: None,
+            payment_window_secs: None,
+            scheduled_release_at: None,
+            refund_grace_secs: None,
+            penalty_tiers: Vec::<PenaltyTier>::new(env),
+            allowed_callers: None,
+            forward_to: None,
+            forward_invoice_id: None,
+            notification_contract: None,
+            overflow_behavior: OverflowBehavior::Reject,
+            cross_chain_ref: None,
+            clone_depth: 0,
+            parent_invoice_id: None,
+            priorities: Vec::new(env),
+            require_kyc: false,
         }
     }
 }
