@@ -235,6 +235,8 @@ pub struct InvoiceOptions {
     pub scheduled_release_at: Option<u64>,
     /// KYC verification requirement.
     pub require_kyc: bool,
+    /// Fallback action to execute if no auto_resolve_rules match (Release, Refund, or None).
+    pub fallback_action: Option<ResolveAction>,
     /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
     pub external_prerequisite: Option<(Address, u64)>,
 }
@@ -344,6 +346,7 @@ pub struct InvoiceExt {
     pub penalty_tiers: Vec<PenaltyTier>,
     pub allowed_callers: Option<Vec<Address>>,
     pub refund_grace_secs: Option<u64>,
+    pub fallback_action: Option<ResolveAction>,
     /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
     pub external_prerequisite: Option<(Address, u64)>,
 }
@@ -368,6 +371,8 @@ pub struct InvoiceExt2 {
     pub priorities: Vec<u32>,
     pub creation_timestamp: u64,
     pub min_payment_increment: i128,
+    /// Issue #230: co-signers who have approved the pending recipient substitution.
+    pub substitute_recipient_approvals: Vec<Address>,
 }
 
 /// Issue #211: A single escalating penalty tier (seconds_after_deadline, bps).
@@ -482,6 +487,9 @@ pub struct Invoice {
     pub min_funding_amount: i128,
     pub priorities: Vec<u32>,
     pub clone_depth: u32,
+    pub fallback_action: Option<ResolveAction>,
+    /// Issue #230: co-signers who have approved the pending recipient substitution.
+    pub substitute_recipient_approvals: Vec<Address>,
     /// Issue #196: invoice creation timestamp for spam deposit age calculation.
     pub creation_timestamp: u64,
     /// Issue #201: minimum payment increment - reject payments below this threshold.
@@ -559,6 +567,7 @@ impl Invoice {
                 allowed_callers: self.allowed_callers,
                 refund_grace_secs: self.refund_grace_secs,
                 external_prerequisite: self.external_prerequisite,
+                fallback_action: self.fallback_action,
             },
             InvoiceExt2 {
                 notification_contract: self.notification_contract,
@@ -576,6 +585,7 @@ impl Invoice {
                 priorities: self.priorities,
                 creation_timestamp: self.creation_timestamp,
                 min_payment_increment: self.min_payment_increment,
+                substitute_recipient_approvals: Vec::new(self.notification_contract.env()),
             },
         )
     }
@@ -645,6 +655,7 @@ impl Invoice {
             allowed_callers: ext.allowed_callers,
             refund_grace_secs: ext.refund_grace_secs,
             external_prerequisite: ext.external_prerequisite,
+            fallback_action: ext.fallback_action,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
@@ -861,16 +872,33 @@ impl Invoice {
             payment_window_secs: None,
             scheduled_release_at: None,
             refund_grace_secs: None,
-            penalty_tiers: Vec::<PenaltyTier>::new(env),
+            penalty_tiers: Vec::new(env),
             allowed_callers: None,
-            forward_to: None,
-            forward_invoice_id: None,
             notification_contract: None,
             overflow_behavior: OverflowBehavior::Reject,
             cross_chain_ref: None,
-            clone_depth: 0,
-            parent_invoice_id: None,
             priorities: Vec::new(env),
+            forward_to: None,
+            forward_invoice_id: None,
+            parent_invoice_id: None,
+            clone_depth: 0,
+            fallback_action: None,
+        }
+    }   max_payments_per_window: None,
+            payment_window_secs: None,
+            scheduled_release_at: None,
+            refund_grace_secs: None,
+            penalty_tiers: Vec::<PenaltyTier>::new(env),
+            allowed_callers: None,
+            notification_contract: None,
+            overflow_behavior: OverflowBehavior::Reject,
+            cross_chain_ref: None,
+            priorities: Vec::new(env),
+            forward_to: None,
+            forward_invoice_id: None,
+            parent_invoice_id: None,
+            clone_depth: 0,
+            fallback_action: None,
             require_kyc: false,
             creation_timestamp: 0,
             min_payment_increment: 0,

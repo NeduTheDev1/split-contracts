@@ -479,6 +479,7 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             penalty_tiers: Vec::new(env),
             allowed_callers: None,
             refund_grace_secs: None,
+            fallback_action: None,
             external_prerequisite: None,
         });
     let ext2: InvoiceExt2 = env.storage().persistent()
@@ -500,6 +501,7 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             priorities: Vec::new(env),
             creation_timestamp: 0,
             min_payment_increment: 0,
+            substitute_recipient_approvals: Vec::new(env),
         });
 
     // Load compact representation if available
@@ -1466,6 +1468,7 @@ impl SplitContract {
                         priorities: Vec::new(&env),
                         creation_timestamp: 0,
                         min_payment_increment: 0,
+                        substitute_recipient_approvals: Vec::new(&env),
                     })
             });
         let audit_log: Vec<types::AuditEntry> = get_audit_log(&env, invoice_id);
@@ -1833,6 +1836,7 @@ impl SplitContract {
             options.priorities,
             options.require_kyc,
             options.scheduled_release_at,
+            options.fallback_action,
             options.external_prerequisite,
         )
     }
@@ -1884,6 +1888,7 @@ impl SplitContract {
         priorities: Vec<u32>,
         require_kyc: bool,
         scheduled_release_at: Option<u64>,
+        fallback_action: Option<ResolveAction>,
         external_prerequisite: Option<(Address, u64)>,
     ) -> u64 {
         assert!(
@@ -2192,6 +2197,7 @@ impl SplitContract {
             min_funding_amount: 0,
             creation_timestamp: env.ledger().timestamp(),
             min_payment_increment: 0,
+            fallback_action,
             external_prerequisite,
         };
 
@@ -4792,18 +4798,19 @@ impl SplitContract {
     // -----------------------------------------------------------------------
 
     /// Evaluate auto_resolve_rules in order against the current funding ratio.
-    /// Executes the first matching rule — Release calls _release(), Refund refunds payers.
-    /// Panics with "no matching resolution rule" if no rule matches.
+    /// Automatically resolves an invoice based on funding progress and configured auto-resolve rules.
+    /// Evaluates rules in order; executes the first matching rule's action (Release or Refund).
+    /// If no rule matches and a fallback_action is configured, executes it.
+    /// If no rule matches and no fallback_action is configured, it's a no-op (idempotent).
+    /// Panics only if invoice is not pending or is disputed.
     pub fn auto_resolve(env: Env, invoice_id: u64) {
         require_not_paused(&env);
         let mut invoice = load_invoice(&env, invoice_id);
 
-        assert!(
-            invoice.status == InvoiceStatus::Pending,
-            "invoice is not pending"
-        );
+        if invoice.status != InvoiceStatus::Pending {
+            return;
+        }
         assert!(!invoice.disputed, "invoice is disputed");
-        assert!(!invoice.auto_resolve_rules.is_empty(), "no auto-resolve rules defined");
 
         let total: i128 = invoice.amounts.iter().sum();
         assert!(total > 0, "invoice total must be positive");
@@ -4864,7 +4871,56 @@ impl SplitContract {
             }
         }
 
-        panic!("no matching resolution rule");
+        // No matching rule — check for fallback_action.
+        if let Some(action) = invoice.fallback_action {
+            match action {
+                ResolveAction::Release => {
+                    let caller = env.current_contract_address();
+                    Self::_release(&env, invoice_id, &mut invoice, &caller);
+                }
+                ResolveAction::Refund => {
+                    let token_client = token::Client::new(
+                        &env,
+                        &invoice.tokens.get(0).expect("no token"),
+                    );
+                    let mut totals: Map<Address, i128> = Map::new(&env);
+                    for payment in invoice.payments.iter() {
+                        let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+                        totals.set(payment.payer.clone(), prev + payment.amount);
+                    }
+                    let mut total_refunded_amount: i128 = 0;
+                    for (payer, amount) in totals.iter() {
+                        token_client.transfer(
+                            &env.current_contract_address(),
+                            &payer,
+                            &amount,
+                        );
+                        total_refunded_amount += amount;
+                        events::payer_refunded(&env, invoice_id, &payer, amount);
+                    }
+                    invoice.status = InvoiceStatus::Refunded;
+                    invoice.completion_time = Some(env.ledger().timestamp());
+                    save_invoice(&env, invoice_id, &invoice);
+                    let actor = env.current_contract_address();
+                    append_audit_entry(&env, invoice_id, symbol_short!("auto_ref"), &actor);
+                    events::invoice_refunded(&env, invoice_id);
+                    maybe_record_refunded(&env, &invoice.creator);
+                    notify_invoice(&env, invoice_id, symbol_short!("refund"), &invoice.notification_contract);
+                    let total_refunded: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&total_refunded_key())
+                        .unwrap_or(0i128);
+                    env.storage().persistent().set(
+                        &total_refunded_key(),
+                        &total_refunded
+                            .checked_add(total_refunded_amount)
+                            .expect("total_refunded overflow"),
+                    );
+                }
+            }
+        }
+        // else: no-op, intentional and idempotent.
     }
 
     // -----------------------------------------------------------------------
@@ -4923,6 +4979,10 @@ impl SplitContract {
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
         );
+        
+        // Issue #229: Freeze deadline clock during active dispute.
+        // Refund is blocked entirely while disputed, regardless of deadline advancement.
+        assert!(!invoice.disputed, "invoice under dispute");
 
         // Check grace period if configured
         let refund_deadline = if let Some(grace_secs) = invoice.refund_grace_secs {
@@ -5694,6 +5754,101 @@ impl SplitContract {
         env.storage().persistent().set(&key, &ids);
     }
 
+    /// Issue #230: Substitute a recipient address (e.g., if original address was compromised).
+    /// With co-signers configured, requires a fresh round of required_signatures approvals.
+    /// Without co-signers, creator auth alone suffices.
+    /// Recipient's corresponding amounts/claimed/tokens entries carry over to the new address.
+    pub fn substitute_recipient(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        old_recipient: Address,
+        new_recipient: Address,
+    ) {
+        require_not_paused(&env);
+        caller.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+        assert!(!invoice.disputed, "invoice is disputed");
+        assert!(invoice.creator == caller, "only creator can substitute recipient");
+
+        // Find the old recipient's index
+        let mut recipient_idx: Option<u64> = None;
+        for (idx, recipient) in invoice.recipients.iter().enumerate() {
+            if recipient == &old_recipient {
+                recipient_idx = Some(idx as u64);
+                break;
+            }
+        }
+        let idx = recipient_idx.expect("recipient not found") as usize;
+
+        // If co-signers are configured, require a fresh round of approvals for this substitution
+        if !invoice.co_signers.is_empty() {
+            // Require fresh approvals from co-signers for this specific substitution
+            // Track approvals separately from release approvals
+            if invoice.substitute_recipient_approvals.len() < invoice.required_signatures as usize {
+                panic!("insufficient approvals for recipient substitution");
+            }
+            // Clear the approval list after successful substitution
+            invoice.substitute_recipient_approvals.clear();
+        }
+
+        // Perform the substitution: update the recipient at idx
+        invoice.recipients.set(idx, new_recipient.clone());
+
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("sub_rec"), &caller);
+        events::recipient_updated(&env, invoice_id, &old_recipient, &new_recipient);
+
+        // Update recipient index: remove old_recipient, add new_recipient
+        let old_key = recipient_invoice_ids_key(&old_recipient);
+        if let Some(mut old_ids) = env.storage().persistent().get::<_, Vec<u64>>(&old_key) {
+            old_ids.retain(|id| id != &invoice_id);
+            if old_ids.is_empty() {
+                env.storage().persistent().remove(&old_key);
+            } else {
+                env.storage().persistent().set(&old_key, &old_ids);
+            }
+        }
+
+        let new_key = recipient_invoice_ids_key(&new_recipient);
+        let mut new_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&new_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        new_ids.push_back(invoice_id);
+        env.storage().persistent().set(&new_key, &new_ids);
+    }
+
+    /// Approve a pending recipient substitution. Only a configured co-signer may call this.
+    /// This approval is separate from release approvals.
+    pub fn approve_substitute_recipient(env: Env, invoice_id: u64, co_signer: Address) {
+        require_not_paused(&env);
+        co_signer.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        assert!(
+            invoice.co_signers.iter().any(|cs| cs == &co_signer),
+            "not a co-signer for this invoice"
+        );
+
+        // Check if this co-signer has already approved
+        if invoice.substitute_recipient_approvals.iter().any(|addr| addr == &co_signer) {
+            panic!("co-signer has already approved substitution");
+        }
+
+        invoice.substitute_recipient_approvals.push_back(co_signer.clone());
+        save_invoice(&env, invoice_id, &invoice);
+        append_audit_entry(&env, invoice_id, symbol_short!("app_sub"), &co_signer);
+    }
+
     // -----------------------------------------------------------------------
     // Adjust split
     // -----------------------------------------------------------------------
@@ -6226,6 +6381,49 @@ impl SplitContract {
         recomputed_hash == proof.proof_hash
     }
 
+    /// Issue #231: Batch verify multiple payment proofs in a single call.
+    /// Reduces the number of contract calls needed for off-chain reconciliation.
+    /// Returns a Vec of booleans in the same order as the input proofs.
+    /// A single invalid proof does not prevent verification of others.
+    /// Capped at 20 proofs per call.
+    pub fn verify_payment_proofs_batch(env: Env, proofs: Vec<PaymentProof>) -> Vec<bool> {
+        assert!(proofs.len() <= 20, "batch limit exceeded");
+
+        let mut results = Vec::new(&env);
+
+        for proof in proofs.iter() {
+            // Return false if invoice doesn't exist
+            let invoice = if env.storage().persistent().has(&invoice_key(proof.invoice_id)) 
+                || env.storage().instance().has(&invoice_key(proof.invoice_id)) {
+                load_invoice(&env, proof.invoice_id)
+            } else {
+                results.push_back(false);
+                continue;
+            };
+
+            // Recompute the current total for the payer
+            let current_total: i128 = invoice
+                .payments
+                .iter()
+                .filter(|p| p.payer == proof.payer)
+                .map(|p| p.amount + p.tip)
+                .sum();
+
+            // Recompute the hash using the current total
+            let mut preimage = [0u8; 24];
+            preimage[..8].copy_from_slice(&proof.invoice_id.to_be_bytes());
+            preimage[8..24].copy_from_slice(&current_total.to_be_bytes());
+
+            let bytes = Bytes::from_array(&env, &preimage);
+            let recomputed_hash: BytesN<32> = env.crypto().sha256(&bytes).into();
+
+            // Compare with the proof's hash and add result
+            results.push_back(recomputed_hash == proof.proof_hash);
+        }
+
+        results
+    }
+
     /// Return all invoice IDs that include `recipient` as a recipient (issue #40).
     pub fn get_recipient_invoice_ids(env: Env, recipient: Address) -> Vec<u64> {
         env.storage()
@@ -6388,6 +6586,8 @@ impl SplitContract {
                 cross_chain_ref: None, require_kyc: false, arbiter: None, disputed: false,
                 admin_frozen: false,
                 auction_on_expiry: false, auction_end: 0, bids: Vec::new(&env),
+                min_payment: 0, min_funding_amount: 0, priorities: Vec::new(&env),
+                substitute_recipient_approvals: Vec::new(&env),
                 min_payment: 0, creation_timestamp: 0, min_payment_increment: 0, min_funding_amount: 0, priorities: Vec::new(&env),
             });
 
@@ -6444,6 +6644,7 @@ impl SplitContract {
                         auction_on_expiry: false, auction_end: 0, bids: Vec::new(&env),
                         min_payment: 0, min_funding_amount: 0, priorities: Vec::new(&env),
                         creation_timestamp: 0, min_payment_increment: 0,
+                        substitute_recipient_approvals: Vec::new(&env),
                     });
 
                 env.storage().instance().set(&invoice_key(id), &core);

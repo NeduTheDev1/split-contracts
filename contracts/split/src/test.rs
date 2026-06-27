@@ -76,6 +76,7 @@ fn default_options(env: &Env) -> InvoiceOptions {
         priorities: Vec::new(env),
         require_kyc: false,
         scheduled_release_at: None,
+        fallback_action: None,
         external_prerequisite: None,
     }
 }
@@ -127,6 +128,7 @@ fn invoice_options(
         require_kyc: false,
         scheduled_release_at: None,
         external_prerequisite: None,
+        fallback_action: None,
     }
 }
 
@@ -5041,6 +5043,13 @@ fn test_all_or_nothing_group_still_requires_all_funded() {
     c.release(&id1); // should panic
 }
 
+
+// ---------------------------------------------------------------------------
+// Fallback action for auto_resolve tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_auto_resolve_no_rules_match_fallback_refunds() {
 // ---------------------------------------------------------------------------
 // Escrow migration
 // ---------------------------------------------------------------------------
@@ -5051,6 +5060,183 @@ fn test_migrate_escrow_transfers_balance() {
     let c = client(&env, &contract_id);
     let tk = token_client(&env, &token_id);
 
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 50% rule (Release) but only 40% funded
+    // and fallback_action = Refund
+    let mut rules = Vec::new(&env);
+    rules.push_back(types::ResolveRule {
+        min_funded_bps: 5000, // 50%
+        action: types::ResolveAction::Release,
+    });
+    let mut opts = default_options(&env);
+    opts.auto_resolve_rules = rules;
+    opts.fallback_action = Some(types::ResolveAction::Refund);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay 40 (40% of 100)
+    c.pay(&payer, &id, &40_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 60);
+
+    // Call auto_resolve; should execute fallback_action (Refund)
+    c.auto_resolve(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+    assert_eq!(tk.balance(&payer), 100);
+}
+
+#[test]
+fn test_auto_resolve_no_rules_match_fallback_releases() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 80% rule (Release) but only 50% funded
+    // and fallback_action = Release
+    let mut rules = Vec::new(&env);
+    rules.push_back(types::ResolveRule {
+        min_funded_bps: 8000, // 80%
+        action: types::ResolveAction::Release,
+    });
+    let mut opts = default_options(&env);
+    opts.auto_resolve_rules = rules;
+    opts.fallback_action = Some(types::ResolveAction::Release);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay 50 (50% of 100)
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 50);
+
+    // Call auto_resolve; should execute fallback_action (Release)
+    c.auto_resolve(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 50);
+}
+
+#[test]
+fn test_auto_resolve_no_rules_match_no_fallback_is_noop() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 80% rule (Release) but only 50% funded
+    // and NO fallback_action
+    let mut rules = Vec::new(&env);
+    rules.push_back(types::ResolveRule {
+        min_funded_bps: 8000, // 80%
+        action: types::ResolveAction::Release,
+    });
+    let mut opts = default_options(&env);
+    opts.auto_resolve_rules = rules;
+    opts.fallback_action = None;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay 50 (50% of 100)
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 50);
+    assert_eq!(tk.balance(&recipient), 0);
+
+    // Call auto_resolve; should be a no-op (no rule matches, no fallback)
+    c.auto_resolve(&id);
+
+    // Invoice should still be Pending, payments unchanged
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 50);
+    assert_eq!(tk.balance(&recipient), 0);
+
+    // Calling auto_resolve again should still be a no-op (idempotent)
+    c.auto_resolve(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+}
+
+#[test]
+fn test_auto_resolve_rule_matches_ignores_fallback() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 50% rule (Release) and 50% funded
+    // and fallback_action = Refund (but should be ignored)
+    let mut rules = Vec::new(&env);
+    rules.push_back(types::ResolveRule {
+        min_funded_bps: 5000, // 50%
+        action: types::ResolveAction::Release,
+    });
+    let mut opts = default_options(&env);
+    opts.auto_resolve_rules = rules;
+    opts.fallback_action = Some(types::ResolveAction::Refund);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay exactly 50 (50% of 100)
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+    // Call auto_resolve; should execute the rule (Release), not fallback
+    c.auto_resolve(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 50);
+}
+
+#[test]
+fn test_auto_resolve_idempotency_second_call_noop() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
     let admin = Address::generate(&env);
     let creator = Address::generate(&env);
     let payer = Address::generate(&env);
@@ -5187,6 +5373,345 @@ fn test_creator_self_limit_enforced_in_create_invoice() {
     let payer = Address::generate(&env);
     let recipient = Address::generate(&env);
 
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with fallback_action = Release
+    let mut opts = default_options(&env);
+    opts.fallback_action = Some(types::ResolveAction::Release);
+    // Create invoice with 80% rule (Release) but only 50% funded
+    // and NO fallback_action
+    let mut rules = Vec::new(&env);
+    rules.push_back(types::ResolveRule {
+        min_funded_bps: 8000, // 80%
+        action: types::ResolveAction::Release,
+    });
+    let mut opts = default_options(&env);
+    opts.auto_resolve_rules = rules;
+    opts.fallback_action = None;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay 30 (30% of 100)
+    c.pay(&payer, &id, &30_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+    // First auto_resolve call executes fallback (Release)
+    c.auto_resolve(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 30);
+
+    // Second auto_resolve call should be a no-op (invoice not Pending)
+    // and not panic about "invoice is not pending"
+    c.auto_resolve(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 30); // unchanged
+}
+
+#[test]
+#[should_panic(expected = "invoice under dispute")]
+fn test_refund_blocked_when_disputed() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    
+    // Set arbiter so disputes can be raised
+    let admin = Address::generate(&env);
+    c.set_arbiter(&admin, &id, &arbiter);
+    
+    // Pay 100
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Raise dispute
+    c.raise_dispute(&id, &arbiter);
+    assert!(c.get_invoice(&id).disputed);
+
+    // Move time far past deadline
+    env.ledger().set_timestamp(10_000);
+
+    // Attempt refund should panic with "invoice under dispute"
+    // even though deadline has long since passed
+    c.refund(&id);
+}
+
+#[test]
+fn test_refund_allowed_after_dispute_resolved() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    
+    // Set arbiter
+    let admin = Address::generate(&env);
+    c.set_arbiter(&admin, &id, &arbiter);
+    
+    // Pay 100
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Raise dispute
+    c.raise_dispute(&id, &arbiter);
+    assert!(c.get_invoice(&id).disputed);
+
+    // Resolve the dispute with Refund
+    c.resolve_dispute(&id, &arbiter, types::ResolveAction::Refund);
+    
+    // Verify invoice is now Refunded and balance restored
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+    assert!(!c.get_invoice(&id).disputed);
+    assert_eq!(tk.balance(&payer), 100);
+}
+
+#[test]
+fn test_non_disputed_invoice_unaffected_by_dispute_logic() {
+    // Pay 50 (50% of 100)
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 50);
+    assert_eq!(tk.balance(&recipient), 0);
+
+    // Call auto_resolve; should be a no-op (no rule matches, no fallback)
+    c.auto_resolve(&id);
+
+    // Invoice should still be Pending, payments unchanged
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 50);
+    assert_eq!(tk.balance(&recipient), 0);
+
+    // Calling auto_resolve again should still be a no-op (idempotent)
+    c.auto_resolve(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+}
+
+#[test]
+fn test_auto_resolve_rule_matches_ignores_fallback() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice without setting an arbiter
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    
+    // Pay 100
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Verify invoice is not disputed
+    assert!(!c.get_invoice(&id).disputed);
+
+    // Move time past deadline
+    env.ledger().set_timestamp(3_000);
+
+    // Refund should work normally (no dispute check impacts it)
+    c.refund(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+    assert_eq!(tk.balance(&payer), 100);
+}
+
+
+#[test]
+fn test_substitute_recipient_no_cosigners() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let old_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &old_recipient, 100, &token_id, 2_000);
+
+    // Pay partial amount
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    // Substitute recipient (no co-signers, creator auth alone)
+    c.substitute_recipient(&creator, &id, &old_recipient, &new_recipient);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.recipients.get(0), Some(new_recipient.clone()));
+
+    // Release to new recipient
+    c.release(&creator, &id);
+    assert_eq!(tk.balance(&new_recipient), 50);
+    assert_eq!(tk.balance(&old_recipient), 0);
+}
+
+#[test]
+#[should_panic(expected = "recipient not found")]
+fn test_substitute_recipient_not_found() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let old_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+    let not_a_recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &old_recipient, 100, &token_id, 2_000);
+
+    // Try to substitute a non-existent recipient
+    c.substitute_recipient(&creator, &id, &not_a_recipient, &new_recipient);
+}
+
+#[test]
+#[should_panic(expected = "insufficient approvals for recipient substitution")]
+fn test_substitute_recipient_with_cosigners_requires_approvals() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let cosigner1 = Address::generate(&env);
+    let cosigner2 = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let old_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(cosigner1.clone());
+    signers.push_back(cosigner2.clone());
+    opts.co_signers = signers;
+    opts.required_signatures = 2;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(old_recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000_u64, &opts);
+
+    // Pay partial amount
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    // Try to substitute without approvals (should panic)
+    c.substitute_recipient(&creator, &id, &old_recipient, &new_recipient);
+}
+
+#[test]
+fn test_substitute_recipient_with_cosigners_after_approvals() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let cosigner1 = Address::generate(&env);
+    let cosigner2 = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let old_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(cosigner1.clone());
+    signers.push_back(cosigner2.clone());
+    opts.co_signers = signers;
+    opts.required_signatures = 2;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(old_recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000_u64, &opts);
+
+    // Pay partial amount
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    // Get the required signatures (2)
+    // Get co-signers to approve the substitution
+    c.approve_substitute_recipient(&id, &cosigner1);
+    c.approve_substitute_recipient(&id, &cosigner2);
+
+    // Now substitute should succeed
+    c.substitute_recipient(&creator, &id, &old_recipient, &new_recipient);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.recipients.get(0), Some(new_recipient.clone()));
+
+    // Release to new recipient
+    c.release(&creator, &id);
+    assert_eq!(tk.balance(&new_recipient), 50);
+    assert_eq!(tk.balance(&old_recipient), 0);
+}
+
+#[test]
+#[should_panic(expected = "not a co-signer for this invoice")]
+fn test_approve_substitute_recipient_not_cosigner() {
+    // Create invoice with 50% rule (Release) and 50% funded
+    // and fallback_action = Refund (but should be ignored)
+    let mut rules = Vec::new(&env);
+    rules.push_back(types::ResolveRule {
+        min_funded_bps: 5000, // 50%
+        action: types::ResolveAction::Release,
+    });
+    let mut opts = default_options(&env);
+    opts.auto_resolve_rules = rules;
+    opts.fallback_action = Some(types::ResolveAction::Refund);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay exactly 50 (50% of 100)
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+    // Call auto_resolve; should execute the rule (Release), not fallback
+    c.auto_resolve(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 50);
+}
+
+#[test]
+fn test_auto_resolve_idempotency_second_call_noop() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
     StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000_i128);
     env.ledger().set_timestamp(1_000);
 
@@ -5438,9 +5963,88 @@ fn test_local_only_invoice_unaffected_by_external_prerequisite() {
     let c = client(&env, &contract_id);
 
     let creator = Address::generate(&env);
+    let cosigner = Address::generate(&env);
+    let not_a_cosigner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(cosigner.clone());
+    opts.co_signers = signers;
+    opts.required_signatures = 1;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000_u64, &opts);
+
+    // Non-cosigner tries to approve
+    c.approve_substitute_recipient(&id, &not_a_cosigner);
+}
+
+#[test]
+#[should_panic(expected = "co-signer has already approved substitution")]
+fn test_approve_substitute_recipient_duplicate_approval() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let cosigner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(cosigner.clone());
+    opts.co_signers = signers;
+    opts.required_signatures = 1;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000_u64, &opts);
+
+    // Approve once
+    c.approve_substitute_recipient(&id, &cosigner);
+
+    // Try to approve again (should panic)
+    c.approve_substitute_recipient(&id, &cosigner);
     let payer = Address::generate(&env);
     let recipient = Address::generate(&env);
 
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with fallback_action = Release
+    let mut opts = default_options(&env);
+    opts.fallback_action = Some(types::ResolveAction::Release);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay 30 (30% of 100)
+    c.pay(&payer, &id, &30_i128, &0_u64, &false, &false);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+    // First auto_resolve call executes fallback (Release)
+    c.auto_resolve(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 30);
+
+    // Second auto_resolve call should be a no-op (invoice not Pending)
+    // and not panic about "invoice is not pending"
+    c.auto_resolve(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 30); // unchanged
     StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
     env.ledger().set_timestamp(1_000);
 
@@ -5638,4 +6242,359 @@ fn test_emergency_withdraw_succeeds_after_7_days() {
 
     assert_eq!(tk.balance(&destination), 500);
     assert_eq!(tk.balance(&contract_id), 0);
+#[test]
+#[should_panic(expected = "invoice under dispute")]
+fn test_refund_blocked_when_disputed() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    
+    // Set arbiter so disputes can be raised
+    let admin = Address::generate(&env);
+    c.set_arbiter(&admin, &id, &arbiter);
+    
+    // Pay 100
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Raise dispute
+    c.raise_dispute(&id, &arbiter);
+    assert!(c.get_invoice(&id).disputed);
+
+    // Move time far past deadline
+    env.ledger().set_timestamp(10_000);
+
+    // Attempt refund should panic with "invoice under dispute"
+    // even though deadline has long since passed
+    c.refund(&id);
+}
+
+#[test]
+fn test_refund_allowed_after_dispute_resolved() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let arbiter = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    
+    // Set arbiter
+    let admin = Address::generate(&env);
+    c.set_arbiter(&admin, &id, &arbiter);
+    
+    // Pay 100
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Raise dispute
+    c.raise_dispute(&id, &arbiter);
+    assert!(c.get_invoice(&id).disputed);
+
+    // Resolve the dispute with Refund
+    c.resolve_dispute(&id, &arbiter, types::ResolveAction::Refund);
+    
+    // Verify invoice is now Refunded and balance restored
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+    assert!(!c.get_invoice(&id).disputed);
+    assert_eq!(tk.balance(&payer), 100);
+}
+
+#[test]
+fn test_non_disputed_invoice_unaffected_by_dispute_logic() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice without setting an arbiter
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    
+    // Pay 100
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Verify invoice is not disputed
+    assert!(!c.get_invoice(&id).disputed);
+
+    // Move time past deadline
+    env.ledger().set_timestamp(3_000);
+
+    // Refund should work normally (no dispute check impacts it)
+    c.refund(&id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+    assert_eq!(tk.balance(&payer), 100);
+}
+
+
+#[test]
+fn test_verify_payment_proofs_batch_single_valid() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+
+    // Make a payment
+    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false);
+
+    // Get the invoice to compute the proof hash
+    let invoice = c.get_invoice(&id);
+    let total_paid: i128 = invoice
+        .payments
+        .iter()
+        .filter(|p| p.payer == payer)
+        .map(|p| p.amount + p.tip)
+        .sum();
+
+    // Compute the proof hash
+    let mut preimage = [0u8; 24];
+    preimage[..8].copy_from_slice(&id.to_be_bytes());
+    preimage[8..24].copy_from_slice(&total_paid.to_be_bytes());
+    let bytes = soroban_sdk::Bytes::from_array(&env, &preimage);
+    let proof_hash: soroban_sdk::BytesN<32> = env.crypto().sha256(&bytes).into();
+
+    // Create a proof
+    let mut proofs = Vec::new(&env);
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id,
+        payer: payer.clone(),
+        total_paid,
+        proof_hash,
+    });
+
+    // Verify batch
+    let results = c.verify_payment_proofs_batch(&proofs);
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0), Some(true));
+}
+
+#[test]
+fn test_verify_payment_proofs_batch_multiple_mixed() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &200);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &200);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+
+    // Pay on first invoice
+    c.pay(&payer1, &id1, &50_i128, &0_u64, &false, &false);
+
+    // Pay on second invoice
+    c.pay(&payer2, &id2, &75_i128, &0_u64, &false, &false);
+
+    // Get invoices
+    let invoice1 = c.get_invoice(&id1);
+    let invoice2 = c.get_invoice(&id2);
+
+    let total1: i128 = invoice1
+        .payments
+        .iter()
+        .filter(|p| p.payer == payer1)
+        .map(|p| p.amount + p.tip)
+        .sum();
+
+    let total2: i128 = invoice2
+        .payments
+        .iter()
+        .filter(|p| p.payer == payer2)
+        .map(|p| p.amount + p.tip)
+        .sum();
+
+    // Compute proof hash for invoice1 (valid)
+    let mut preimage1 = [0u8; 24];
+    preimage1[..8].copy_from_slice(&id1.to_be_bytes());
+    preimage1[8..24].copy_from_slice(&total1.to_be_bytes());
+    let bytes1 = soroban_sdk::Bytes::from_array(&env, &preimage1);
+    let hash1: soroban_sdk::BytesN<32> = env.crypto().sha256(&bytes1).into();
+
+    // Compute proof hash for invoice2 (invalid - wrong total)
+    let mut preimage2_invalid = [0u8; 24];
+    preimage2_invalid[..8].copy_from_slice(&id2.to_be_bytes());
+    preimage2_invalid[8..24].copy_from_slice(&999_i128.to_be_bytes()); // Wrong total
+    let bytes2_invalid = soroban_sdk::Bytes::from_array(&env, &preimage2_invalid);
+    let hash2_invalid: soroban_sdk::BytesN<32> = env.crypto().sha256(&bytes2_invalid).into();
+
+    // Create batch with one valid and one invalid
+    let mut proofs = Vec::new(&env);
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id1,
+        payer: payer1.clone(),
+        total_paid: total1,
+        proof_hash: hash1,
+    });
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id2,
+        payer: payer2.clone(),
+        total_paid: 999, // Wrong in proof
+        proof_hash: hash2_invalid,
+    });
+
+    // Verify batch
+    let results = c.verify_payment_proofs_batch(&proofs);
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get(0), Some(true));  // Valid
+    assert_eq!(results.get(1), Some(false)); // Invalid
+}
+
+#[test]
+#[should_panic(expected = "batch limit exceeded")]
+fn test_verify_payment_proofs_batch_exceeds_limit() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create 21 proofs (exceeds limit of 20)
+    let mut proofs = Vec::new(&env);
+    for _ in 0..21 {
+        let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+        proofs.push_back(types::PaymentProof {
+            invoice_id: id,
+            payer: payer.clone(),
+            total_paid: 0,
+            proof_hash: soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]),
+        });
+    }
+
+    // This should panic with "batch limit exceeded"
+    c.verify_payment_proofs_batch(&proofs);
+}
+
+#[test]
+fn test_verify_payment_proofs_batch_nonexistent_invoice() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let payer = Address::generate(&env);
+
+    // Create a proof for a non-existent invoice
+    let mut proofs = Vec::new(&env);
+    proofs.push_back(types::PaymentProof {
+        invoice_id: 99999, // Non-existent
+        payer: payer.clone(),
+        total_paid: 0,
+        proof_hash: soroban_sdk::BytesN::<32>::from_array(&env, &[0u8; 32]),
+    });
+
+    // Verify batch should return false for non-existent invoice
+    let results = c.verify_payment_proofs_batch(&proofs);
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0), Some(false));
+}
+
+#[test]
+fn test_verify_payment_proofs_batch_maintains_order() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+    let id3 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+
+    // Pay on invoices
+    c.pay(&payer, &id1, &10_i128, &0_u64, &false, &false);
+    c.pay(&payer, &id2, &20_i128, &0_u64, &false, &false);
+    c.pay(&payer, &id3, &30_i128, &0_u64, &false, &false);
+
+    // Get invoices
+    let inv1 = c.get_invoice(&id1);
+    let inv2 = c.get_invoice(&id2);
+    let inv3 = c.get_invoice(&id3);
+
+    let total1: i128 = inv1.payments.iter().filter(|p| p.payer == payer).map(|p| p.amount + p.tip).sum();
+    let total2: i128 = inv2.payments.iter().filter(|p| p.payer == payer).map(|p| p.amount + p.tip).sum();
+    let total3: i128 = inv3.payments.iter().filter(|p| p.payer == payer).map(|p| p.amount + p.tip).sum();
+
+    // Compute valid hashes
+    let hash1 = compute_proof_hash(&env, id1, total1);
+    let hash2 = compute_proof_hash(&env, id2, total2);
+    let hash3 = compute_proof_hash(&env, id3, total3);
+
+    // Create batch in specific order
+    let mut proofs = Vec::new(&env);
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id1,
+        payer: payer.clone(),
+        total_paid: total1,
+        proof_hash: hash1,
+    });
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id2,
+        payer: payer.clone(),
+        total_paid: total2,
+        proof_hash: hash2,
+    });
+    proofs.push_back(types::PaymentProof {
+        invoice_id: id3,
+        payer: payer.clone(),
+        total_paid: total3,
+        proof_hash: hash3,
+    });
+
+    // Verify batch and check order is maintained
+    let results = c.verify_payment_proofs_batch(&proofs);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0), Some(true));  // First proof valid
+    assert_eq!(results.get(1), Some(true));  // Second proof valid
+    assert_eq!(results.get(2), Some(true));  // Third proof valid
+}
+
+// Helper function to compute proof hash
+fn compute_proof_hash(env: &soroban_sdk::Env, invoice_id: u64, total_paid: i128) -> soroban_sdk::BytesN<32> {
+    let mut preimage = [0u8; 24];
+    preimage[..8].copy_from_slice(&invoice_id.to_be_bytes());
+    preimage[8..24].copy_from_slice(&total_paid.to_be_bytes());
+    let bytes = soroban_sdk::Bytes::from_array(&env, &preimage);
+    env.crypto().sha256(&bytes).into()
 }
