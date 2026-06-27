@@ -343,6 +343,24 @@ fn reentrancy_key() -> Symbol {
     symbol_short!("re_guard")
 }
 
+/// Issue #175: Persistent storage key for a used transaction ID.
+fn txid_key(tx_id: &BytesN<32>) -> (Symbol, BytesN<32>) {
+    (symbol_short!("txid"), tx_id.clone())
+}
+
+/// Issue #175: Check that `tx_id` has not been used before, then mark it as used.
+/// When `tx_id` is `None`, the check is skipped (backward-compatible).
+fn check_and_mark_txid(env: &Env, tx_id: &Option<BytesN<32>>) {
+    if let Some(id) = tx_id {
+        let key = txid_key(id);
+        assert!(
+            !env.storage().persistent().get::<_, bool>(&key).unwrap_or(false),
+            "duplicate transaction"
+        );
+        env.storage().persistent().set(&key, &true);
+    }
+}
+
 fn require_non_reentrant(env: &Env) {
     assert!(
         !env.storage().instance().get(&reentrancy_key()).unwrap_or(false),
@@ -3117,9 +3135,10 @@ impl SplitContract {
         clear_reentrant(&env);
     }
 
-    pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool, donate_on_failure: bool) {
+    pub fn pay(env: Env, payer: Address, invoice_id: u64, amount: i128, nonce: u64, _auto_convert: bool, donate_on_failure: bool, tx_id: Option<BytesN<32>>) {
         require_non_reentrant(&env);
         require_fn_not_paused(&env, &symbol_short!("pay"));
+        check_and_mark_txid(&env, &tx_id);
         payer.require_auth();
         Self::_pay(&env, &payer, invoice_id, amount, nonce, _auto_convert, None, None, donate_on_failure, Vec::new(&env));
         clear_reentrant(&env);
@@ -3817,9 +3836,10 @@ impl SplitContract {
     /// For tranche invoices, only distributes tranches whose timestamp ≤ now.
     /// Blocks with "prerequisite not released" until the prerequisite invoice is Released.
     /// If an approver is set, requires the invoice to be approved first (issue #25).
-    pub fn release(env: Env, invoice_id: u64) {
+    pub fn release(env: Env, invoice_id: u64, tx_id: Option<BytesN<32>>) {
         require_non_reentrant(&env);
         require_fn_not_paused(&env, &symbol_short!("release"));
+        check_and_mark_txid(&env, &tx_id);
         let caller = env.current_contract_address();
         let mut invoice = load_invoice(&env, invoice_id);
 
@@ -5391,9 +5411,10 @@ impl SplitContract {
 
     /// Refund all payers if the deadline has passed and the invoice is not fully funded.
     /// If the invoice belongs to a group and any member is underfunded, all group members are refunded.
-    pub fn refund(env: Env, invoice_id: u64) {
+    pub fn refund(env: Env, invoice_id: u64, tx_id: Option<BytesN<32>>) {
         require_non_reentrant(&env);
         require_fn_not_paused(&env, &symbol_short!("refund"));
+        check_and_mark_txid(&env, &tx_id);
         let mut invoice = load_invoice(&env, invoice_id);
 
         assert!(
