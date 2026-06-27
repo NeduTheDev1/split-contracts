@@ -481,6 +481,7 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             penalty_tiers: Vec::new(env),
             allowed_callers: None,
             refund_grace_secs: None,
+            fallback_action: None,
             external_prerequisite: None,
         });
     let ext2: InvoiceExt2 = env.storage().persistent()
@@ -1840,6 +1841,7 @@ impl SplitContract {
             options.priorities,
             options.require_kyc,
             options.scheduled_release_at,
+            options.fallback_action,
             options.external_prerequisite,
         )
     }
@@ -1891,6 +1893,7 @@ impl SplitContract {
         priorities: Vec<u32>,
         require_kyc: bool,
         scheduled_release_at: Option<u64>,
+        fallback_action: Option<ResolveAction>,
         external_prerequisite: Option<(Address, u64)>,
     ) -> u64 {
         assert!(
@@ -2197,6 +2200,7 @@ impl SplitContract {
             allowed_callers: None,
             admin_frozen: false,
             min_funding_amount: 0,
+            fallback_action,
             external_prerequisite,
         };
 
@@ -4797,8 +4801,11 @@ impl SplitContract {
     // -----------------------------------------------------------------------
 
     /// Evaluate auto_resolve_rules in order against the current funding ratio.
-    /// Executes the first matching rule — Release calls _release(), Refund refunds payers.
-    /// Panics with "no matching resolution rule" if no rule matches.
+    /// Automatically resolves an invoice based on funding progress and configured auto-resolve rules.
+    /// Evaluates rules in order; executes the first matching rule's action (Release or Refund).
+    /// If no rule matches and a fallback_action is configured, executes it.
+    /// If no rule matches and no fallback_action is configured, it's a no-op (idempotent).
+    /// Panics only if invoice is not pending or is disputed.
     pub fn auto_resolve(env: Env, invoice_id: u64) {
         require_not_paused(&env);
         let mut invoice = load_invoice(&env, invoice_id);
@@ -4808,7 +4815,6 @@ impl SplitContract {
             "invoice is not pending"
         );
         assert!(!invoice.disputed, "invoice is disputed");
-        assert!(!invoice.auto_resolve_rules.is_empty(), "no auto-resolve rules defined");
 
         let total: i128 = invoice.amounts.iter().sum();
         assert!(total > 0, "invoice total must be positive");
@@ -4869,7 +4875,56 @@ impl SplitContract {
             }
         }
 
-        panic!("no matching resolution rule");
+        // No matching rule — check for fallback_action.
+        if let Some(action) = invoice.fallback_action {
+            match action {
+                ResolveAction::Release => {
+                    let caller = env.current_contract_address();
+                    Self::_release(&env, invoice_id, &mut invoice, &caller);
+                }
+                ResolveAction::Refund => {
+                    let token_client = token::Client::new(
+                        &env,
+                        &invoice.tokens.get(0).expect("no token"),
+                    );
+                    let mut totals: Map<Address, i128> = Map::new(&env);
+                    for payment in invoice.payments.iter() {
+                        let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+                        totals.set(payment.payer.clone(), prev + payment.amount);
+                    }
+                    let mut total_refunded_amount: i128 = 0;
+                    for (payer, amount) in totals.iter() {
+                        token_client.transfer(
+                            &env.current_contract_address(),
+                            &payer,
+                            &amount,
+                        );
+                        total_refunded_amount += amount;
+                        events::payer_refunded(&env, invoice_id, &payer, amount);
+                    }
+                    invoice.status = InvoiceStatus::Refunded;
+                    invoice.completion_time = Some(env.ledger().timestamp());
+                    save_invoice(&env, invoice_id, &invoice);
+                    let actor = env.current_contract_address();
+                    append_audit_entry(&env, invoice_id, symbol_short!("auto_ref"), &actor);
+                    events::invoice_refunded(&env, invoice_id);
+                    maybe_record_refunded(&env, &invoice.creator);
+                    notify_invoice(&env, invoice_id, symbol_short!("refund"), &invoice.notification_contract);
+                    let total_refunded: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&total_refunded_key())
+                        .unwrap_or(0i128);
+                    env.storage().persistent().set(
+                        &total_refunded_key(),
+                        &total_refunded
+                            .checked_add(total_refunded_amount)
+                            .expect("total_refunded overflow"),
+                    );
+                }
+            }
+        }
+        // else: no-op, intentional and idempotent.
     }
 
     // -----------------------------------------------------------------------
