@@ -3436,6 +3436,30 @@ fn test_events_emitted_on_create_and_pay() {
     assert!(env.events().all().len() >= 3);
 }
 
+#[test]
+fn test_events_include_schema_version() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    let all_events = env.events().all();
+    assert!(all_events.len() >= 1);
+
+    for (_, _, data) in all_events.iter() {
+        let v = data.get_unchecked(0);
+        assert_eq!(v, soroban_sdk::Val::from(1u32));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Issue #43: delegation
 // ---------------------------------------------------------------------------
