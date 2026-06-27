@@ -38,9 +38,6 @@ fn admin_key() -> Symbol {
 fn admins_key() -> Symbol {
     symbol_short!("admins")
 }
-fn pending_admin_key() -> Symbol {
-    symbol_short!("pd_adm")
-}
 fn paused_key() -> Symbol {
     symbol_short!("paused")
 }
@@ -389,6 +386,10 @@ fn pending_admin_key() -> Symbol {
     symbol_short!("pend_adm")
 }
 
+fn admin_proposal_time_key() -> Symbol {
+    symbol_short!("adm_prop")
+}
+
 fn maybe_record_created(env: &Env, creator: &Address, total: i128) {
     if let Some(dashboard) = env.storage().persistent().get::<Symbol, Address>(&dashboard_contract_key()) {
         let _: Val = env.invoke_contract(
@@ -727,7 +728,14 @@ fn maybe_record_refunded(env: &Env, creator: &Address) {
     if let Some(dashboard) = env
         .storage()
         .persistent()
-        .set(&invoice_ext_key(id), ext);
+        .get::<Symbol, Address>(&dashboard_contract_key())
+    {
+        let _: Val = env.invoke_contract(
+            &dashboard,
+            &Symbol::new(env, "record_refunded"),
+            (creator.clone(),).into_val(env),
+        );
+    }
 }
 
 fn maybe_record_released(env: &Env, creator: &Address, amount: i128) {
@@ -945,13 +953,18 @@ impl SplitContract {
     // -----------------------------------------------------------------------
 
     /// Propose a new admin. Requires current admin auth.
+    /// Stores the proposal timestamp so that accept_admin() enforces a timelock delay.
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
         require_admin(&env);
         let _ = admin;
+        assert!(new_admin != env.current_contract_address(), "cannot set contract as admin");
         env.storage().instance().set(&pending_admin_key(), &new_admin);
+        env.storage().instance().set(&admin_proposal_time_key(), &env.ledger().timestamp());
     }
 
     /// Accept the admin role. Requires the proposed admin to authenticate.
+    /// Only succeeds after the timelock duration (set via set_timelock_secs) has elapsed
+    /// since propose_admin() was called.
     pub fn accept_admin(env: Env) {
         let pending: Address = env
             .storage()
@@ -959,8 +972,26 @@ impl SplitContract {
             .get(&pending_admin_key())
             .expect("no pending admin");
         pending.require_auth();
+
+        let proposed_at: u64 = env
+            .storage()
+            .instance()
+            .get(&admin_proposal_time_key())
+            .expect("no admin proposal time");
+        let timelock_secs: u64 = env
+            .storage()
+            .persistent()
+            .get(&timelock_secs_key())
+            .unwrap_or(0u64);
+        let now = env.ledger().timestamp();
+        assert!(
+            now >= proposed_at.saturating_add(timelock_secs),
+            "timelock not yet elapsed"
+        );
+
         env.storage().instance().set(&admin_key(), &pending);
         env.storage().instance().remove(&pending_admin_key());
+        env.storage().instance().remove(&admin_proposal_time_key());
     }
 
     // -----------------------------------------------------------------------
@@ -1008,33 +1039,6 @@ impl SplitContract {
     /// * `new_limit` - The new daily spending limit (must be >= 0)
     pub fn set_self_limit(env: Env, creator: Address, new_limit: i128) {
         creator.require_auth();
-        events::monitor_event(
-            &env,
-            Symbol::new(&env, "create_invoice"),
-            0,
-            &creator,
-            env.ledger().timestamp(),
-        );
-        Self::_create_invoice_inner(
-            &env,
-            creator,
-            recipients,
-            amounts,
-            token,
-            deadline,
-            options.co_creators,
-            options.allow_early_withdrawal,
-            options.bonus_pool,
-            options.bonus_max_payers,
-            options.prerequisite_id,
-            options.tranches,
-            options.co_signers,
-            options.required_signatures,
-            options.penalty_bps.unwrap_or(0),
-            options.penalty_deadline.unwrap_or(0),
-            options.min_funding_bps.unwrap_or(0),
-        )
-    }
         assert!(new_limit >= 0, "self limit must be non-negative");
 
         let current_limit: i128 = env
@@ -1347,17 +1351,6 @@ impl SplitContract {
     /// For tranche invoices, only distributes tranches whose timestamp ≤ now.
     /// Blocks with "prerequisite not released" until the prerequisite invoice is Released.
     /// If an approver is set, requires the invoice to be approved first (issue #25).
-    pub fn release(env: Env, invoice_id: u64) {
-        require_not_paused(&env);
-        let caller = env.current_contract_address();
-        let mut invoice = load_invoice(&env, invoice_id);
-        events::monitor_event(
-            &env,
-            Symbol::new(&env, "release"),
-            invoice_id,
-            &caller,
-            env.ledger().timestamp(),
-        );
     /// Add an address to the creator whitelist. Requires admin auth.
     /// When the whitelist is non-empty, only listed addresses may call create_invoice().
     pub fn whitelist_creator(env: Env, admin: Address, address: Address) {
