@@ -349,3 +349,23 @@ pub fn refund_shortfall(env: &Env, invoice_id: u64, shortfall_amount: i128) {
         shortfall_amount,
     );
 }
+
+/// Emitted when a third-party pays on behalf of a beneficiary (issue #277).
+/// Topics: (split, del_pay, invoice_id)
+/// Data: (payer, beneficiary, amount)
+pub fn delegated_payment_received(env: &Env, invoice_id: u64, payer: &Address, beneficiary: &Address, amount: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("del_pay"), invoice_id),
+        (payer.clone(), beneficiary.clone(), amount),
+    );
+}
+
+/// Emitted when a contract migration is executed (issue #279).
+/// Topics: (split, migrated)
+/// Data: (from_version, to_version, ledger)
+pub fn contract_migrated(env: &Env, from_version: u32, to_version: u32, ledger: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("migrated")),
+        (from_version, to_version, ledger),
+    );
+}
