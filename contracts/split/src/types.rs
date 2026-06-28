@@ -864,6 +864,31 @@ impl Invoice {
 }
 
 
+/// Issue #298: Result type returned by simulate_release().
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SimulateReleaseResult {
+    pub estimated_instructions: u64,
+    pub estimated_fee_stroops: u64,
+    pub would_succeed: bool,
+}
+
+/// Issue #297: Circuit breaker status returned by get_circuit_breaker_status().
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CircuitBreakerStatus {
+    pub active: bool,
+    pub reason: Option<String>,
+}
+
+/// Issue #295: A single confidential payment record stored per payer.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ConfidentialPayment {
+    pub commitment: BytesN<32>,
+    pub encrypted_amount: Bytes,
+}
+
 #[derive(Clone, Debug, soroban_sdk::contracttype)]
 pub struct InvoiceParams {
     pub creator: Address,
