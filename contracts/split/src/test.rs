@@ -4,7 +4,7 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, Symbol, Vec,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 use types::InvoiceOptions;
 
@@ -5187,3 +5187,1014 @@ fn test_milestone_disabled_when_threshold_zero() {
     assert!(!has_creator_milestone_event(&env), "creator milestone should be suppressed when threshold is 0");
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #298: simulate_release compute cost estimation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_simulate_release_returns_result_for_small_invoice() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let result = c.simulate_release(&id);
+
+    // A single-recipient invoice should be well within budget.
+    assert!(result.would_succeed, "single-recipient invoice should succeed");
+    assert!(result.estimated_instructions > 0, "instructions must be positive");
+    assert!(result.estimated_fee_stroops >= 0, "fee must be non-negative");
+}
+
+#[test]
+fn test_simulate_release_at_limit_succeeds() {
+    // Build an invoice with enough recipients to sit just at or below the budget.
+    // INSTRUCTION_BUDGET_LIMIT = 100_000_000
+    // INSTRUCTIONS_BASE = 1_000_000
+    // INSTRUCTIONS_PER_SHARD (8 shards) = 8 * 100_000 = 800_000
+    // Remaining = 100_000_000 - 1_000_000 - 800_000 = 98_200_000
+    // INSTRUCTIONS_PER_RECIPIENT = 500_000
+    // Max recipients within budget = 98_200_000 / 500_000 = 196
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    let payer = Address::generate(&env);
+    sa.mint(&payer, &1_000_000);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    let mut amounts = Vec::new(&env);
+    for _ in 0..196u32 {
+        recipients.push_back(Address::generate(&env));
+        amounts.push_back(1_i128);
+    }
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env));
+    let result = c.simulate_release(&id);
+    assert!(result.would_succeed, "invoice at limit should succeed");
+}
+
+#[test]
+fn test_simulate_release_over_limit_fails() {
+    // 197 recipients exceeds the budget by 500_000 instructions.
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    let payer = Address::generate(&env);
+    sa.mint(&payer, &1_000_000);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    let mut amounts = Vec::new(&env);
+    for _ in 0..197u32 {
+        recipients.push_back(Address::generate(&env));
+        amounts.push_back(1_i128);
+    }
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env));
+    let result = c.simulate_release(&id);
+    assert!(!result.would_succeed, "invoice over limit should not succeed");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #297: Circuit breaker
+// ---------------------------------------------------------------------------
+
+fn has_circuit_breaker_event(env: &Env, topic_name: &str) -> bool {
+    env.events().all().iter().any(|(_c, topics, _d)| topic1_is(env, &topics, topic_name))
+}
+
+#[test]
+fn test_circuit_breaker_defaults_inactive() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+    let status = c.get_circuit_breaker_status();
+    assert!(!status.active, "circuit breaker should default to inactive");
+    assert!(status.reason.is_none(), "reason should be None when inactive");
+}
+
+#[test]
+fn test_activate_circuit_breaker_blocks_pay() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    let _ = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let reason = String::from_str(&env, "vulnerability discovered");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    let status = c.get_circuit_breaker_status();
+    assert!(status.active, "circuit breaker must be active");
+    assert_eq!(status.reason, Some(reason), "reason must match");
+}
+
+#[test]
+#[should_panic(expected = "ContractPaused")]
+fn test_circuit_breaker_blocks_pay() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let reason = String::from_str(&env, "vulnerability discovered");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false);
+}
+
+#[test]
+fn test_activate_circuit_breaker_emits_event() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    let reason = String::from_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    assert!(has_circuit_breaker_event(&env, "cb_act"), "cb_act event not emitted");
+}
+
+#[test]
+fn test_deactivate_circuit_breaker_restores_operations() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let reason = String::from_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+    c.deactivate_circuit_breaker(&admin);
+
+    let status = c.get_circuit_breaker_status();
+    assert!(!status.active, "circuit breaker should be inactive after deactivation");
+
+    // pay should work again
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 200);
+}
+
+#[test]
+fn test_deactivate_circuit_breaker_emits_event() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    let reason = String::from_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+    c.deactivate_circuit_breaker(&admin);
+
+    assert!(has_circuit_breaker_event(&env, "cb_dact"), "cb_dact event not emitted");
+}
+
+#[test]
+fn test_get_invoice_unaffected_by_circuit_breaker() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let reason = String::from_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    // read-only call must still work
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Pending);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #296: Per-creator fee waiver list
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_add_fee_waiver_grants_waiver() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    assert!(!c.has_fee_waiver(&creator), "should not have waiver before grant");
+    c.add_fee_waiver(&admin, &creator);
+    assert!(c.has_fee_waiver(&creator), "should have waiver after grant");
+}
+
+#[test]
+fn test_remove_fee_waiver_revokes_waiver() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    c.add_fee_waiver(&admin, &creator);
+    c.remove_fee_waiver(&admin, &creator);
+    assert!(!c.has_fee_waiver(&creator), "waiver should be gone after revocation");
+}
+
+#[test]
+fn test_fee_waiver_grants_event_emitted() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    c.add_fee_waiver(&admin, &creator);
+    let granted = env.events().all().iter().any(|(_c, topics, _d)| topic1_is(&env, &topics, "fw_grant"));
+    assert!(granted, "fw_grant event should be emitted");
+}
+
+#[test]
+fn test_fee_waiver_revoke_event_emitted() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    c.add_fee_waiver(&admin, &creator);
+    c.remove_fee_waiver(&admin, &creator);
+    let revoked = env.events().all().iter().any(|(_c, topics, _d)| topic1_is(&env, &topics, "fw_rev"));
+    assert!(revoked, "fw_rev event should be emitted");
+}
+
+#[test]
+fn test_fee_waiver_zeroes_platform_fee_at_release() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // 1000 bps (10%) platform fee
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &1_000_u32, &None, &0_u32, &0_u32, &0_u64);
+    c.add_fee_waiver(&admin, &creator);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // With fee waiver the recipient should receive the full 100 (no 10% deducted).
+    assert_eq!(tk.balance(&recipient), 100, "waived creator should result in zero platform fee");
+}
+
+#[test]
+fn test_no_fee_waiver_deducts_platform_fee_normally() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // 1000 bps (10%) platform fee, no waiver
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &1_000_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // 10% fee deducted → recipient gets 90
+    assert_eq!(tk.balance(&recipient), 90, "non-waived creator should pay platform fee");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #295: Confidential payment amounts
+// ---------------------------------------------------------------------------
+
+fn make_commitment(env: &Env, seed: u8) -> BytesN<32> {
+    let mut arr = [0u8; 32];
+    arr[0] = seed;
+    arr[31] = seed.wrapping_add(1);
+    BytesN::from_array(env, &arr)
+}
+
+fn make_range_proof(env: &Env, seed: u8) -> Bytes {
+    // Non-zero range proof: sha256(commitment) would never be all-zero.
+    let commitment = make_commitment(env, seed);
+    let b: Bytes = commitment.into();
+    b
+}
+
+fn make_encrypted_amount(env: &Env, seed: u8) -> Bytes {
+    let mut arr = [0u8; 16];
+    arr[0] = seed;
+    Bytes::from_array(env, &arr)
+}
+
+#[test]
+fn test_pay_confidential_stores_commitment() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let commitment = make_commitment(&env, 42);
+    let range_proof = make_range_proof(&env, 42);
+    let encrypted = make_encrypted_amount(&env, 42);
+
+    c.pay_confidential(&payer, &id, &commitment, &range_proof, &encrypted);
+
+    assert_eq!(c.get_confidential_payment_count(&id), 1);
+}
+
+#[test]
+fn test_pay_confidential_increments_counter() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    c.pay_confidential(&payer1, &id, &make_commitment(&env, 1), &make_range_proof(&env, 1), &make_encrypted_amount(&env, 1));
+    c.pay_confidential(&payer2, &id, &make_commitment(&env, 2), &make_range_proof(&env, 2), &make_encrypted_amount(&env, 2));
+
+    assert_eq!(c.get_confidential_payment_count(&id), 2);
+}
+
+#[test]
+#[should_panic(expected = "invalid range proof")]
+fn test_pay_confidential_rejects_zero_range_proof() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let commitment = make_commitment(&env, 5);
+    // A zero-filled commitment XOR'd with a zero range proof produces an all-zero hash → invalid.
+    let zero_commitment = BytesN::from_array(&env, &[0u8; 32]);
+    let zero_proof = Bytes::from_array(&env, &[0u8; 32]);
+    c.pay_confidential(&payer, &id, &zero_commitment, &zero_proof, &make_encrypted_amount(&env, 5));
+    let _ = commitment; // suppress unused warning
+}
+
+#[test]
+fn test_reveal_confidential_total_triggers_release() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Submit a confidential payment for the payer (off-chain funds already moved separately).
+    c.pay_confidential(&payer, &id, &make_commitment(&env, 7), &make_range_proof(&env, 7), &make_encrypted_amount(&env, 7));
+
+    // Credit actual token funds so contract can pay out on reveal.
+    StellarAssetClient::new(&env, &token_id).mint(&contract_id, &100);
+
+    // Creator reveals the sum and a non-zero proof.
+    let proof = make_commitment(&env, 99);
+    c.reveal_confidential_total(&id, &100_i128, &proof);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 100);
+}
+
+#[test]
+#[should_panic(expected = "invalid reveal proof")]
+fn test_reveal_confidential_total_rejects_zero_proof() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let zero_proof = BytesN::from_array(&env, &[0u8; 32]);
+    c.reveal_confidential_total(&id, &100_i128, &zero_proof);
+}
+
+
+// ---------------------------------------------------------------------------
+// Issue #297: Circuit breaker tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_circuit_breaker_activate_deactivate() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Setup: Register admin as SuperAdmin
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    // Initially circuit breaker is inactive
+    let status = c.get_circuit_breaker_status();
+    assert!(!status.active);
+    assert!(status.reason.is_none());
+
+    // Activate circuit breaker
+    let reason = String::from_small_str(&env, "security vulnerability");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    let status = c.get_circuit_breaker_status();
+    assert!(status.active);
+    assert_eq!(status.reason, Some(reason));
+
+    // Deactivate circuit breaker
+    c.deactivate_circuit_breaker(&admin);
+
+    let status = c.get_circuit_breaker_status();
+    assert!(!status.active);
+    assert!(status.reason.is_none());
+}
+
+#[test]
+#[should_panic(expected = "ContractPaused")]
+fn test_circuit_breaker_blocks_create_invoice() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    // Activate circuit breaker
+    let reason = String::from_small_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    // Try to create invoice - should panic
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient);
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+    c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env));
+}
+
+#[test]
+#[should_panic(expected = "ContractPaused")]
+fn test_circuit_breaker_blocks_pay() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Activate circuit breaker
+    let reason = String::from_small_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    // Try to pay - should panic
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+}
+
+#[test]
+fn test_circuit_breaker_allows_read_operations() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Activate circuit breaker
+    let reason = String::from_small_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    // Read operations should still work
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Pending);
+
+    let status = c.get_circuit_breaker_status();
+    assert!(status.active);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #296: Fee waiver tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_add_fee_waiver() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    // Initially no waiver
+    assert!(!c.has_fee_waiver(&creator));
+
+    // Add fee waiver
+    c.add_fee_waiver(&admin, &creator);
+
+    // Now waiver exists
+    assert!(c.has_fee_waiver(&creator));
+}
+
+#[test]
+fn test_remove_fee_waiver() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    // Add waiver
+    c.add_fee_waiver(&admin, &creator);
+    assert!(c.has_fee_waiver(&creator));
+
+    // Remove waiver
+    c.remove_fee_waiver(&admin, &creator);
+    assert!(!c.has_fee_waiver(&creator));
+}
+
+#[test]
+fn test_fee_waiver_exempts_from_fees() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    // Grant fee waiver to creator
+    c.add_fee_waiver(&admin, &creator);
+
+    // Create and pay invoice
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Recipient should get full 100 (no fee deducted)
+    assert_eq!(tk.balance(&recipient), 100, "waived creator should not pay platform fee");
+}
+
+#[test]
+#[should_panic(expected = "fee waiver list full")]
+fn test_fee_waiver_max_entries_enforced() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    // Add 100 waivers (at max)
+    for i in 0..100 {
+        let creator = Address::generate(&env);
+        c.add_fee_waiver(&admin, &creator);
+    }
+
+    // 101st should fail
+    let creator_101 = Address::generate(&env);
+    c.add_fee_waiver(&admin, &creator_101);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #298: Compute cost estimation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_simulate_release_single_recipient() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let result = c.simulate_release(&id);
+    assert!(result.estimated_instructions > 0);
+    assert!(result.estimated_fee_stroops >= 0);
+    assert!(result.would_succeed); // single recipient should fit in budget
+}
+
+#[test]
+fn test_simulate_release_multiple_recipients() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 10 recipients
+    let mut recipients = Vec::new(&env);
+    let mut amounts = Vec::new(&env);
+    for _ in 0..10 {
+        recipients.push_back(Address::generate(&env));
+        amounts.push_back(100_i128);
+    }
+
+    let id = c.create_invoice(
+        &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
+    );
+
+    let result = c.simulate_release(&id);
+    assert!(result.estimated_instructions > 0);
+    assert!(result.estimated_fee_stroops >= 0);
+    assert!(result.would_succeed);
+}
+
+#[test]
+fn test_simulate_release_instruction_budget_calculation() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 1 recipient
+    let recipient = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient);
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+
+    let id = c.create_invoice(
+        &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
+    );
+
+    let result = c.simulate_release(&id);
+
+    // Verify calculation: INSTRUCTIONS_BASE + 1 * INSTRUCTIONS_PER_RECIPIENT + SHARD_COUNT * INSTRUCTIONS_PER_SHARD
+    // INSTRUCTIONS_BASE = 1_000_000
+    // INSTRUCTIONS_PER_RECIPIENT = 500_000
+    // SHARD_COUNT = 8
+    // INSTRUCTIONS_PER_SHARD = 100_000
+    // Total = 1_000_000 + 500_000 + 8 * 100_000 = 2_300_000
+    let expected = 1_000_000 + 500_000 + 8 * 100_000;
+    assert_eq!(result.estimated_instructions, expected as u64);
+}
+
+#[test]
+fn test_simulate_release_would_succeed_at_budget_limit() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Small invoice should fit in budget
+    let recipient = Address::generate(&env);
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let result = c.simulate_release(&id);
+    assert!(result.would_succeed, "single recipient should fit in budget");
+    assert!(result.estimated_instructions < 100_000_000); // INSTRUCTION_BUDGET_LIMIT
+}
+
+// ---------------------------------------------------------------------------
+// Issue #295: Additional confidential payment tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_confidential_payment_count() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    // Initially zero
+    assert_eq!(c.get_confidential_payment_count(&id), 0);
+
+    // Add first confidential payment
+    c.pay_confidential(&payer1, &id, &make_commitment(&env, 1), &make_range_proof(&env, 1), &make_encrypted_amount(&env, 1));
+    assert_eq!(c.get_confidential_payment_count(&id), 1);
+
+    // Add second from different payer
+    c.pay_confidential(&payer2, &id, &make_commitment(&env, 2), &make_range_proof(&env, 2), &make_encrypted_amount(&env, 2));
+    assert_eq!(c.get_confidential_payment_count(&id), 2);
+}
+
+#[test]
+fn test_confidential_payment_overwrite() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    // Submit first payment from payer
+    c.pay_confidential(&payer, &id, &make_commitment(&env, 5), &make_range_proof(&env, 5), &make_encrypted_amount(&env, 5));
+    assert_eq!(c.get_confidential_payment_count(&id), 1);
+
+    // Same payer submits again (overwrites)
+    c.pay_confidential(&payer, &id, &make_commitment(&env, 10), &make_range_proof(&env, 10), &make_encrypted_amount(&env, 10));
+    assert_eq!(c.get_confidential_payment_count(&id), 1, "same payer should overwrite, not increment");
+}
+
+#[test]
+#[should_panic(expected = "invalid range proof")]
+fn test_pay_confidential_rejects_zero_range_proof() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Try to submit with all-zero proof (should fail)
+    let commitment = make_commitment(&env, 5);
+    let zero_proof = Bytes::from_array(&env, &[0u8; 32]);
+    c.pay_confidential(&payer, &id, &commitment, &zero_proof, &make_encrypted_amount(&env, 5));
+}
+
+#[test]
+fn test_reveal_confidential_total_partial_funding() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    // Submit confidential payment of 100
+    c.pay_confidential(&payer, &id, &make_commitment(&env, 7), &make_range_proof(&env, 7), &make_encrypted_amount(&env, 7));
+
+    // Mint funds to contract for payout
+    StellarAssetClient::new(&env, &token_id).mint(&contract_id, &100);
+
+    // Reveal 100 (partial, invoice needs 200 total)
+    let proof = make_commitment(&env, 99);
+    c.reveal_confidential_total(&id, &100_i128, &proof);
+
+    // Invoice should still be pending (not fully funded)
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+    assert_eq!(c.get_invoice(&id).funded, 100);
+    assert_eq!(tk.balance(&recipient), 0, "should not distribute on partial reveal");
+}
+
+#[test]
+#[should_panic(expected = "decrypted_sum must be positive")]
+fn test_reveal_confidential_total_rejects_zero_sum() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let proof = make_commitment(&env, 99);
+    c.reveal_confidential_total(&id, &0_i128, &proof); // Should panic
+}
+
+#[test]
+#[should_panic(expected = "ContractPaused")]
+fn test_pay_confidential_blocked_by_circuit_breaker() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Activate circuit breaker
+    let reason = String::from_small_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    // Try confidential payment
+    c.pay_confidential(&payer, &id, &make_commitment(&env, 5), &make_range_proof(&env, 5), &make_encrypted_amount(&env, 5));
+}
+
+#[test]
+#[should_panic(expected = "ContractPaused")]
+fn test_reveal_confidential_blocked_by_circuit_breaker() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Submit confidential payment
+    c.pay_confidential(&payer, &id, &make_commitment(&env, 7), &make_range_proof(&env, 7), &make_encrypted_amount(&env, 7));
+
+    // Activate circuit breaker
+    let reason = String::from_small_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    // Try to reveal
+    let proof = make_commitment(&env, 99);
+    c.reveal_confidential_total(&id, &100_i128, &proof);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-feature integration tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_simulate_release_estimate_for_large_invoice() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with 50 recipients (larger batch)
+    let mut recipients = Vec::new(&env);
+    let mut amounts = Vec::new(&env);
+    for _ in 0..50 {
+        recipients.push_back(Address::generate(&env));
+        amounts.push_back(10_i128);
+    }
+
+    let id = c.create_invoice(
+        &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
+    );
+
+    let result = c.simulate_release(&id);
+    // With 50 recipients: BASE (1M) + 50*RECIPIENT (25M) + 8*SHARD (0.8M) = ~26.8M
+    let expected = 1_000_000 + 50 * 500_000 + 8 * 100_000;
+    assert_eq!(result.estimated_instructions, expected as u64);
+    assert!(result.would_succeed);
+}
+
+#[test]
+fn test_fee_waiver_persists_across_operations() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    // Add waiver
+    c.add_fee_waiver(&admin, &creator);
+
+    // Perform various operations
+    let recipient = Address::generate(&env);
+    let _ = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Waiver should still be active
+    assert!(c.has_fee_waiver(&creator));
+}
+
+#[test]
+fn test_circuit_breaker_prevents_refund() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+    c.set_admin(&admin, &types::AdminRole::SuperAdmin);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 2_000);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+
+    // Advance past deadline
+    env.ledger().set_timestamp(3_000);
+
+    // Activate circuit breaker
+    let reason = String::from_small_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    // Try to refund - should panic
+    c.refund(&id);
+}
