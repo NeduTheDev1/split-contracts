@@ -12,6 +12,9 @@ mod types;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod fuzz_tests;
+
 use soroban_sdk::{
     String,
     contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec,
