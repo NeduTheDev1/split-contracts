@@ -981,3 +981,10 @@ impl Invoice {
     }
 }
 
+
+#[derive(Clone, Debug, soroban_sdk::contracttype)]
+pub struct InvoiceParams {
+    pub creator: Address,
+    pub recipients: Vec<Address>,
+    // ... add all other fields here ...
+}
