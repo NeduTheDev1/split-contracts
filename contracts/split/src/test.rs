@@ -5187,3 +5187,275 @@ fn test_milestone_disabled_when_threshold_zero() {
     assert!(!has_creator_milestone_event(&env), "creator milestone should be suppressed when threshold is 0");
 }
 
+// ---------------------------------------------------------------------------
+// Issue #285: Volume-based fee tiers tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_set_fee_tiers() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &100_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    let mut tiers = Vec::new(&env);
+    tiers.push_back(types::FeeTier {
+        volume_threshold: 1_000,
+        fee_bps: 50,
+    });
+    tiers.push_back(types::FeeTier {
+        volume_threshold: 10_000,
+        fee_bps: 25,
+    });
+
+    c.set_fee_tiers(&admin, &tiers);
+
+    let retrieved_tiers = c.get_fee_tiers();
+    assert_eq!(retrieved_tiers.len(), 2);
+    assert_eq!(retrieved_tiers.get(0).unwrap().volume_threshold, 1_000);
+    assert_eq!(retrieved_tiers.get(0).unwrap().fee_bps, 50);
+    assert_eq!(retrieved_tiers.get(1).unwrap().volume_threshold, 10_000);
+    assert_eq!(retrieved_tiers.get(1).unwrap().fee_bps, 25);
+}
+
+#[test]
+fn test_get_applicable_fee_no_tiers() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &100_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    // No tiers set, should return platform fee
+    let fee = c.get_applicable_fee(&creator);
+    assert_eq!(fee, 100_u32);
+}
+
+#[test]
+fn test_get_applicable_fee_with_tiers() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &100_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    let mut tiers = Vec::new(&env);
+    tiers.push_back(types::FeeTier {
+        volume_threshold: 100,
+        fee_bps: 50,
+    });
+    tiers.push_back(types::FeeTier {
+        volume_threshold: 1_000,
+        fee_bps: 25,
+    });
+
+    c.set_fee_tiers(&admin, &tiers);
+
+    // Create invoice to accumulate volume
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false);
+
+    // Creator now has volume of 200, qualifies for 50 bps tier
+    let fee = c.get_applicable_fee(&creator);
+    assert_eq!(fee, 50_u32);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #286: Invariant checks tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_invoice_funded_never_exceeds_total() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+    let inv_before = c.get_invoice(&id);
+    debug_assert!(inv_before.funded <= inv_before.amounts.get(0).unwrap(), "invariant failed: funded > total");
+
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false);
+    let inv_after = c.get_invoice(&id);
+    debug_assert!(inv_after.funded <= inv_after.amounts.get(0).unwrap(), "invariant failed: funded > total after payment");
+
+    assert_eq!(inv_before.amounts.get(0).unwrap(), 300);
+    assert!(inv_after.funded <= 300);
+}
+
+#[test]
+fn test_no_duplicate_recipients() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with single recipient
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100);
+
+    let id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999,
+        &default_options(&env),
+    );
+
+    let invoice = c.get_invoice(&id);
+    // Verify no duplicates (debug_assert should have caught it if there were)
+    assert_eq!(invoice.recipients.len(), 1);
+}
+
+#[test]
+fn test_payment_shards_sum_correctly() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer1, &150);
+    sa.mint(&payer2, &150);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+
+    c.pay(&payer1, &id, &150_i128, &0_u64, &false, &false);
+    let inv1 = c.get_invoice(&id);
+    debug_assert_eq!(inv1.funded, 150, "invariant: funded amount mismatch after first payment");
+
+    c.pay(&payer2, &id, &150_i128, &0_u64, &false, &false);
+    let inv2 = c.get_invoice(&id);
+    debug_assert_eq!(inv2.funded, 300, "invariant: funded amount must equal sum of payments");
+
+    assert_eq!(inv2.status, InvoiceStatus::Released);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #299: Creator analytics tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_creator_stats_empty() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+
+    let stats = c.get_creator_stats(&creator);
+    assert_eq!(stats.total_invoices, 0);
+    assert_eq!(stats.total_raised, 0);
+    assert_eq!(stats.total_released, 0);
+    assert_eq!(stats.total_payers, 0);
+    assert_eq!(stats.avg_funding_time_ledgers, 0);
+}
+
+#[test]
+fn test_creator_stats_on_invoice_creation() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    let _id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let _id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let stats = c.get_creator_stats(&creator);
+    assert_eq!(stats.total_invoices, 2, "total_invoices should be 2 after creating 2 invoices");
+}
+
+#[test]
+fn test_creator_stats_on_payment() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false);
+    let stats = c.get_creator_stats(&creator);
+    assert_eq!(stats.total_raised, 100, "total_raised should reflect payment amount");
+}
+
+#[test]
+fn test_creator_stats_on_release() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 250, &token_id, 9_999);
+    c.pay(&payer, &id, &250_i128, &0_u64, &false, &false);
+
+    let stats = c.get_creator_stats(&creator);
+    assert_eq!(stats.total_released, 250, "total_released should equal released amount");
+}
+
+#[test]
+fn test_creator_stats_unique_payers() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer1, &200);
+    sa.mint(&payer2, &200);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    c.pay(&payer1, &id1, &100_i128, &0_u64, &false, &false);
+    c.pay(&payer2, &id2, &100_i128, &0_u64, &false, &false);
+
+    let stats = c.get_creator_stats(&creator);
+    assert_eq!(stats.total_payers, 2, "total_payers should count unique payers only");
+}
+
