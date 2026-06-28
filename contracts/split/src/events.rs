@@ -1,5 +1,5 @@
 use soroban_sdk::{symbol_short, Address, Env, Vec, String};
-use crate::types::TimelockAction;
+use crate::types::{InvoiceStatus, TimelockAction};
 
 /// Emitted when a new invoice is created.
 /// Topics: (split, created, invoice_id)
@@ -260,5 +260,46 @@ pub fn creator_volume_milestone(env: &Env, creator: &Address, total_volume: i128
     env.events().publish(
         (symbol_short!("split"), symbol_short!("cr_v_ms"), creator.clone()),
         (total_volume, invoice_count, milestone_number, env.ledger().sequence()),
+    );
+}
+
+/// Issue #283: Unified state transition event emitted on every invoice status change.
+///
+/// # Indexer Guide
+/// Indexers can reconstruct the full invoice lifecycle by filtering events with
+/// topic[1] == "st_chg". Each event carries:
+///   - `from`: the previous status (as a Symbol: "none", "pending", "released", "refunded", "cancelled")
+///   - `to`: the new status (same encoding)
+///   - `actor`: the address that triggered the transition
+///   - `ledger`: the ledger sequence number at transition time
+///
+/// To build a per-invoice state machine, collect all "st_chg" events for a given
+/// `invoice_id` ordered by ledger, then replay `from → to` pairs.
+///
+/// Topics: (split, st_chg, invoice_id)
+/// Data: (from_status, to_status, actor, ledger)
+pub fn invoice_state_changed(
+    env: &Env,
+    invoice_id: u64,
+    from_status: Option<&InvoiceStatus>,
+    to_status: &InvoiceStatus,
+    actor: &Address,
+) {
+    let from_sym = match from_status {
+        None => symbol_short!("none"),
+        Some(InvoiceStatus::Pending) => symbol_short!("pending"),
+        Some(InvoiceStatus::Released) => symbol_short!("released"),
+        Some(InvoiceStatus::Refunded) => symbol_short!("refunded"),
+        Some(InvoiceStatus::Cancelled) => symbol_short!("cancld"),
+    };
+    let to_sym = match to_status {
+        InvoiceStatus::Pending => symbol_short!("pending"),
+        InvoiceStatus::Released => symbol_short!("released"),
+        InvoiceStatus::Refunded => symbol_short!("refunded"),
+        InvoiceStatus::Cancelled => symbol_short!("cancld"),
+    };
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("st_chg"), invoice_id),
+        (from_sym, to_sym, actor.clone(), env.ledger().sequence()),
     );
 }

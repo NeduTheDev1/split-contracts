@@ -1006,6 +1006,7 @@ impl SplitContract {
                 // If the invoice has no payments, mark as cancelled.
                 if invoice.funded == 0 {
                     invoice.status = InvoiceStatus::Cancelled;
+                    events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Cancelled, &arbiter);
                     save_invoice(&env, invoice_id, &invoice);
                     append_audit_entry(&env, invoice_id, symbol_short!("resolve"), &arbiter);
                     return;
@@ -1044,6 +1045,7 @@ impl SplitContract {
                 save_invoice(&env, invoice_id, &invoice);
                 append_audit_entry(&env, invoice_id, symbol_short!("resolve"), &arbiter);
                 events::invoice_refunded(&env, invoice_id);
+                events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &arbiter);
 
                 let total_refunded: i128 = env
                     .storage()
@@ -3770,6 +3772,7 @@ impl SplitContract {
             }
             append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
             events::invoice_released(env, invoice_id, &invoice.recipients);
+            events::invoice_state_changed(env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Released, actor);
             notify_invoice(env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
             maybe_record_released(env, &invoice.creator, amount_released);
         }
@@ -3909,6 +3912,7 @@ impl SplitContract {
             }
             append_audit_entry(&env, invoice_id, symbol_short!("stg_rel"), &creator);
             events::invoice_released(&env, invoice_id, &invoice.recipients);
+            events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Released, &creator);
             notify_invoice(&env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
         } else {
             append_audit_entry(&env, invoice_id, symbol_short!("stg_rel"), &creator);
@@ -4265,6 +4269,7 @@ impl SplitContract {
                         save_invoice(env, member_id, &member);
                         append_audit_entry(env, member_id, symbol_short!("release"), actor);
                         events::invoice_released(env, member_id, &member.recipients);
+                        events::invoice_state_changed(env, member_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Released, actor);
                     }
                 }
             }
@@ -4326,6 +4331,7 @@ impl SplitContract {
         save_invoice(env, invoice_id, invoice);
         append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
         events::invoice_released(env, invoice_id, &invoice.recipients);
+        events::invoice_state_changed(env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Released, actor);
         notify_invoice(env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
         maybe_record_released(env, &invoice.creator, funded);
 
@@ -4496,6 +4502,7 @@ impl SplitContract {
                         let actor = env.current_contract_address();
                         append_audit_entry(&env, invoice_id, symbol_short!("auto_ref"), &actor);
                         events::invoice_refunded(&env, invoice_id);
+                        events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &actor);
                         maybe_record_refunded(&env, &invoice.creator);
                         notify_invoice(&env, invoice_id, symbol_short!("refund"), &invoice.notification_contract);
                         let total_refunded: i128 = env
@@ -4649,6 +4656,7 @@ impl SplitContract {
         let actor = env.current_contract_address();
         append_audit_entry(&env, invoice_id, symbol_short!("refund"), &actor);
         events::invoice_refunded(&env, invoice_id);
+        events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &actor);
         notify_invoice(&env, invoice_id, symbol_short!("refund"), &invoice.notification_contract);
         maybe_record_refunded(&env, &invoice.creator);
 
@@ -4737,6 +4745,7 @@ impl SplitContract {
             invoice.status = InvoiceStatus::Refunded;
             invoice.completion_time = Some(now);
             save_invoice(&env, invoice_id, &invoice);
+            events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &env.current_contract_address());
             append_audit_entry(&env, invoice_id, symbol_short!("auc_stl"), &env.current_contract_address());
             return;
         }
@@ -4767,6 +4776,7 @@ impl SplitContract {
         invoice.status = InvoiceStatus::Refunded;
         invoice.completion_time = Some(now);
         save_invoice(&env, invoice_id, &invoice);
+        events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &env.current_contract_address());
         append_audit_entry(&env, invoice_id, symbol_short!("auc_stl"), &env.current_contract_address());
 
         let total_refunded: i128 = env.storage().persistent().get(&total_refunded_key()).unwrap_or(0i128);
@@ -4881,6 +4891,7 @@ impl SplitContract {
             }
 
             invoice.status = InvoiceStatus::Refunded;
+            events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &caller);
             maybe_record_refunded(&env, &invoice.creator);
 
             // Increment total_refunded counter (issue #28).
@@ -4908,6 +4919,7 @@ impl SplitContract {
             // (stake_amount field not yet on Invoice; skipped)
 
             invoice.status = InvoiceStatus::Cancelled;
+            events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Cancelled, &caller);
         }
 
         save_invoice(&env, invoice_id, &invoice);
@@ -5071,6 +5083,7 @@ impl SplitContract {
         old_invoice.status = InvoiceStatus::Refunded;
         old_invoice.completion_time = Some(env.ledger().timestamp());
         save_invoice(&env, invoice_id, &old_invoice);
+        events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &caller);
 
         append_audit_entry(&env, invoice_id, symbol_short!("rollover"), &caller);
         append_audit_entry(&env, new_id, symbol_short!("rollover"), &caller);
