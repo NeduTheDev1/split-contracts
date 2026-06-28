@@ -263,6 +263,33 @@ pub fn creator_volume_milestone(env: &Env, creator: &Address, total_volume: i128
     );
 }
 
+/// Issue #285: Emitted when fee tiers are updated.
+/// Topics: (split, fee_tiers_updated)
+/// Data: count of tiers
+pub fn fee_tiers_updated(env: &Env, tier_count: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("fee_upd")),
+        tier_count,
+    );
+}
+
+/// Issue #285: Emitted when a fee tier is applied at release time.
+/// Topics: (split, fee_tier_applied, creator)
+/// Data: (tier_index, fee_bps, creator_volume)
+pub fn fee_tier_applied(env: &Env, creator: &Address, tier_index: u32, fee_bps: u32, creator_volume: u64) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("fee_app"), creator.clone()),
+        (tier_index, fee_bps, creator_volume),
+    );
+}
+
+/// Issue #299: Emitted when creator stats are updated.
+/// Topics: (split, creator_stats_updated, creator)
+/// Data: (total_invoices, total_raised, total_released, total_payers, avg_funding_time)
+pub fn creator_stats_updated(env: &Env, creator: &Address, total_invoices: u32, total_raised: u64, total_released: u64, total_payers: u32, avg_funding_time_ledgers: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("stats_upd"), creator.clone()),
+        (total_invoices, total_raised, total_released, total_payers, avg_funding_time_ledgers),
 /// Issue #283: Unified state transition event emitted on every invoice status change.
 ///
 /// # Indexer Guide

@@ -21,6 +21,11 @@ use soroban_sdk::{
 };
 use soroban_sdk::xdr::ToXdr;
 use types::{
+    AdminRole, AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreatorStats,
+    CreateInvoiceParams, FeeTier, Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceOptions,
+    InvoicePayment, InvoiceStatus, InvoiceTemplate, LegacyInvoice, OverflowBehavior, Payment,
+    PaymentCertificate, PaymentProof, QueuedAction, ResolveAction, ResolveRule, SplitRule,
+    SubscriptionParams, TimelockAction, Tranche, TreasuryRecord,
     AdminRole, AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreateInvoiceParams,
     Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus,
     InvoiceTemplate, LegacyInvoice, OverflowBehavior, Payment, PaymentCertificate, PaymentProof,
@@ -311,6 +316,16 @@ fn creator_stats_refunded_key(creator: &Address) -> (Symbol, Address) {
     (symbol_short!("cr_ref"), creator.clone())
 }
 
+/// Per-creator total payers count key (Issue #299).
+fn creator_stats_payers_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cr_pyr"), creator.clone())
+}
+
+/// Per-creator average funding time in ledgers key (Issue #299).
+fn creator_stats_avg_funding_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cr_avgf"), creator.clone())
+}
+
 /// Dashboard contract address key.
 fn dashboard_contract_key() -> Symbol {
     symbol_short!("dash_ctr")
@@ -415,6 +430,39 @@ fn maybe_record_released(env: &Env, creator: &Address, amount: i128) {
     }
 }
 
+/// Issue #299: Update creator stats on invoice creation.
+fn update_creator_stats_on_creation(env: &Env, creator: &Address) {
+    let count_key = creator_stats_count_key(creator);
+    let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0u64);
+    env.storage().persistent().set(&count_key, &(count + 1));
+}
+
+/// Issue #299: Update creator stats on payment received.
+fn update_creator_stats_on_payment(env: &Env, creator: &Address, amount: i128) {
+    let volume_key = creator_stats_volume_key(creator);
+    let volume: u64 = env.storage().persistent().get(&volume_key).unwrap_or(0u64);
+    env.storage().persistent().set(&volume_key, &(volume + amount as u64));
+}
+
+/// Issue #299: Update creator stats on release.
+fn update_creator_stats_on_release(env: &Env, creator: &Address, amount: i128) {
+    let released_key = creator_stats_released_key(creator);
+    let released: u64 = env.storage().persistent().get(&released_key).unwrap_or(0u64);
+    env.storage().persistent().set(&released_key, &(released + amount as u64));
+}
+
+/// Issue #299: Update creator unique payers count (call after recording payment).
+fn update_creator_payers(env: &Env, creator: &Address, payer: &Address) {
+    // Track unique payers using a set-like approach via a key pattern
+    let payer_key = (symbol_short!("cr_py_set"), creator.clone(), payer.clone());
+    if env.storage().persistent().get::<(Symbol, Address, Address), bool>(&payer_key).is_none() {
+        env.storage().persistent().set(&payer_key, &true);
+        let payers_key = creator_stats_payers_key(creator);
+        let payers: u64 = env.storage().persistent().get(&payers_key).unwrap_or(0u64);
+        env.storage().persistent().set(&payers_key, &(payers + 1));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Invoice storage helpers
 // ---------------------------------------------------------------------------
@@ -516,6 +564,22 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
 }
 
 fn save_invoice(env: &Env, id: u64, invoice: &Invoice) {
+    // Issue #286: Verify invariants before saving
+    debug_assert!(
+        invoice.funded <= invoice.amounts.iter().sum(),
+        "invariant: funded exceeds total"
+    );
+    
+    // Check no duplicate recipients
+    for i in 0..invoice.recipients.len() {
+        for j in (i + 1)..invoice.recipients.len() {
+            debug_assert!(
+                invoice.recipients.get(i).unwrap() != invoice.recipients.get(j).unwrap(),
+                "invariant: duplicate recipient addresses"
+            );
+        }
+    }
+    
     let mut clean_invoice = invoice.clone();
     clean_invoice.payments = Vec::new(env);
     let (core, ext, ext2) = clean_invoice.split();
@@ -1349,6 +1413,114 @@ impl SplitContract {
             .unwrap_or(0u32)
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #285: Volume-based fee tiers
+    // -----------------------------------------------------------------------
+
+    /// Admin function to set up to 5 fee tiers sorted by volume threshold.
+    /// Requires admin auth.
+    pub fn set_fee_tiers(env: Env, admin: Address, tiers: Vec<FeeTier>) {
+        let admin_addr = require_admin(&env);
+        let _ = admin;
+
+        debug_assert!(tiers.len() <= 5, "Maximum 5 fee tiers allowed");
+
+        // Verify tiers are sorted by volume_threshold in ascending order
+        for i in 1..tiers.len() {
+            let prev = tiers.get(i - 1).unwrap();
+            let curr = tiers.get(i).unwrap();
+            debug_assert!(prev.volume_threshold < curr.volume_threshold, "Fee tiers must be sorted by volume_threshold");
+        }
+
+        env.storage().instance().set(&fee_tiers_key(), &tiers);
+        events::fee_tiers_updated(&env, tiers.len() as u32);
+    }
+
+    /// Get the applicable fee in basis points for a creator based on their lifetime volume.
+    /// Returns the lowest fee_bps for which the creator's volume meets the threshold.
+    pub fn get_applicable_fee(env: Env, creator: Address) -> u32 {
+        let tiers: Vec<FeeTier> = env
+            .storage()
+            .instance()
+            .get(&fee_tiers_key())
+            .unwrap_or(Vec::new(&env));
+
+        if tiers.is_empty() {
+            return SplitContract::get_platform_fee_bps(env);
+        }
+
+        let creator_volume: u64 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_volume_key(&creator))
+            .unwrap_or(0u64);
+
+        // Find the applicable tier (highest volume threshold that creator meets)
+        let mut applicable_fee = SplitContract::get_platform_fee_bps(env);
+        for i in (0..tiers.len()).rev() {
+            let tier = tiers.get(i).unwrap();
+            if creator_volume >= tier.volume_threshold {
+                applicable_fee = tier.fee_bps;
+                break;
+            }
+        }
+
+        applicable_fee
+    }
+
+    /// Get the current fee tiers.
+    pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
+        env.storage()
+            .instance()
+            .get(&fee_tiers_key())
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #299: Creator analytics aggregator
+    // -----------------------------------------------------------------------
+
+    /// Get aggregated analytics for a creator.
+    pub fn get_creator_stats(env: Env, creator: Address) -> CreatorStats {
+        let total_invoices: u32 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_count_key(&creator))
+            .unwrap_or(0u64) as u32;
+
+        let total_raised: u64 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_volume_key(&creator))
+            .unwrap_or(0u64);
+
+        let total_released: u64 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_released_key(&creator))
+            .unwrap_or(0u64);
+
+        let total_payers: u32 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_payers_key(&creator))
+            .unwrap_or(0u64) as u32;
+
+        let avg_funding_time_ledgers: u32 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_avg_funding_key(&creator))
+            .unwrap_or(0u64) as u32;
+
+        CreatorStats {
+            total_invoices,
+            total_raised,
+            total_released,
+            total_payers,
+            avg_funding_time_ledgers,
+        }
+    }
+
     /// Set the NFT gate contract address. When set, only holders of the NFT
     /// (via `balance_of(creator) > 0`) may create invoices. Pass `None` to disable.
     /// Requires admin auth.
@@ -1668,6 +1840,16 @@ impl SplitContract {
 
         let _total_amount: i128 = amounts.iter().sum();
 
+        // Issue #286: Verify no duplicate recipients
+        for i in 0..recipients.len() {
+            for j in (i + 1)..recipients.len() {
+                debug_assert!(
+                    recipients.get(i).unwrap() != recipients.get(j).unwrap(),
+                    "invariant: duplicate recipient addresses in list"
+                );
+            }
+        }
+
         if let Some(compliance_contract) = env.storage().persistent().get::<_, Address>(&soroban_sdk::symbol_short!("comp_ctr")) {
             let creator_ok: bool = env.invoke_contract(&compliance_contract, &soroban_sdk::Symbol::new(env, "check"), (creator.clone(),).into_val(env));
             assert!(creator_ok, "compliance check failed");
@@ -1957,6 +2139,7 @@ impl SplitContract {
         save_invoice(env, id, &invoice);
         events::invoice_created(env, id, &creator, total, &invoice.cross_chain_ref);
         maybe_record_created(env, &creator, total);
+        update_creator_stats_on_creation(env, &creator);
 
         // Index each recipient -> invoice ID (issue #40).
         for recipient in invoice.recipients.iter() {
@@ -2781,6 +2964,8 @@ impl SplitContract {
 
         append_audit_entry(env, invoice_id, symbol_short!("pay"), payer);
         events::payment_received(env, invoice_id, payer, credited_amount);
+        update_creator_stats_on_payment(env, &invoice.creator, credited_amount);
+        update_creator_payers(env, &invoice.creator, payer);
         notify_invoice(env, invoice_id, symbol_short!("pay"), &invoice.notification_contract);
 
         // Record rate-limiter timestamps after successful payment (issue #168).
@@ -3803,6 +3988,7 @@ impl SplitContract {
             events::invoice_state_changed(env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Released, actor);
             notify_invoice(env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
             maybe_record_released(env, &invoice.creator, amount_released);
+            update_creator_stats_on_release(env, &invoice.creator, amount_released);
         }
 
         save_invoice(env, invoice_id, invoice);
