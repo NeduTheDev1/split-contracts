@@ -18,11 +18,11 @@ use soroban_sdk::{
 };
 use soroban_sdk::xdr::ToXdr;
 use types::{
-    AdminRole, AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreateInvoiceParams,
-    Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus,
-    InvoiceTemplate, LegacyInvoice, OverflowBehavior, Payment, PaymentCertificate, PaymentProof,
-    QueuedAction, ResolveAction, ResolveRule, SplitRule, SubscriptionParams,
-    TimelockAction, Tranche, TreasuryRecord,
+    AdminRole, AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreatorStats,
+    CreateInvoiceParams, FeeTier, Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceOptions,
+    InvoicePayment, InvoiceStatus, InvoiceTemplate, LegacyInvoice, OverflowBehavior, Payment,
+    PaymentCertificate, PaymentProof, QueuedAction, ResolveAction, ResolveRule, SplitRule,
+    SubscriptionParams, TimelockAction, Tranche, TreasuryRecord,
 };
 
 // ---------------------------------------------------------------------------
@@ -306,6 +306,16 @@ fn creator_stats_released_key(creator: &Address) -> (Symbol, Address) {
 /// Per-creator total refunded volume key.
 fn creator_stats_refunded_key(creator: &Address) -> (Symbol, Address) {
     (symbol_short!("cr_ref"), creator.clone())
+}
+
+/// Per-creator total payers count key (Issue #299).
+fn creator_stats_payers_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cr_pyr"), creator.clone())
+}
+
+/// Per-creator average funding time in ledgers key (Issue #299).
+fn creator_stats_avg_funding_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("cr_avgf"), creator.clone())
 }
 
 /// Dashboard contract address key.
@@ -1330,6 +1340,69 @@ impl SplitContract {
             .instance()
             .get(&platform_fee_bps_key())
             .unwrap_or(0u32)
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #285: Volume-based fee tiers
+    // -----------------------------------------------------------------------
+
+    /// Admin function to set up to 5 fee tiers sorted by volume threshold.
+    /// Requires admin auth.
+    pub fn set_fee_tiers(env: Env, admin: Address, tiers: Vec<FeeTier>) {
+        let admin_addr = require_admin(&env);
+        let _ = admin;
+
+        debug_assert!(tiers.len() <= 5, "Maximum 5 fee tiers allowed");
+
+        // Verify tiers are sorted by volume_threshold in ascending order
+        for i in 1..tiers.len() {
+            let prev = tiers.get(i - 1).unwrap();
+            let curr = tiers.get(i).unwrap();
+            debug_assert!(prev.volume_threshold < curr.volume_threshold, "Fee tiers must be sorted by volume_threshold");
+        }
+
+        env.storage().instance().set(&fee_tiers_key(), &tiers);
+        events::fee_tiers_updated(&env, tiers.len() as u32);
+    }
+
+    /// Get the applicable fee in basis points for a creator based on their lifetime volume.
+    /// Returns the lowest fee_bps for which the creator's volume meets the threshold.
+    pub fn get_applicable_fee(env: Env, creator: Address) -> u32 {
+        let tiers: Vec<FeeTier> = env
+            .storage()
+            .instance()
+            .get(&fee_tiers_key())
+            .unwrap_or(Vec::new(&env));
+
+        if tiers.is_empty() {
+            return SplitContract::get_platform_fee_bps(env);
+        }
+
+        let creator_volume: u64 = env
+            .storage()
+            .persistent()
+            .get(&creator_stats_volume_key(&creator))
+            .unwrap_or(0u64);
+
+        // Find the applicable tier (highest volume threshold that creator meets)
+        let mut applicable_fee = SplitContract::get_platform_fee_bps(env);
+        for i in (0..tiers.len()).rev() {
+            let tier = tiers.get(i).unwrap();
+            if creator_volume >= tier.volume_threshold {
+                applicable_fee = tier.fee_bps;
+                break;
+            }
+        }
+
+        applicable_fee
+    }
+
+    /// Get the current fee tiers.
+    pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
+        env.storage()
+            .instance()
+            .get(&fee_tiers_key())
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Set the NFT gate contract address. When set, only holders of the NFT
