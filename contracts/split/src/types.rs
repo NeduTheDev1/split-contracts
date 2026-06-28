@@ -890,7 +890,8 @@ impl Invoice {
 }
 
 
-#[derive(Clone, Debug, soroban_sdk::contracttype)]
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct InvoiceParams {
     pub creator: Address,
     pub recipients: Vec<Address>,

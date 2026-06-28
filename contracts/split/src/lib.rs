@@ -12,6 +12,9 @@ mod types;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod fuzz_tests;
+
 use soroban_sdk::{
     String,
     contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec,
@@ -23,6 +26,11 @@ use types::{
     InvoicePayment, InvoiceStatus, InvoiceTemplate, LegacyInvoice, OverflowBehavior, Payment,
     PaymentCertificate, PaymentProof, QueuedAction, ResolveAction, ResolveRule, SplitRule,
     SubscriptionParams, TimelockAction, Tranche, TreasuryRecord,
+    AdminRole, AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreateInvoiceParams,
+    Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus,
+    InvoiceTemplate, LegacyInvoice, OverflowBehavior, Payment, PaymentCertificate, PaymentProof,
+    QueuedAction, ResolveAction, ResolveRule, SplitRule, SubscriptionParams,
+    TimelockAction, Tranche, TreasuryRecord, UpgradeProposal,
 };
 
 // ---------------------------------------------------------------------------
@@ -392,6 +400,16 @@ fn pending_admin_key() -> Symbol {
     symbol_short!("pend_adm")
 }
 
+/// Issue #310: pending upgrade proposal — instance storage.
+fn upgrade_proposal_key() -> Symbol {
+    symbol_short!("upg_prop")
+}
+
+/// Issue #308: per-invoice refunded-addresses set — persistent storage.
+fn refunded_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("refunded"), invoice_id)
+}
+
 fn maybe_record_created(env: &Env, creator: &Address, total: i128) {
     if let Some(dashboard) = env.storage().persistent().get::<Symbol, Address>(&dashboard_contract_key()) {
         let _: Val = env.invoke_contract(
@@ -515,6 +533,7 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
             penalty_tiers: Vec::new(env),
             allowed_callers: None,
             refund_grace_secs: None,
+            refunded_addresses: Vec::new(env),
         });
     let ext2: InvoiceExt2 = env.storage().persistent()
         .get(&invoice_ext2_key(id))
@@ -1065,6 +1084,7 @@ impl SplitContract {
                 // If the invoice has no payments, mark as cancelled.
                 if invoice.funded == 0 {
                     invoice.status = InvoiceStatus::Cancelled;
+                    events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Cancelled, &arbiter);
                     save_invoice(&env, invoice_id, &invoice);
                     append_audit_entry(&env, invoice_id, symbol_short!("resolve"), &arbiter);
                     return;
@@ -1103,6 +1123,7 @@ impl SplitContract {
                 save_invoice(&env, invoice_id, &invoice);
                 append_audit_entry(&env, invoice_id, symbol_short!("resolve"), &arbiter);
                 events::invoice_refunded(&env, invoice_id);
+                events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &arbiter);
 
                 let total_refunded: i128 = env
                     .storage()
@@ -1328,6 +1349,7 @@ impl SplitContract {
                         penalty_tiers: Vec::new(&env),
                         allowed_callers: None,
                         refund_grace_secs: None,
+                        refunded_addresses: Vec::new(&env),
                     })
             });
         let ext2: types::InvoiceExt2 = env
@@ -1698,7 +1720,8 @@ impl SplitContract {
             creator,
             recipients,
             amounts,
-            token,
+            // Issue #307: if payment_token is explicitly set, use it instead of the token param.
+            options.payment_token.unwrap_or(token),
             deadline,
             options.co_creators,
             options.allow_early_withdrawal,
@@ -2107,6 +2130,7 @@ impl SplitContract {
             priorities,
             penalty_tiers: Vec::new(env),
             allowed_callers: None,
+            refunded_addresses: Vec::new(env),
             admin_frozen: false,
             min_funding_amount: 0,
             target_usd_cents: None,
@@ -2488,6 +2512,7 @@ impl SplitContract {
             scheduled_release_at: source.scheduled_release_at,
             priorities: source.priorities.clone(),
             target_usd_cents: source.target_usd_cents,
+            refunded_addresses: Vec::new(&env),
         };
 
         save_invoice(&env, id, &new_invoice);
@@ -3551,14 +3576,16 @@ impl SplitContract {
             invoice.allowed_payers = Some(new_whitelist);
             save_invoice(&env, invoice_id, &invoice);
             append_audit_entry(&env, invoice_id, symbol_short!("rem_payer"), &creator);
+            // Issue #309: emit AllowlistUpdated event on removal
+            events::allowlist_updated(&env, invoice_id, &creator, &payer, false);
         }
     }
 
     /// Add a payer to the invoice's allowed_payers allowlist.
     ///
     /// Only the creator (or a co-creator) may call this. If allowed_payers is None
-    /// (open invoice), this is a no-op and does not error. If the payer is already
-    /// in the allowlist, this is a no-op.
+    /// (open invoice), initializes the list with this payer (making the invoice private).
+    /// If the payer is already in the allowlist, this is a no-op.
     pub fn add_allowed_payer(env: Env, creator: Address, invoice_id: u64, payer: Address) {
         require_not_paused(&env);
         creator.require_auth();
@@ -3570,13 +3597,21 @@ impl SplitContract {
             "only creator can modify allowlist"
         );
 
-        // No-op if allowed_payers is None (open invoice)
+        // If allowed_payers is None, initialize a new list (makes invoice private).
+        if invoice.allowed_payers.is_none() {
+            invoice.allowed_payers = Some(Vec::new(&env));
+        }
+
         if let Some(ref mut whitelist) = invoice.allowed_payers {
             // Only add if not already present
             if !whitelist.iter().any(|p| p == payer) {
-                whitelist.push_back(payer);
+                // Issue #309: enforce max 100 allowed payers
+                assert!(whitelist.len() < 100, "allowlist is full");
+                whitelist.push_back(payer.clone());
                 save_invoice(&env, invoice_id, &invoice);
                 append_audit_entry(&env, invoice_id, symbol_short!("add_payer"), &creator);
+                // Issue #309: emit AllowlistUpdated event
+                events::allowlist_updated(&env, invoice_id, &creator, &payer, true);
             }
         }
     }
@@ -3950,6 +3985,7 @@ impl SplitContract {
             }
             append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
             events::invoice_released(env, invoice_id, &invoice.recipients);
+            events::invoice_state_changed(env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Released, actor);
             notify_invoice(env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
             maybe_record_released(env, &invoice.creator, amount_released);
             update_creator_stats_on_release(env, &invoice.creator, amount_released);
@@ -4090,6 +4126,7 @@ impl SplitContract {
             }
             append_audit_entry(&env, invoice_id, symbol_short!("stg_rel"), &creator);
             events::invoice_released(&env, invoice_id, &invoice.recipients);
+            events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Released, &creator);
             notify_invoice(&env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
         } else {
             append_audit_entry(&env, invoice_id, symbol_short!("stg_rel"), &creator);
@@ -4446,6 +4483,7 @@ impl SplitContract {
                         save_invoice(env, member_id, &member);
                         append_audit_entry(env, member_id, symbol_short!("release"), actor);
                         events::invoice_released(env, member_id, &member.recipients);
+                        events::invoice_state_changed(env, member_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Released, actor);
                     }
                 }
             }
@@ -4507,6 +4545,7 @@ impl SplitContract {
         save_invoice(env, invoice_id, invoice);
         append_audit_entry(env, invoice_id, symbol_short!("release"), actor);
         events::invoice_released(env, invoice_id, &invoice.recipients);
+        events::invoice_state_changed(env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Released, actor);
         notify_invoice(env, invoice_id, symbol_short!("release"), &invoice.notification_contract);
         maybe_record_released(env, &invoice.creator, funded);
 
@@ -4677,6 +4716,7 @@ impl SplitContract {
                         let actor = env.current_contract_address();
                         append_audit_entry(&env, invoice_id, symbol_short!("auto_ref"), &actor);
                         events::invoice_refunded(&env, invoice_id);
+                        events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &actor);
                         maybe_record_refunded(&env, &invoice.creator);
                         notify_invoice(&env, invoice_id, symbol_short!("refund"), &invoice.notification_contract);
                         let total_refunded: i128 = env
@@ -4830,6 +4870,7 @@ impl SplitContract {
         let actor = env.current_contract_address();
         append_audit_entry(&env, invoice_id, symbol_short!("refund"), &actor);
         events::invoice_refunded(&env, invoice_id);
+        events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &actor);
         notify_invoice(&env, invoice_id, symbol_short!("refund"), &invoice.notification_contract);
         maybe_record_refunded(&env, &invoice.creator);
 
@@ -4918,6 +4959,7 @@ impl SplitContract {
             invoice.status = InvoiceStatus::Refunded;
             invoice.completion_time = Some(now);
             save_invoice(&env, invoice_id, &invoice);
+            events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &env.current_contract_address());
             append_audit_entry(&env, invoice_id, symbol_short!("auc_stl"), &env.current_contract_address());
             return;
         }
@@ -4948,6 +4990,7 @@ impl SplitContract {
         invoice.status = InvoiceStatus::Refunded;
         invoice.completion_time = Some(now);
         save_invoice(&env, invoice_id, &invoice);
+        events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &env.current_contract_address());
         append_audit_entry(&env, invoice_id, symbol_short!("auc_stl"), &env.current_contract_address());
 
         let total_refunded: i128 = env.storage().persistent().get(&total_refunded_key()).unwrap_or(0i128);
@@ -5062,6 +5105,7 @@ impl SplitContract {
             }
 
             invoice.status = InvoiceStatus::Refunded;
+            events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &caller);
             maybe_record_refunded(&env, &invoice.creator);
 
             // Increment total_refunded counter (issue #28).
@@ -5089,6 +5133,7 @@ impl SplitContract {
             // (stake_amount field not yet on Invoice; skipped)
 
             invoice.status = InvoiceStatus::Cancelled;
+            events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Cancelled, &caller);
         }
 
         save_invoice(&env, invoice_id, &invoice);
@@ -5252,6 +5297,7 @@ impl SplitContract {
         old_invoice.status = InvoiceStatus::Refunded;
         old_invoice.completion_time = Some(env.ledger().timestamp());
         save_invoice(&env, invoice_id, &old_invoice);
+        events::invoice_state_changed(&env, invoice_id, Some(&InvoiceStatus::Pending), &InvoiceStatus::Refunded, &caller);
 
         append_audit_entry(&env, invoice_id, symbol_short!("rollover"), &caller);
         append_audit_entry(&env, new_id, symbol_short!("rollover"), &caller);
@@ -6003,6 +6049,7 @@ impl SplitContract {
                 payment_cooldown_secs: None, max_payments_per_window: None, payment_window_secs: None,
                 scheduled_release_at: None, refund_grace_secs: None,
                 penalty_tiers: Vec::new(&env), allowed_callers: None,
+                refunded_addresses: Vec::new(&env),
             });
         let ext2: InvoiceExt2 = env.storage().persistent()
             .get(&invoice_ext2_key(invoice_id))
@@ -6345,5 +6392,137 @@ impl SplitContract {
             .persistent()
             .get::<_, PaymentCertificate>(&cert_key(invoice_id))
             .expect("certificate not found")
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #308: Per-payer claim_refund after deadline
+    // -----------------------------------------------------------------------
+
+    /// Claim a refund for the calling payer's contribution after the deadline.
+    ///
+    /// Conditions: invoice must be Pending, deadline must have passed, invoice
+    /// must NOT be fully funded, and the payer must not have already claimed.
+    /// Idempotent — calling twice after the first claim is a no-op.
+    pub fn claim_refund(env: Env, payer: Address, invoice_id: u64) {
+        require_fn_not_paused(&env, &symbol_short!("refund"));
+        payer.require_auth();
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        // Must still be pending (not fully released/refunded via bulk refund).
+        if invoice.status != InvoiceStatus::Pending {
+            // Idempotent: already refunded via bulk path — nothing to do.
+            return;
+        }
+
+        // Deadline must have passed (respecting grace period).
+        let refund_deadline = if let Some(grace_secs) = invoice.refund_grace_secs {
+            invoice.deadline.saturating_add(grace_secs)
+        } else {
+            invoice.deadline
+        };
+        assert!(
+            env.ledger().timestamp() > refund_deadline,
+            "invoice has not expired yet"
+        );
+
+        // Invoice must NOT be fully funded.
+        let total: i128 = invoice.amounts.iter().sum();
+        assert!(invoice.funded < total, "invoice is fully funded");
+
+        // Idempotent: if payer already claimed, silently return.
+        if invoice.refunded_addresses.iter().any(|a| a == payer) {
+            return;
+        }
+
+        // Compute this payer's total contribution (across all shards).
+        let mut payer_total: i128 = 0;
+        for shard_id in 0..SHARD_COUNT {
+            if let Some(shard_payments) = env.storage().persistent().get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id)) {
+                for payment in shard_payments.iter() {
+                    if payment.payer == payer && !payment.donate_on_failure {
+                        payer_total += payment.amount;
+                    }
+                }
+            }
+        }
+
+        if payer_total == 0 {
+            return; // No contribution to refund.
+        }
+
+        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        token_client.transfer(&env.current_contract_address(), &payer, &payer_total);
+
+        // Record that this payer has claimed.
+        invoice.refunded_addresses.push_back(payer.clone());
+        invoice.funded = invoice.funded.saturating_sub(payer_total);
+        save_invoice(&env, invoice_id, &invoice);
+
+        events::refund_claimed(&env, invoice_id, &payer, payer_total);
+        append_audit_entry(&env, invoice_id, symbol_short!("clm_ref"), &payer);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #310: Two-step upgrade with 48-hour timelock
+    // -----------------------------------------------------------------------
+
+    /// Propose a contract upgrade. Only the admin may call this.
+    ///
+    /// Stores a pending proposal with an eligible_at = now + 48 h.
+    /// Overwrites any existing proposal (only one active at a time).
+    pub fn propose_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        require_admin(&env);
+        let _ = admin;
+
+        const FORTY_EIGHT_HOURS: u64 = 48 * 60 * 60;
+        let eligible_at = env.ledger().timestamp().saturating_add(FORTY_EIGHT_HOURS);
+
+        let proposal = UpgradeProposal {
+            new_wasm_hash: new_wasm_hash.clone(),
+            eligible_at,
+        };
+        env.storage().instance().set(&upgrade_proposal_key(), &proposal);
+
+        events::upgrade_proposed(&env, &new_wasm_hash, eligible_at);
+    }
+
+    /// Execute a pending upgrade once the 48-hour timelock has elapsed.
+    ///
+    /// Callable by anyone after the timelock expires. Clears the proposal on success.
+    pub fn execute_upgrade(env: Env) {
+        let proposal: UpgradeProposal = env
+            .storage()
+            .instance()
+            .get(&upgrade_proposal_key())
+            .expect("no upgrade proposal");
+
+        assert!(
+            env.ledger().timestamp() >= proposal.eligible_at,
+            "upgrade timelock still active"
+        );
+
+        env.storage().instance().remove(&upgrade_proposal_key());
+        events::upgrade_executed(&env, &proposal.new_wasm_hash);
+        env.deployer().update_current_contract_wasm(proposal.new_wasm_hash);
+    }
+
+    /// Cancel a pending upgrade proposal. Only the admin may call this.
+    pub fn cancel_upgrade(env: Env, admin: Address) {
+        let admin_addr = require_admin(&env);
+        let _ = admin;
+
+        assert!(
+            env.storage().instance().has(&upgrade_proposal_key()),
+            "no upgrade proposal"
+        );
+        env.storage().instance().remove(&upgrade_proposal_key());
+
+        events::upgrade_cancelled(&env, &admin_addr);
+    }
+
+    /// Return the pending upgrade proposal, or None if none is active.
+    pub fn get_upgrade_proposal(env: Env) -> Option<UpgradeProposal> {
+        env.storage().instance().get(&upgrade_proposal_key())
     }
 }
