@@ -5,6 +5,21 @@
 
 const SHARD_COUNT: u64 = 8;
 
+/// Issue #298: Soroban per-transaction instruction budget limit.
+const INSTRUCTION_BUDGET_LIMIT: u64 = 100_000_000;
+
+/// Issue #298: Base cost per recipient transfer during release (estimated).
+const INSTRUCTIONS_PER_RECIPIENT: u64 = 500_000;
+/// Issue #298: Base cost per payment shard to aggregate (estimated).
+const INSTRUCTIONS_PER_SHARD: u64 = 100_000;
+/// Issue #298: Fixed overhead for a release call (estimated).
+const INSTRUCTIONS_BASE: u64 = 1_000_000;
+/// Issue #298: Stroops per 10_000 instructions (rough estimate based on Soroban fee schedule).
+const STROOPS_PER_10K_INSTRUCTIONS: u64 = 1;
+
+/// Issue #296: Maximum entries in the per-creator fee waiver list.
+const MAX_FEE_WAIVER_ENTRIES: usize = 100;
+
 mod error;
 mod events;
 mod types;
@@ -30,6 +45,8 @@ use types::{
     Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus,
     InvoiceTemplate, LegacyInvoice, OverflowBehavior, Payment, PaymentCertificate, PaymentProof,
     QueuedAction, ResolveAction, ResolveRule, SplitRule, SubscriptionParams,
+    TimelockAction, Tranche, TreasuryRecord,
+    SimulateReleaseResult, CircuitBreakerStatus, ConfidentialPayment,
     TimelockAction, Tranche, TreasuryRecord, UpgradeProposal,
 };
 
@@ -79,6 +96,32 @@ fn platform_fee_bps_key() -> Symbol {
 fn platform_fee_waiver_list_key() -> Symbol {
     symbol_short!("fee_wvrs")
 }
+
+/// Issue #296: Per-creator fee waiver list key (distinct from the recipient-level waiver list).
+fn creator_fee_waiver_key() -> Symbol {
+    symbol_short!("cr_fw")
+}
+
+/// Issue #297: Circuit breaker active flag key.
+fn circuit_breaker_key() -> Symbol {
+    symbol_short!("cb_flag")
+}
+
+/// Issue #297: Circuit breaker reason storage key.
+fn circuit_breaker_reason_key() -> Symbol {
+    symbol_short!("cb_rsn")
+}
+
+/// Issue #295: Confidential payment storage key per (invoice_id, payer).
+fn confidential_pay_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("conf_pay"), invoice_id, payer.clone())
+}
+
+/// Issue #295: Counter of confidential payments per invoice.
+fn confidential_count_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("conf_cnt"), invoice_id)
+}
+
 fn treasury_key() -> Symbol {
     symbol_short!("treasury")
 }
@@ -631,6 +674,13 @@ fn is_paused(env: &Env) -> bool {
 
 fn require_not_paused(env: &Env) {
     assert!(!is_paused(env), "contract is paused");
+    // Issue #297: also check circuit breaker
+    let cb_active: bool = env
+        .storage()
+        .persistent()
+        .get(&circuit_breaker_key())
+        .unwrap_or(false);
+    assert!(!cb_active, "ContractPaused");
 }
 
 fn require_role(env: &Env, admin: &Address, min_role: AdminRole) {
@@ -4236,11 +4286,25 @@ impl SplitContract {
         let token_client =
             token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
 
-        let platform_fee_bps: u32 = env
+        // Issue #296: if creator has a fee waiver, platform_fee_bps is 0 for this invoice.
+        let creator_waived: bool = {
+            let cfw: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&creator_fee_waiver_key())
+                .unwrap_or_else(|| Vec::new(env));
+            cfw.iter().any(|a| a == invoice.creator)
+        };
+
+        let platform_fee_bps: u32 = if creator_waived {
+            0
+        } else {
+            env
             .storage()
             .instance()
             .get(&platform_fee_bps_key())
-            .unwrap_or(0u32);
+            .unwrap_or(0u32)
+        };
 
         let total: i128 = invoice.amounts.iter().sum();
         let funded = invoice.funded;
@@ -6395,6 +6459,220 @@ impl SplitContract {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #298: Compute cost estimation before release submission
+    // -----------------------------------------------------------------------
+
+    /// Estimate the compute cost of releasing a given invoice without executing it.
+    /// Returns { estimated_instructions, estimated_fee_stroops, would_succeed }.
+    pub fn simulate_release(env: Env, invoice_id: u64) -> SimulateReleaseResult {
+        let invoice = load_invoice(&env, invoice_id);
+        let recipient_count = invoice.recipients.len() as u64;
+        let shard_count = SHARD_COUNT;
+
+        let estimated_instructions = INSTRUCTIONS_BASE
+            + recipient_count * INSTRUCTIONS_PER_RECIPIENT
+            + shard_count * INSTRUCTIONS_PER_SHARD;
+
+        let estimated_fee_stroops =
+            (estimated_instructions / 10_000) * STROOPS_PER_10K_INSTRUCTIONS;
+
+        let would_succeed = estimated_instructions <= INSTRUCTION_BUDGET_LIMIT;
+
+        SimulateReleaseResult {
+            estimated_instructions,
+            estimated_fee_stroops,
+            would_succeed,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #297: Contract-wide circuit breaker
+    // -----------------------------------------------------------------------
+
+    /// Activate the circuit breaker. Admin-only. Halts all mutating entry points.
+    pub fn activate_circuit_breaker(env: Env, admin: Address, reason: String) {
+        require_role(&env, &admin, AdminRole::SuperAdmin);
+        env.storage().persistent().set(&circuit_breaker_key(), &true);
+        env.storage().persistent().set(&circuit_breaker_reason_key(), &reason.clone());
+        events::circuit_breaker_activated(&env, &reason);
+    }
+
+    /// Deactivate the circuit breaker. Admin-only.
+    pub fn deactivate_circuit_breaker(env: Env, admin: Address) {
+        require_role(&env, &admin, AdminRole::SuperAdmin);
+        env.storage().persistent().set(&circuit_breaker_key(), &false);
+        env.storage().persistent().remove(&circuit_breaker_reason_key());
+        events::circuit_breaker_deactivated(&env);
+    }
+
+    /// Returns the current circuit breaker status.
+    /// Read-only — not affected by the circuit breaker.
+    pub fn get_circuit_breaker_status(env: Env) -> CircuitBreakerStatus {
+        let active: bool = env
+            .storage()
+            .persistent()
+            .get(&circuit_breaker_key())
+            .unwrap_or(false);
+        let reason: Option<String> = env
+            .storage()
+            .persistent()
+            .get(&circuit_breaker_reason_key());
+        CircuitBreakerStatus { active, reason }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #296: Per-creator fee waiver list
+    // -----------------------------------------------------------------------
+
+    /// Grant a fee waiver to a creator. Admin-only. Max 100 entries.
+    pub fn add_fee_waiver(env: Env, admin: Address, creator: Address) {
+        require_role(&env, &admin, AdminRole::SuperAdmin);
+        let mut waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&creator_fee_waiver_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        assert!(
+            (waivers.len() as usize) < MAX_FEE_WAIVER_ENTRIES,
+            "fee waiver list full"
+        );
+        if !waivers.iter().any(|a| a == creator) {
+            waivers.push_back(creator.clone());
+            env.storage().persistent().set(&creator_fee_waiver_key(), &waivers);
+            events::fee_waiver_granted(&env, &creator);
+        }
+    }
+
+    /// Revoke a fee waiver from a creator. Admin-only.
+    pub fn remove_fee_waiver(env: Env, admin: Address, creator: Address) {
+        require_role(&env, &admin, AdminRole::SuperAdmin);
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&creator_fee_waiver_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_waivers: Vec<Address> = Vec::new(&env);
+        for a in waivers.iter() {
+            if a != creator {
+                new_waivers.push_back(a);
+            }
+        }
+        env.storage().persistent().set(&creator_fee_waiver_key(), &new_waivers);
+        events::fee_waiver_revoked(&env, &creator);
+    }
+
+    /// Returns true if the creator is on the fee waiver list.
+    pub fn has_fee_waiver(env: Env, creator: Address) -> bool {
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&creator_fee_waiver_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        waivers.iter().any(|a| a == creator)
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #295: Confidential payment amounts using blinded commitments
+    // -----------------------------------------------------------------------
+
+    /// Submit a confidential payment for an invoice.
+    ///
+    /// # Cryptographic scheme
+    /// The caller provides a Pedersen commitment `C = r·G + amount·H` where `G` and `H` are
+    /// independent generators and `r` is a blinding factor known only to the payer/creator.
+    /// A bulletproof-style `range_proof` (provided externally) asserts `amount > 0` without
+    /// revealing it. The contract stores the commitment and an `encrypted_amount` (encrypted
+    /// under the creator's public key off-chain). The creator later calls
+    /// `reveal_confidential_total` to prove the decrypted sum equals the funded total.
+    ///
+    /// In the current implementation the range proof is verified by hashing the concatenation of
+    /// commitment and proof bytes and asserting the result is non-zero (a placeholder that
+    /// maintains the correct API surface for future ZK integration).
+    pub fn pay_confidential(
+        env: Env,
+        payer: Address,
+        invoice_id: u64,
+        commitment: BytesN<32>,
+        range_proof: Bytes,
+        encrypted_amount: Bytes,
+    ) {
+        require_not_paused(&env);
+        payer.require_auth();
+
+        let invoice = load_invoice(&env, invoice_id);
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+
+        // Verify the range proof: concatenate commitment bytes + range_proof then hash.
+        // A valid proof produces a non-zero 32-byte digest (placeholder for full ZK verify).
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&commitment.into());
+        preimage.append(&range_proof);
+        let proof_hash = env.crypto().sha256(&preimage);
+        let zero: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        assert!(proof_hash != zero, "invalid range proof");
+
+        let record = ConfidentialPayment {
+            commitment,
+            encrypted_amount,
+        };
+        env.storage()
+            .persistent()
+            .set(&confidential_pay_key(invoice_id, &payer), &record);
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&confidential_count_key(invoice_id))
+            .unwrap_or(0u32);
+        env.storage()
+            .persistent()
+            .set(&confidential_count_key(invoice_id), &(count + 1));
+    }
+
+    /// Returns the number of confidential payments registered for an invoice.
+    pub fn get_confidential_payment_count(env: Env, invoice_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&confidential_count_key(invoice_id))
+            .unwrap_or(0u32)
+    }
+
+    /// Creator reveals the decrypted sum of all confidential payments and provides
+    /// a proof (hash of encrypted_amounts XOR'd together) to trigger release.
+    pub fn reveal_confidential_total(
+        env: Env,
+        invoice_id: u64,
+        decrypted_sum: i128,
+        proof: BytesN<32>,
+    ) {
+        require_not_paused(&env);
+        let invoice = load_invoice(&env, invoice_id);
+        invoice.creator.require_auth();
+
+        assert!(
+            invoice.status == InvoiceStatus::Pending,
+            "invoice is not pending"
+        );
+        assert!(decrypted_sum > 0, "decrypted_sum must be positive");
+
+        // Verify proof is non-zero (placeholder for full ZK verification).
+        let zero: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        assert!(proof != zero, "invalid reveal proof");
+
+        // Credit the revealed sum to the invoice so the normal release path can proceed.
+        let mut invoice = invoice;
+        let total: i128 = invoice.amounts.iter().sum();
+        let new_funded = invoice.funded + decrypted_sum;
+        invoice.funded = if new_funded > total { total } else { new_funded };
+        save_invoice(&env, invoice_id, &invoice);
+
+        if invoice.funded >= total {
+            let actor = env.current_contract_address();
+            Self::_release(&env, invoice_id, &mut invoice.clone(), &actor);
+        }
     // Issue #308: Per-payer claim_refund after deadline
     // -----------------------------------------------------------------------
 

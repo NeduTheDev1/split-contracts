@@ -263,6 +263,43 @@ pub fn creator_volume_milestone(env: &Env, creator: &Address, total_volume: i128
     );
 }
 
+/// Issue #297: Emitted when the circuit breaker is activated.
+/// Topics: (split, cb_act)
+/// Data: reason
+pub fn circuit_breaker_activated(env: &Env, reason: &String) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cb_act")),
+        reason.clone(),
+    );
+}
+
+/// Issue #297: Emitted when the circuit breaker is deactivated.
+/// Topics: (split, cb_deact)
+/// Data: ()
+pub fn circuit_breaker_deactivated(env: &Env) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cb_dact")),
+        (),
+    );
+}
+
+/// Issue #296: Emitted when a fee waiver is granted to a creator.
+/// Topics: (split, fw_grant, creator)
+/// Data: ()
+pub fn fee_waiver_granted(env: &Env, creator: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("fw_grant"), creator.clone()),
+        (),
+    );
+}
+
+/// Issue #296: Emitted when a fee waiver is revoked from a creator.
+/// Topics: (split, fw_rev, creator)
+/// Data: ()
+pub fn fee_waiver_revoked(env: &Env, creator: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("fw_rev"), creator.clone()),
+        (),
 /// Issue #285: Emitted when fee tiers are updated.
 /// Topics: (split, fee_tiers_updated)
 /// Data: count of tiers
