@@ -47,6 +47,32 @@ pub struct ResolveRule {
     pub action: ResolveAction,
 }
 
+/// Issue #285: Volume-based fee tier for creators.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeTier {
+    /// Minimum creator lifetime volume threshold to qualify for this tier.
+    pub volume_threshold: u64,
+    /// Fee in basis points (e.g. 100 = 1%).
+    pub fee_bps: u32,
+}
+
+/// Issue #299: Per-creator analytics aggregator.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CreatorStats {
+    /// Total number of invoices created.
+    pub total_invoices: u32,
+    /// Total amount raised across all invoices.
+    pub total_raised: u64,
+    /// Total amount released to recipients.
+    pub total_released: u64,
+    /// Total number of unique payers.
+    pub total_payers: u32,
+    /// Average funding time in ledgers (running average).
+    pub avg_funding_time_ledgers: u32,
+}
+
 /// Issue #: A single (invoice_id, amount) pair for pool_pay.
 #[contracttype]
 #[derive(Clone, Debug)]
