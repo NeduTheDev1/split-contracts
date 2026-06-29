@@ -263,6 +263,8 @@ pub struct InvoiceOptions {
     pub require_kyc: bool,
     /// Issue #274: invoice target in USD cents; used with price_oracle for dynamic funding.
     pub target_usd_cents: Option<u64>,
+    /// Issue #307: explicit payment token override; uses this token instead of the invoice base token.
+    pub payment_token: Option<Address>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -370,6 +372,8 @@ pub struct InvoiceExt {
     pub penalty_tiers: Vec<PenaltyTier>,
     pub allowed_callers: Option<Vec<Address>>,
     pub refund_grace_secs: Option<u64>,
+    /// Issue #308: addresses that have already claimed a per-payer refund on this invoice.
+    pub refunded_addresses: Vec<Address>,
 }
 
 #[contracttype]
@@ -504,6 +508,8 @@ pub struct Invoice {
     pub clone_depth: u32,
     /// Issue #274: invoice target in USD cents for oracle-based dynamic funding.
     pub target_usd_cents: Option<u64>,
+    /// Issue #308: addresses that have already claimed a per-payer refund on this invoice.
+    pub refunded_addresses: Vec<Address>,
 }
 
 impl Invoice {
@@ -574,6 +580,7 @@ impl Invoice {
                 penalty_tiers: self.penalty_tiers,
                 allowed_callers: self.allowed_callers,
                 refund_grace_secs: self.refund_grace_secs,
+                refunded_addresses: self.refunded_addresses,
             },
             InvoiceExt2 {
                 notification_contract: self.notification_contract,
@@ -658,6 +665,7 @@ impl Invoice {
             penalty_tiers: ext.penalty_tiers,
             allowed_callers: ext.allowed_callers,
             refund_grace_secs: ext.refund_grace_secs,
+            refunded_addresses: ext.refunded_addresses,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
@@ -915,11 +923,43 @@ pub struct ConfidentialPayment {
     pub encrypted_amount: Bytes,
 }
 
-#[derive(Clone, Debug, soroban_sdk::contracttype)]
+/// Issue #310: Parameters for create_invoice v2 — groups all fields to stay within
+/// Soroban's argument limit.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct InvoiceParams {
     pub creator: Address,
     pub recipients: Vec<Address>,
     // ... add all other fields here ...
+}
+
+/// Issue #310: Pending WASM upgrade proposal stored in instance storage.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct UpgradeProposal {
+    pub new_wasm_hash: BytesN<32>,
+    /// Ledger timestamp after which the upgrade may be executed.
+    pub eligible_at: u64,
+}
+
+/// Hot invoice fields stored in instance storage for TTL-efficient reads.
+///
+/// These four fields are read on every `pay()` call. Keeping them in the
+/// contract *instance* bucket means their TTL is extended by a single
+/// `extend_ttl` call that covers all active invoices simultaneously —
+/// O(1) per payment rather than one persistent-rent charge per invoice entry.
+///
+/// Cold creation params and audit metadata stay in persistent storage
+/// (`InvoiceCore` / `InvoiceExt` / `InvoiceExt2`).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceHot {
+    /// Current lifecycle status — checked at the top of every `pay()`.
+    pub status: InvoiceStatus,
+    /// Cumulative funded amount — mutated on every payment.
+    pub funded: i128,
+    /// Sum of `amounts[]` cached at creation; avoids recomputing on each pay.
+    pub total: i128,
+    /// Recipient list — needed for penalty distribution and auto-release.
+    pub recipients: Vec<Address>,
 }

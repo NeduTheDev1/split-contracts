@@ -38,17 +38,11 @@ use soroban_sdk::{
 use soroban_sdk::xdr::ToXdr;
 use types::{
     AdminRole, AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreatorStats,
-    CreateInvoiceParams, FeeTier, Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceOptions,
-    InvoicePayment, InvoiceStatus, InvoiceTemplate, LegacyInvoice, OverflowBehavior, Payment,
-    PaymentCertificate, PaymentProof, QueuedAction, ResolveAction, ResolveRule, SplitRule,
-    SubscriptionParams, TimelockAction, Tranche, TreasuryRecord,
-    AdminRole, AuditEntry, Bid, CloneOverrides, CompactInvoice, CompletionProof, CreateInvoiceParams,
-    Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceOptions, InvoicePayment, InvoiceStatus,
-    InvoiceTemplate, LegacyInvoice, OverflowBehavior, Payment, PaymentCertificate, PaymentProof,
-    QueuedAction, ResolveAction, ResolveRule, SplitRule, SubscriptionParams,
-    TimelockAction, Tranche, TreasuryRecord,
+    CreateInvoiceParams, FeeTier, Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceHot,
+    InvoiceOptions, InvoicePayment, InvoiceStatus, InvoiceTemplate, LegacyInvoice,
+    OverflowBehavior, Payment, PaymentCertificate, PaymentProof, QueuedAction, ResolveAction,
+    ResolveRule, SplitRule, SubscriptionParams, TimelockAction, Tranche, TreasuryRecord,
     SimulateReleaseResult, CircuitBreakerStatus, ConfidentialPayment,
-    TimelockAction, Tranche, TreasuryRecord, UpgradeProposal,
 };
 
 // ---------------------------------------------------------------------------
@@ -152,6 +146,10 @@ fn invoice_ext2_key(id: u64) -> (Symbol, u64) {
 }
 fn invoice_compact_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("inv_cpt"), id)
+}
+/// Hot invoice fields — instance storage key. See `InvoiceHot` in types.rs.
+fn invoice_hot_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("inv_hot"), id)
 }
 fn audit_log_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("log"), id)
@@ -521,6 +519,24 @@ fn update_creator_payers(env: &Env, creator: &Address, payer: &Address) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// Hot-field TTL helpers
+// ---------------------------------------------------------------------------
+
+/// Target ledger count for instance-storage TTL extension (~30 days at 5 s/ledger).
+const INVOICE_HOT_TTL_LEDGERS: u32 = 518_400;
+
+/// Extend the contract instance TTL so all `InvoiceHot` entries remain live.
+///
+/// Because every `InvoiceHot` entry lives in the *instance* bucket, one call
+/// covers every active invoice simultaneously — O(1) cost per payment instead
+/// of one persistent-rent charge per invoice key.
+fn bump_invoice_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INVOICE_HOT_TTL_LEDGERS / 2, INVOICE_HOT_TTL_LEDGERS);
+}
+
+// ---------------------------------------------------------------------------
 // Storage helpers
 // ---------------------------------------------------------------------------
 
@@ -616,6 +632,13 @@ fn maybe_archive_invoice(env: &Env, id: u64) {
 
 fn load_invoice(env: &Env, id: u64) -> Invoice {
     maybe_archive_invoice(env, id);
+    // Read hot fields from instance storage and extend TTL on every access.
+    // For invoices not yet migrated the entry is absent; the persistent path
+    // acts as fallback and the hot entry is written on the next save_invoice.
+    let maybe_hot: Option<InvoiceHot> = env.storage().instance().get(&invoice_hot_key(id));
+    if maybe_hot.is_some() {
+        bump_invoice_ttl(env);
+    }
 
     let mut core: InvoiceCore = if let Some(c) = env.storage().persistent().get(&invoice_key(id)) {
         c
@@ -707,10 +730,21 @@ fn load_invoice(env: &Env, id: u64) -> Invoice {
     if let Some(compact) = env.storage().persistent().get::<_, CompactInvoice>(&invoice_compact_key(id))
         .or_else(|| env.storage().instance().get(&invoice_compact_key(id)))
     {
+    // Load compact representation if available, then overlay hot fields.
+    let mut invoice = if let Some(compact) = env.storage().persistent().get::<_, CompactInvoice>(&invoice_compact_key(id)) {
         Invoice::from_compact(&compact, core, ext, ext2)
     } else {
         Invoice::assemble(core, ext, ext2)
+    };
+
+    // Hot fields are authoritative post-migration; overlay them here.
+    if let Some(hot) = maybe_hot {
+        invoice.status     = hot.status;
+        invoice.funded     = hot.funded;
+        invoice.recipients = hot.recipients;
     }
+
+    invoice
 }
 
 fn save_invoice(env: &Env, id: u64, invoice: &Invoice) {
@@ -719,7 +753,7 @@ fn save_invoice(env: &Env, id: u64, invoice: &Invoice) {
         invoice.funded <= invoice.amounts.iter().sum(),
         "invariant: funded exceeds total"
     );
-    
+
     // Check no duplicate recipients
     for i in 0..invoice.recipients.len() {
         for j in (i + 1)..invoice.recipients.len() {
@@ -729,7 +763,7 @@ fn save_invoice(env: &Env, id: u64, invoice: &Invoice) {
             );
         }
     }
-    
+
     let mut clean_invoice = invoice.clone();
     clean_invoice.payments = Vec::new(env);
     let (core, ext, ext2) = clean_invoice.split();
@@ -756,6 +790,25 @@ fn save_invoice(env: &Env, id: u64, invoice: &Invoice) {
     } else {
         env.storage().persistent().set(&invoice_compact_key(id), &compact);
     }
+    env.storage().persistent().set(&invoice_key(id), &core);
+    env.storage().persistent().set(&invoice_ext_key(id), &ext);
+    env.storage().persistent().set(&invoice_ext2_key(id), &ext2);
+
+    // Store compact representation
+    let compact = invoice.to_compact(env);
+    env.storage().persistent().set(&invoice_compact_key(id), &compact);
+
+    // Write hot fields to instance storage and bump TTL.
+    // status, funded, and recipients change on pay/release/refund paths.
+    let total: i128 = invoice.amounts.iter().sum();
+    let hot = InvoiceHot {
+        status:     invoice.status.clone(),
+        funded:     invoice.funded,
+        total,
+        recipients: invoice.recipients.clone(),
+    };
+    env.storage().instance().set(&invoice_hot_key(id), &hot);
+    bump_invoice_ttl(env);
 }
 
 fn append_audit_entry(env: &Env, id: u64, action: Symbol, actor: &Address) {
@@ -1374,34 +1427,7 @@ impl SplitContract {
     // -----------------------------------------------------------------------
     // Issue #203: Fee tier system for volume-based discounts
     // -----------------------------------------------------------------------
-
-    /// Set fee tiers for volume-based creation fee discounts.
-    ///
-    /// Requires admin auth. Tiers are stored as Vec<(volume_threshold, discount_bps)>
-    /// where volume_threshold is the minimum lifetime volume required and discount_bps
-    /// is the discount in basis points (e.g., 500 = 5% discount). Tiers must be sorted
-    /// ascending by threshold. A creator gets the highest tier their lifetime volume qualifies for.
-    /// Discount applies only to creation_fee, not platform_fee_bps.
-    pub fn set_fee_tiers(env: Env, admin: Address, tiers: Vec<(i128, u32)>) {
-        require_admin(&env);
-        let _ = admin;
-
-        // Validate tiers are sorted ascending by threshold
-        for i in 0..tiers.len() {
-            if i > 0 {
-                assert!(
-                    tiers.get(i).unwrap().0 >= tiers.get(i - 1).unwrap().0,
-                    "tiers must be sorted ascending by threshold"
-                );
-            }
-            assert!(
-                tiers.get(i).unwrap().1 <= 10_000,
-                "discount_bps must be ≤ 10000"
-            );
-        }
-
-        env.storage().persistent().set(&fee_tiers_key(), &tiers);
-    }
+    // (Superseded by the FeeTier-based set_fee_tiers below; old tuple variant removed.)
 
     // -----------------------------------------------------------------------
     // Issue #4: creator whitelist
@@ -6147,36 +6173,6 @@ impl SplitContract {
             result.push_back(ids.get(i).unwrap());
         }
         result
-    }
-
-    /// Returns creator analytics: (count, volume, released, refunded).
-    ///
-    /// - count: total number of invoices created
-    /// - volume: total amount released across all invoices
-    /// - released: number of invoices successfully released
-    /// - refunded: number of invoices refunded
-    pub fn get_creator_stats(env: Env, creator: Address) -> (u64, i128, u64, u64) {
-        let count = env
-            .storage()
-            .persistent()
-            .get(&creator_stats_count_key(&creator))
-            .unwrap_or(0u64);
-        let volume = env
-            .storage()
-            .persistent()
-            .get(&creator_stats_volume_key(&creator))
-            .unwrap_or(0i128);
-        let released = env
-            .storage()
-            .persistent()
-            .get(&creator_stats_released_key(&creator))
-            .unwrap_or(0u64);
-        let refunded = env
-            .storage()
-            .persistent()
-            .get(&creator_stats_refunded_key(&creator))
-            .unwrap_or(0u64);
-        (count, volume, released, refunded)
     }
 
     /// Returns true if the invoice exists and its status matches `expected_status`.
