@@ -1,6 +1,5 @@
-use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol, Vec};
 use soroban_sdk::{symbol_short, Address, Env, Vec, String};
-use crate::types::TimelockAction;
+use crate::types::{InvoiceStatus, TimelockAction};
 
 /// Emitted when a new invoice is created.
 /// Topics: (split, created, invoice_id)
@@ -102,36 +101,6 @@ pub fn delegate_revoked(env: &Env, invoice_id: u64) {
     );
 }
 
-/// Emitted when NFT gate is set.
-/// Topics: (split, nft_gate)
-/// Data: (contract, admin)
-pub fn nft_gate_set(env: &Env, contract: &Option<Address>, admin: &Address) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("nft_gate")),
-        (contract.clone(), admin.clone()),
-    );
-}
-
-/// Emitted when a timelock action is queued.
-/// Topics: (split, action_q, action_id)
-/// Data: (action, admin)
-pub fn action_queued(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("action_q"), action_id),
-        (action.clone(), admin.clone()),
-    );
-}
-
-/// Emitted when a timelock action is executed.
-/// Topics: (split, action_e, action_id)
-/// Data: action
-pub fn action_executed(env: &Env, action_id: u64, action: &TimelockAction) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("action_e"), action_id),
-        action.clone(),
-    );
-}
-
 /// Emitted when an invoice is partially released.
 /// Topics: (split, part_rel, invoice_id)
 /// Data: recipients
@@ -139,56 +108,6 @@ pub fn invoice_partially_released(env: &Env, invoice_id: u64, recipients: &Vec<A
     env.events().publish(
         (symbol_short!("split"), symbol_short!("part_rel"), invoice_id),
         recipients.clone(),
-    );
-}
-
-/// Emitted when a timelock action is cancelled.
-/// Topics: (split, action_c, action_id)
-/// Data: (action, admin)
-pub fn action_cancelled(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("action_c"), action_id),
-        (action.clone(), admin.clone()),
-    );
-}
-
-/// Emitted when an invoice is admin frozen.
-/// Topics: (split, admin_frz, invoice_id)
-/// Data: (admin, reason)
-pub fn invoice_admin_frozen(env: &Env, invoice_id: u64, admin: &Address, reason: &String) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("admin_frz"), invoice_id),
-        (admin.clone(), reason.clone()),
-    );
-}
-
-/// Emitted when an invoice is admin unfrozen.
-/// Topics: (split, adm_unfrz, invoice_id)
-/// Data: admin
-pub fn invoice_admin_unfrozen(env: &Env, invoice_id: u64, admin: &Address) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("adm_unfrz"), invoice_id),
-        admin.clone(),
-    );
-}
-
-/// Emitted when a partial refund is issued.
-/// Topics: (split, part_ref, invoice_id)
-/// Data: (creator, bps, amount)
-pub fn partial_refund_issued(env: &Env, invoice_id: u64, creator: &Address, bps: u32, amount: i128) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("part_ref"), invoice_id),
-        (creator.clone(), bps, amount),
-    );
-}
-
-/// Emitted when invoices are batch archived.
-/// Topics: (split, bat_arch)
-/// Data: (count, ids)
-pub fn batch_archived(env: &Env, count: u64, ids: &Vec<u64>) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("bat_arch")),
-        (count, ids.clone()),
     );
 }
 
@@ -268,78 +187,183 @@ pub fn pending_payout_claimed(env: &Env, invoice_id: u64, recipient: &Address, a
     );
 }
 
-/// Emitted at the start of every public entry point for real-time contract health observability.
-///
-/// Topic: `(symbol_short!("monitor"), function_name)`
-/// Data:  `(invoice_id, actor_address, ledger_timestamp)`
-pub fn monitor_event(env: &Env, function: Symbol, invoice_id: u64, actor: &Address, timestamp: u64) {
+pub fn nft_gate_set(env: &Env, contract: &Option<Address>, admin: &Address) {
     env.events().publish(
-        (symbol_short!("monitor"), function),
-        (invoice_id, actor.clone(), timestamp),
-/// Emitted when an emergency withdrawal is executed.
-/// Topics: (split, emrg_wd)
-/// Data: (token, destination, amount)
-pub fn emergency_withdrawal_executed(env: &Env, token: &Address, destination: &Address, amount: i128) {
-    env.events().publish(
-        (symbol_short!("split"), symbol_short!("emrg_wd")),
-        (token.clone(), destination.clone(), amount),
+        (symbol_short!("split"), symbol_short!("nft_set")),
+        (contract.clone(), admin.clone()),
     );
 }
 
-/// Replayed invoice_created event tagged with "replay" so indexers can distinguish it.
-/// Topics: (split, created, invoice_id, replay)
-/// Data: (creator, total, cross_chain_ref)
-pub fn replay_invoice_created(env: &Env, invoice_id: u64, creator: &Address, total: i128, cross_chain_ref: &Option<soroban_sdk::String>) {
+pub fn action_queued(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("created"), invoice_id, symbol_short!("replay")),
-        (creator.clone(), total, cross_chain_ref.clone()),
+        (symbol_short!("split"), symbol_short!("tl_queue"), action_id),
+        (action.clone(), admin.clone()),
     );
 }
 
-/// Replayed payment_received event tagged with "replay".
-/// Topics: (split, paid, invoice_id, replay)
-/// Data: (payer, amount)
-pub fn replay_payment_received(env: &Env, invoice_id: u64, payer: &Address, amount: i128) {
+pub fn action_executed(env: &Env, action_id: u64, action: &TimelockAction) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("paid"), invoice_id, symbol_short!("replay")),
-        (payer.clone(), amount),
+        (symbol_short!("split"), symbol_short!("tl_exec"), action_id),
+        action.clone(),
     );
 }
 
-/// Replayed invoice_released event tagged with "replay".
-/// Topics: (split, released, invoice_id, replay)
-/// Data: recipients
-pub fn replay_invoice_released(env: &Env, invoice_id: u64, recipients: &Vec<Address>) {
+pub fn action_cancelled(env: &Env, action_id: u64, action: &TimelockAction, admin: &Address) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("released"), invoice_id, symbol_short!("replay")),
-        recipients.clone(),
+        (symbol_short!("split"), symbol_short!("tl_cncl"), action_id),
+        (action.clone(), admin.clone()),
     );
 }
 
-/// Replayed invoice_refunded event tagged with "replay".
-/// Topics: (split, refunded, invoice_id, replay)
+pub fn invoice_admin_frozen(env: &Env, invoice_id: u64, admin: &Address, reason: &String) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("adm_frz"), invoice_id),
+        (admin.clone(), reason.clone()),
+    );
+}
+
+pub fn invoice_admin_unfrozen(env: &Env, invoice_id: u64, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("adm_unf"), invoice_id),
+        admin.clone(),
+    );
+}
+
+pub fn batch_archived(env: &Env, count: u32, ids: &Vec<u64>) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("bat_arc")),
+        (count, ids.clone()),
+    );
+}
+
+pub fn partial_refund_issued(env: &Env, invoice_id: u64, creator: &Address, bps: u32, amount: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("prt_ref"), invoice_id),
+        (creator.clone(), bps, amount),
+    );
+}
+
+/// Issue #276: Emitted when cumulative platform volume crosses a milestone threshold.
+/// Topics: (split, plt_v_ms, milestone_number)
+/// Data: (total_volume, invoice_count, ledger)
+pub fn platform_volume_milestone(env: &Env, total_volume: i128, invoice_count: u64, milestone_number: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("plt_v_ms"), milestone_number),
+        (total_volume, invoice_count, env.ledger().sequence()),
+    );
+}
+
+/// Issue #276: Emitted when a creator's lifetime volume crosses a milestone threshold.
+/// Topics: (split, cr_v_ms, creator)
+/// Data: (total_volume, invoice_count, milestone_number, ledger)
+pub fn creator_volume_milestone(env: &Env, creator: &Address, total_volume: i128, invoice_count: u64, milestone_number: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cr_v_ms"), creator.clone()),
+        (total_volume, invoice_count, milestone_number, env.ledger().sequence()),
+    );
+}
+
+/// Issue #297: Emitted when the circuit breaker is activated.
+/// Topics: (split, cb_act)
+/// Data: reason
+pub fn circuit_breaker_activated(env: &Env, reason: &String) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cb_act")),
+        reason.clone(),
+    );
+}
+
+/// Issue #297: Emitted when the circuit breaker is deactivated.
+/// Topics: (split, cb_deact)
 /// Data: ()
-pub fn replay_invoice_refunded(env: &Env, invoice_id: u64) {
+pub fn circuit_breaker_deactivated(env: &Env) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("refunded"), invoice_id, symbol_short!("replay")),
+        (symbol_short!("split"), symbol_short!("cb_dact")),
         (),
     );
 }
 
+/// Issue #296: Emitted when a fee waiver is granted to a creator.
+/// Topics: (split, fw_grant, creator)
+/// Data: ()
+pub fn fee_waiver_granted(env: &Env, creator: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("fw_grant"), creator.clone()),
+        (),
+    );
+}
 
-/// Emitted when a recipient is substituted (Issue #230).
-/// Topics: (split, sub_rec, invoice_id)
-/// Data: (old_recipient, new_recipient)
-pub fn recipient_updated(env: &Env, invoice_id: u64, old_recipient: &Address, new_recipient: &Address) {
+/// Issue #296: Emitted when a fee waiver is revoked from a creator.
+/// Topics: (split, fw_rev, creator)
+/// Data: ()
+pub fn fee_waiver_revoked(env: &Env, creator: &Address) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("sub_rec"), invoice_id),
-        (old_recipient.clone(), new_recipient.clone()),
-/// Emitted when a refund encounters insufficient balance and partial refunds are distributed.
-/// Topics: (split, ref_short, invoice_id)
-/// Data: shortfall_amount
-pub fn refund_shortfall(env: &Env, invoice_id: u64, shortfall_amount: i128) {
+        (symbol_short!("split"), symbol_short!("fw_rev"), creator.clone()),
+        (),
+/// Issue #285: Emitted when fee tiers are updated.
+/// Topics: (split, fee_tiers_updated)
+/// Data: count of tiers
+pub fn fee_tiers_updated(env: &Env, tier_count: u32) {
     env.events().publish(
-        (symbol_short!("split"), symbol_short!("ref_short"), invoice_id),
-        shortfall_amount,
+        (symbol_short!("split"), symbol_short!("fee_upd")),
+        tier_count,
+    );
+}
+
+/// Issue #285: Emitted when a fee tier is applied at release time.
+/// Topics: (split, fee_tier_applied, creator)
+/// Data: (tier_index, fee_bps, creator_volume)
+pub fn fee_tier_applied(env: &Env, creator: &Address, tier_index: u32, fee_bps: u32, creator_volume: u64) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("fee_app"), creator.clone()),
+        (tier_index, fee_bps, creator_volume),
+    );
+}
+
+/// Issue #299: Emitted when creator stats are updated.
+/// Topics: (split, creator_stats_updated, creator)
+/// Data: (total_invoices, total_raised, total_released, total_payers, avg_funding_time)
+pub fn creator_stats_updated(env: &Env, creator: &Address, total_invoices: u32, total_raised: u64, total_released: u64, total_payers: u32, avg_funding_time_ledgers: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("stats_upd"), creator.clone()),
+        (total_invoices, total_raised, total_released, total_payers, avg_funding_time_ledgers),
+/// Issue #283: Unified state transition event emitted on every invoice status change.
+///
+/// # Indexer Guide
+/// Indexers can reconstruct the full invoice lifecycle by filtering events with
+/// topic[1] == "st_chg". Each event carries:
+///   - `from`: the previous status (as a Symbol: "none", "pending", "released", "refunded", "cancelled")
+///   - `to`: the new status (same encoding)
+///   - `actor`: the address that triggered the transition
+///   - `ledger`: the ledger sequence number at transition time
+///
+/// To build a per-invoice state machine, collect all "st_chg" events for a given
+/// `invoice_id` ordered by ledger, then replay `from → to` pairs.
+///
+/// Topics: (split, st_chg, invoice_id)
+/// Data: (from_status, to_status, actor, ledger)
+pub fn invoice_state_changed(
+    env: &Env,
+    invoice_id: u64,
+    from_status: Option<&InvoiceStatus>,
+    to_status: &InvoiceStatus,
+    actor: &Address,
+) {
+    let from_sym = match from_status {
+        None => symbol_short!("none"),
+        Some(InvoiceStatus::Pending) => symbol_short!("pending"),
+        Some(InvoiceStatus::Released) => symbol_short!("released"),
+        Some(InvoiceStatus::Refunded) => symbol_short!("refunded"),
+        Some(InvoiceStatus::Cancelled) => symbol_short!("cancld"),
+    };
+    let to_sym = match to_status {
+        InvoiceStatus::Pending => symbol_short!("pending"),
+        InvoiceStatus::Released => symbol_short!("released"),
+        InvoiceStatus::Refunded => symbol_short!("refunded"),
+        InvoiceStatus::Cancelled => symbol_short!("cancld"),
+    };
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("st_chg"), invoice_id),
+        (from_sym, to_sym, actor.clone(), env.ledger().sequence()),
     );
 }

@@ -47,6 +47,32 @@ pub struct ResolveRule {
     pub action: ResolveAction,
 }
 
+/// Issue #285: Volume-based fee tier for creators.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeTier {
+    /// Minimum creator lifetime volume threshold to qualify for this tier.
+    pub volume_threshold: u64,
+    /// Fee in basis points (e.g. 100 = 1%).
+    pub fee_bps: u32,
+}
+
+/// Issue #299: Per-creator analytics aggregator.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CreatorStats {
+    /// Total number of invoices created.
+    pub total_invoices: u32,
+    /// Total amount raised across all invoices.
+    pub total_raised: u64,
+    /// Total amount released to recipients.
+    pub total_released: u64,
+    /// Total number of unique payers.
+    pub total_payers: u32,
+    /// Average funding time in ledgers (running average).
+    pub avg_funding_time_ledgers: u32,
+}
+
 /// Issue #: A single (invoice_id, amount) pair for pool_pay.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -235,10 +261,8 @@ pub struct InvoiceOptions {
     pub scheduled_release_at: Option<u64>,
     /// KYC verification requirement.
     pub require_kyc: bool,
-    /// Fallback action to execute if no auto_resolve_rules match (Release, Refund, or None).
-    pub fallback_action: Option<ResolveAction>,
-    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
-    pub external_prerequisite: Option<(Address, u64)>,
+    /// Issue #274: invoice target in USD cents; used with price_oracle for dynamic funding.
+    pub target_usd_cents: Option<u64>,
 }
 
 /// Legacy invoice layout used by stored invoices created before the `version`
@@ -346,9 +370,6 @@ pub struct InvoiceExt {
     pub penalty_tiers: Vec<PenaltyTier>,
     pub allowed_callers: Option<Vec<Address>>,
     pub refund_grace_secs: Option<u64>,
-    pub fallback_action: Option<ResolveAction>,
-    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
-    pub external_prerequisite: Option<(Address, u64)>,
 }
 
 #[contracttype]
@@ -369,10 +390,8 @@ pub struct InvoiceExt2 {
     pub min_payment: i128,
     pub min_funding_amount: i128,
     pub priorities: Vec<u32>,
-    pub creation_timestamp: u64,
-    pub min_payment_increment: i128,
-    /// Issue #230: co-signers who have approved the pending recipient substitution.
-    pub substitute_recipient_approvals: Vec<Address>,
+    /// Issue #274: invoice target in USD cents for oracle-based dynamic funding.
+    pub target_usd_cents: Option<u64>,
 }
 
 /// Issue #211: A single escalating penalty tier (seconds_after_deadline, bps).
@@ -389,10 +408,6 @@ pub struct PenaltyTier {
 pub enum TimelockAction {
     SetTreasury(Address),
     SetPlatformFee(u32),
-    /// Issue #241: Creator self-imposed limit raise request.
-    RaiseCreatorSelfLimit(Address, i128),
-    /// Issue #233: Emergency withdrawal of all custodied funds for a given token.
-    EmergencyWithdraw(Address, Address),
 }
 
 /// A queued timelock action with metadata.
@@ -487,15 +502,8 @@ pub struct Invoice {
     pub min_funding_amount: i128,
     pub priorities: Vec<u32>,
     pub clone_depth: u32,
-    pub fallback_action: Option<ResolveAction>,
-    /// Issue #230: co-signers who have approved the pending recipient substitution.
-    pub substitute_recipient_approvals: Vec<Address>,
-    /// Issue #196: invoice creation timestamp for spam deposit age calculation.
-    pub creation_timestamp: u64,
-    /// Issue #201: minimum payment increment - reject payments below this threshold.
-    pub min_payment_increment: i128,
-    /// Issue #242: External prerequisite - (contract_address, invoice_id) on different contract instance.
-    pub external_prerequisite: Option<(Address, u64)>,
+    /// Issue #274: invoice target in USD cents for oracle-based dynamic funding.
+    pub target_usd_cents: Option<u64>,
 }
 
 impl Invoice {
@@ -566,8 +574,6 @@ impl Invoice {
                 penalty_tiers: self.penalty_tiers,
                 allowed_callers: self.allowed_callers,
                 refund_grace_secs: self.refund_grace_secs,
-                external_prerequisite: self.external_prerequisite,
-                fallback_action: self.fallback_action,
             },
             InvoiceExt2 {
                 notification_contract: self.notification_contract,
@@ -583,9 +589,7 @@ impl Invoice {
                 min_payment: self.min_payment,
                 min_funding_amount: self.min_funding_amount,
                 priorities: self.priorities,
-                creation_timestamp: self.creation_timestamp,
-                min_payment_increment: self.min_payment_increment,
-                substitute_recipient_approvals: Vec::new(self.notification_contract.env()),
+                target_usd_cents: self.target_usd_cents,
             },
         )
     }
@@ -654,8 +658,6 @@ impl Invoice {
             penalty_tiers: ext.penalty_tiers,
             allowed_callers: ext.allowed_callers,
             refund_grace_secs: ext.refund_grace_secs,
-            external_prerequisite: ext.external_prerequisite,
-            fallback_action: ext.fallback_action,
             notification_contract: ext2.notification_contract,
             overflow_behavior: ext2.overflow_behavior,
             cross_chain_ref: ext2.cross_chain_ref,
@@ -669,8 +671,7 @@ impl Invoice {
             min_payment: ext2.min_payment,
             min_funding_amount: ext2.min_funding_amount,
             priorities: ext2.priorities,
-            creation_timestamp: ext2.creation_timestamp,
-            min_payment_increment: ext2.min_payment_increment,
+            target_usd_cents: ext2.target_usd_cents,
         }
     }
 }
@@ -852,6 +853,7 @@ impl Invoice {
             smart_route: false,
             convert_to_stream: false,
             accepted_tokens: Vec::new(env),
+            require_kyc: false,
             arbiter: None,
             disputed: false,
             admin_frozen: false,
@@ -872,38 +874,52 @@ impl Invoice {
             payment_window_secs: None,
             scheduled_release_at: None,
             refund_grace_secs: None,
-            penalty_tiers: Vec::new(env),
-            allowed_callers: None,
-            notification_contract: None,
-            overflow_behavior: OverflowBehavior::Reject,
-            cross_chain_ref: None,
-            priorities: Vec::new(env),
-            forward_to: None,
-            forward_invoice_id: None,
-            parent_invoice_id: None,
-            clone_depth: 0,
-            fallback_action: None,
-        }
-    }   max_payments_per_window: None,
-            payment_window_secs: None,
-            scheduled_release_at: None,
-            refund_grace_secs: None,
             penalty_tiers: Vec::<PenaltyTier>::new(env),
             allowed_callers: None,
+            forward_to: None,
+            forward_invoice_id: None,
             notification_contract: None,
             overflow_behavior: OverflowBehavior::Reject,
             cross_chain_ref: None,
-            priorities: Vec::new(env),
-            forward_to: None,
-            forward_invoice_id: None,
-            parent_invoice_id: None,
             clone_depth: 0,
-            fallback_action: None,
-            require_kyc: false,
-            creation_timestamp: 0,
-            min_payment_increment: 0,
-            external_prerequisite: None,
+            parent_invoice_id: None,
+            priorities: Vec::new(env),
+            target_usd_cents: None,
         }
     }
 }
 
+
+/// Issue #298: Result type returned by simulate_release().
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SimulateReleaseResult {
+    pub estimated_instructions: u64,
+    pub estimated_fee_stroops: u64,
+    pub would_succeed: bool,
+}
+
+/// Issue #297: Circuit breaker status returned by get_circuit_breaker_status().
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CircuitBreakerStatus {
+    pub active: bool,
+    pub reason: Option<String>,
+}
+
+/// Issue #295: A single confidential payment record stored per payer.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ConfidentialPayment {
+    pub commitment: BytesN<32>,
+    pub encrypted_amount: Bytes,
+}
+
+#[derive(Clone, Debug, soroban_sdk::contracttype)]
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceParams {
+    pub creator: Address,
+    pub recipients: Vec<Address>,
+    // ... add all other fields here ...
+}
