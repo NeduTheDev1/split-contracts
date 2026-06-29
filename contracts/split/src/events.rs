@@ -300,6 +300,9 @@ pub fn fee_waiver_revoked(env: &Env, creator: &Address) {
     env.events().publish(
         (symbol_short!("split"), symbol_short!("fw_rev"), creator.clone()),
         (),
+    );
+}
+
 /// Issue #285: Emitted when fee tiers are updated.
 /// Topics: (split, fee_tiers_updated)
 /// Data: count of tiers
@@ -327,6 +330,9 @@ pub fn creator_stats_updated(env: &Env, creator: &Address, total_invoices: u32, 
     env.events().publish(
         (symbol_short!("split"), symbol_short!("stats_upd"), creator.clone()),
         (total_invoices, total_raised, total_released, total_payers, avg_funding_time_ledgers),
+    );
+}
+
 /// Issue #283: Unified state transition event emitted on every invoice status change.
 ///
 /// # Indexer Guide
@@ -365,5 +371,55 @@ pub fn invoice_state_changed(
     env.events().publish(
         (symbol_short!("split"), symbol_short!("st_chg"), invoice_id),
         (from_sym, to_sym, actor.clone(), env.ledger().sequence()),
+    );
+}
+
+/// Issue #309: Emitted when a payer is added/removed from an invoice's allowlist.
+/// Topics: (split, al_upd, invoice_id)
+/// Data: (creator, payer, added)
+pub fn allowlist_updated(env: &Env, invoice_id: u64, creator: &Address, payer: &Address, added: bool) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("al_upd"), invoice_id),
+        (creator.clone(), payer.clone(), added),
+    );
+}
+
+/// Issue #308: Emitted when a payer claims their per-payer refund.
+/// Topics: (split, ref_clm, invoice_id)
+/// Data: (payer, amount)
+pub fn refund_claimed(env: &Env, invoice_id: u64, payer: &Address, amount: i128) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("ref_clm"), invoice_id),
+        (payer.clone(), amount),
+    );
+}
+
+/// Issue #310: Emitted when an upgrade is proposed via the timelock.
+/// Topics: (split, upg_prop)
+/// Data: (new_wasm_hash, eligible_at)
+pub fn upgrade_proposed(env: &Env, new_wasm_hash: &soroban_sdk::BytesN<32>, eligible_at: u64) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("upg_prop")),
+        (new_wasm_hash.clone(), eligible_at),
+    );
+}
+
+/// Issue #310: Emitted when a pending upgrade is executed.
+/// Topics: (split, upg_exec)
+/// Data: new_wasm_hash
+pub fn upgrade_executed(env: &Env, new_wasm_hash: &soroban_sdk::BytesN<32>) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("upg_exec")),
+        new_wasm_hash.clone(),
+    );
+}
+
+/// Issue #310: Emitted when a pending upgrade proposal is cancelled.
+/// Topics: (split, upg_cncl)
+/// Data: admin
+pub fn upgrade_cancelled(env: &Env, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("upg_cncl")),
+        admin.clone(),
     );
 }
